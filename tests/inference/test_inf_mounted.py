@@ -118,10 +118,48 @@ async def test_broke_or_unconsented_chatters_are_refused(pool):
     await two_nodes(h, session_token=host_token)
     _, broke = account(h, "broke@lan.test")
     r = await chat(h, QWEN, headers={"Authorization": f"Bearer {broke}"})
-    assert r.status_code == 400 and "Contribute first" in r.text   # CreditError, same as training
+    assert r.status_code == 402 and "Contribute first" in r.text   # Payment Required (training says 400)
     _, no_terms = account(h, "new@lan.test", terms=False, balance=1e16)
     r = await chat(h, QWEN, headers={"Authorization": f"Bearer {no_terms}"})
     assert r.status_code == 403
+
+
+async def test_hanging_up_on_a_non_streaming_chat_charges_only_the_partial_work(tmp_path):
+    cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.05, verify_rate=0.0)
+    h = await start_harness(fast_settings(), time_scale=1.0, tmp=str(tmp_path / "nodes"),
+                            app_factory=lambda: create_app(cfg, inference=fast_settings()))
+    try:
+        h.add_model(synthetic_layout(QWEN, n_layers=64, total_bytes=int(17.56 * GB), head_bytes=1 * GB))
+        host, host_token = account(h, "host@lan.test")
+        chatter, chat_token = account(h, "chatter@lan.test", balance=1e18)
+        await two_nodes(h, session_token=host_token)
+        credits = core(h).credits
+        start = credits.balance(chatter.id)
+        async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+            req = asyncio.create_task(c.post("/v1/chat/completions", headers={"Authorization": f"Bearer {chat_token}"},
+                                             json={"model": QWEN, "max_tokens": 1500,
+                                                   "messages": [{"role": "user", "content": "go on"}]}))
+            for _ in range(100):
+                await asyncio.sleep(0.1)
+                if h.agents["head"].jobs:
+                    break
+            await asyncio.sleep(0.5)
+            req.cancel()  # curl -m
+            with pytest.raises(asyncio.CancelledError):
+                await req
+        svc = h.app.state.inference
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            job = svc.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if job["state"] != "running" and credits.reserved_in_flight(chatter.id) == 0:
+                break
+        assert job["state"] == "cancelled" and 1 <= job["predicted_n"] < 1500
+        assert credits.reserved_in_flight(chatter.id) == 0                     # settled once
+        spent = start - credits.balance(chatter.id)
+        assert spent == pytest.approx(job["flops"]) and spent > 0              # only the partial work
+        assert credits.lifetime_earned(host.id) == pytest.approx(job["flops"])
+    finally:
+        await h.stop()
 
 
 @pytest.mark.parametrize("pool", [True], indirect=True, ids=["public"])

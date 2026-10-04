@@ -134,6 +134,16 @@ class InferenceService:
         if self.latency_kick is not None:
             self.latency_kick.set()
 
+    def node_state(self, node_id: str) -> Optional[dict]:
+        """Liveness of an inference node for its owner's node list (None: not an inference node)."""
+        row = self.conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if row is None:
+            return None
+        if not nodes.is_online(row, self.s):
+            return {"online": False, "status": None}
+        busy = node_id in nodes.reserved_bytes(self.conn)  # a member of a live pipeline
+        return {"online": True, "status": "draining" if row["draining"] else "running" if busy else "idle"}
+
     # ------------------------------------------------------------ auth
 
     def node_by_token(self, token: str):
@@ -627,8 +637,10 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         events = serve(mgr, row["id"], engine_body, ctx, user_id or "anonymous", stream, account_id)
 
         if not stream:
-            try:
-                text, reasoning, final = [], [], None
+            text, reasoning = [], []
+
+            async def collect() -> Optional[dict]:
+                """The 'final' or 'error' event, accumulating the reply text on the way."""
                 async for ev in events:
                     if ev["type"] == "reset":
                         text.clear()
@@ -638,13 +650,37 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                         text.append(delta.get("content") or "")
                         # thinking models (Qwen3 etc.) stream their reasoning separately from the answer
                         reasoning.append(delta.get("reasoning_content") or "")
-                    elif ev["type"] == "error":
-                        return JSONResponse({"error": {"message": ev["error"], "retryable": ev["retryable"],
-                                                       "job_id": ev["job_id"]}}, status_code=ev["status"])
-                    elif ev["type"] == "final":
-                        final = ev
+                    elif ev["type"] in ("error", "final"):
+                        return ev
+                return None
+
+            async def hung_up() -> None:
+                # the body is read, so the next ASGI message is the disconnect (request.is_disconnected()
+                # never sees it behind the main coordinator's BaseHTTPMiddleware)
+                while (await request.receive())["type"] != "http.disconnect":
+                    pass
+
+            # nothing is written until the reply is done, so watch for a hang-up (curl -m, a closed tab)
+            # and cancel serve() then: the head stops and only the partial work is charged
+            collector, watcher = asyncio.ensure_future(collect()), asyncio.ensure_future(hung_up())
+            try:
+                await asyncio.wait({collector, watcher}, return_when=asyncio.FIRST_COMPLETED)
             finally:
+                watcher.cancel()
+                collector.cancel()  # a no-op once it has finished
+                await asyncio.wait({collector})
+                # like sse(): serve() has cancelled the job on the head and recorded the tokens so far
+                # *before* settle() releases the reservation
+                await events.aclose()
                 settle()
+            if collector.cancelled():
+                return JSONResponse({"error": {"message": "client disconnected", "retryable": True,
+                                               "job_id": None}}, status_code=499)
+            final = collector.result()
+            if final is None or final["type"] == "error":
+                err = final or {"error": "no response", "status": 503, "retryable": True, "job_id": None}
+                return JSONResponse({"error": {"message": err["error"], "retryable": err["retryable"],
+                                               "job_id": err["job_id"]}}, status_code=err["status"])
             summ = final["summary"]
             message = {"role": "assistant", "content": "".join(text)}
             if any(reasoning):

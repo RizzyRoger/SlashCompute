@@ -895,6 +895,23 @@ def test_http_community_lists_live_and_admin(env):
     assert client.get("/admin/flags", headers=_hdr(member_tok)).status_code == 403
 
 
+def test_my_nodes_shows_live_inference_nodes_online(env):
+    client, core, _, _ = env
+    token = client.post("/auth/register", json={
+        "email": "host@lan.test", "password": "password1", "name": "Host",
+    }).json()["token"]
+    user = core.auth.user_from_token(token)
+    inference = client.app.state.inference
+    for node_id, beat in [("inf-live", time.time()), ("inf-gone", time.time() - 3600)]:
+        inference.conn.execute("INSERT INTO nodes (id, name, last_heartbeat, created_at) VALUES (?,?,?,?)",
+                               (node_id, node_id, beat, beat))
+        core.credits.bind_node(node_id, user.id)
+    nodes = {n["node_id"]: n for n in client.get("/auth/me/nodes", headers=_hdr(token)).json()}
+    assert nodes["inf-live"] == {"node_id": "inf-live", "user_id": user.id, "online": True,
+                                 "status": "idle", "gpu_percent": None}
+    assert nodes["inf-gone"]["online"] is False and nodes["inf-gone"]["status"] is None
+
+
 def test_http_comment_only_on_grants_you_can_view(env):
     client, core, *_ = env
     tokens = {}

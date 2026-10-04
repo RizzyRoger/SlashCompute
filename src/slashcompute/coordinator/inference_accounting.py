@@ -7,7 +7,7 @@ from typing import Optional
 
 from fastapi import Request
 
-from slashcompute.community.credits import CreditError
+from slashcompute.community.credits import CreditError, InsufficientCredits
 from slashcompute.community.http import _token
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.inference.accounting import AccountingError
@@ -76,6 +76,8 @@ class CoreAccounting:
             raise AccountingError("Accept the terms before taking from the pool.", 403)
         try:
             self.core.credits.reserve_job(user_id, account_id, flops)
+        except InsufficientCredits as e:
+            raise AccountingError(str(e), 402) from e   # Payment Required, as the Accounting protocol promises
         except CreditError as e:
             raise AccountingError(str(e), e.status) from e
 

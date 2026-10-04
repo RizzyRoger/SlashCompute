@@ -26,6 +26,10 @@ class CreditError(Exception):
         self.status = status
 
 
+class InsufficientCredits(CreditError):
+    """The balance does not cover a reservation (training keeps its 400; chat answers 402)."""
+
+
 class Credits:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -197,7 +201,7 @@ class Credits:
         with self._spend_lock:
             have = self.balance(user_id)
             if have < flops:
-                raise CreditError(
+                raise InsufficientCredits(
                     f"Need {flops:.3e} FLOPs; you have {have:.3e}. Contribute first.",
                 )
             acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
