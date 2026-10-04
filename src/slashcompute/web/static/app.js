@@ -173,6 +173,8 @@ function toast(text, tone = "ok") {
 const status = () => (state.ov && state.ov.status) || {};
 const pool = () => (state.ov && state.ov.pool) || { online: false, nodes: [], jobs: [], capacity: {} };
 const me = () => (state.ov && state.ov.me) || { flops: 0 };
+// The share the running agent was started with; a slider move only saves the next one.
+const liveGpuPercent = () => (me().node || {}).gpu_percent ?? (state.settings || {}).gpu_percent ?? 0;
 
 function credits() {
   const split = Number((state.user && state.user.grant_split)
@@ -316,7 +318,7 @@ function renderSidebar() {
   }
   const agent = $("#side-agent");
   agent.hidden = !st.agent_running;
-  agent.textContent = `Contributing · ${(state.settings || {}).gpu_percent ?? 0}%`;
+  agent.textContent = `Contributing · ${liveGpuPercent()}%`;
 }
 
 function renderAuth() {
@@ -395,7 +397,7 @@ function renderContributions() {
 
   const running = !!st.agent_running;
   const s = state.settings || {};
-  setTag("#c-pill", running ? `Contributing · ${s.gpu_percent}%` : "Not contributing", running ? "ok" : "");
+  setTag("#c-pill", running ? `Contributing · ${liveGpuPercent()}%` : "Not contributing", running ? "ok" : "");
   setDot("#c-dot", running ? "ok" : "", running);
   if (running) {
     const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
@@ -1098,6 +1100,10 @@ const actions = {
     await saveSettings({ session_token: "" });
     state.user = null;
     state.credits = null;
+    // Back to the sign-in form, even if this session started with a registration.
+    state.authMode = "login";
+    const mode = document.querySelector("[data-act='auth-mode']");
+    if (mode) mode.textContent = "Create account";
     // The grant board is per user (admin review queue, pledges): rebuild it
     // so nothing from the old session stays on screen.
     $("#g-request").hidden = true;

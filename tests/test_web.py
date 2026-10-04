@@ -614,6 +614,41 @@ def test_start_hosting_stays_clickable_after_the_coordinator_fails(tmp_path):
     assert stale == [False, "Start hosting"]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_contributing_pill_shows_the_running_share(tmp_path):
+    """Moving the slider while contributing saves the next share; the pills keep the live one."""
+    def probe(node):
+        ov = {"status": {"agent_running": True}, "me": {"flops": 0, **({"node": node} if node else {})}}
+        return (f'state.settings = {{ gpu_percent: 30 }}; state.ov = {json.dumps(ov)}; '
+                'renderContributions(); renderSidebar(); [$("#c-pill").textContent, $("#side-agent").textContent]')
+    phases = [{"routes": {}}] + [{"routes": {}, "run": "0", "probe": probe(n)}
+                                 for n in ({"gpu_percent": 50}, None)]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    live, unlisted = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert live == ["Contributing · 50%", "Contributing · 50%"]
+    # not in the pool's node list yet: fall back to the saved share
+    assert unlisted == ["Contributing · 30%", "Contributing · 30%"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_sign_out_after_registering_shows_sign_in(tmp_path):
+    routes = {"/api/coord/auth/logout": {}, "/api/settings": {"session_token": ""}}
+    phases = [
+        {"routes": {}},
+        {"routes": routes, "run": """
+            state.user = { id: "u1", email: "ada@example.com", accepted_terms: true };
+            actions["auth-mode"]();
+            actions.logout(null);""",
+         "probe": """[state.authMode, $("#auth-submit").textContent, $("[data-act='auth-mode']").textContent]"""},
+    ]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    assert json.loads(out.stdout.strip().splitlines()[-1])[1]["probe"] == ["login", "Sign in", "Create account"]
+
+
 def test_live_grants_flow(tmp_path):
     T = 1e12
     app, launcher, _ = _shell(tmp_path, http=GrantHTTP())
