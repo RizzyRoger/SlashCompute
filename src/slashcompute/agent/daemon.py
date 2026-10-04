@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import websockets
 from pydantic import BaseModel, ValidationError
 
@@ -159,7 +160,8 @@ class Daemon:
                 self._write_status()
                 try:
                     await self._connect_once(ws_url, device)
-                except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
+                except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException,
+                        httpx.HTTPError) as e:
                     rejected = _rejection(e)
                     if rejected:
                         raise SystemExit(f"coordinator refused this agent: {rejected}") from e
@@ -361,39 +363,44 @@ class Daemon:
 
     async def _on_fetch(self, msg: VerifyFetch) -> None:
         dest = self.opt.paths.job_dir(msg.job_id, msg.epoch) / f"bundle_{msg.step}.safetensors"
-        ok = False
-        if self._session:
-            ok = self._session.save_bundle(msg.step, dest)
-        if not ok:
-            await self.send(VerifyBundleReady(
-                verify_id=msg.verify_id, job_id=msg.job_id, stage_idx=msg.stage_idx,
-                step=msg.step, error="bundle no longer held",
-            ))
-            return
-        self.opt.http.put_bytes(f"/verify/{msg.verify_id}/bundle", dest.read_bytes())
+        error = None
+        try:
+            if self._session and self._session.save_bundle(msg.step, dest):
+                await asyncio.to_thread(self._upload, f"/verify/{msg.verify_id}/bundle", dest)
+            else:
+                error = "bundle no longer held"
+        except Exception as e:           # the coordinator must hear back, and the session must survive
+            log.exception("verify bundle upload failed")
+            error = f"bundle upload failed: {e}"
         await self.send(VerifyBundleReady(
             verify_id=msg.verify_id, job_id=msg.job_id, stage_idx=msg.stage_idx,
-            step=msg.step, path=str(dest),
+            step=msg.step, path=None if error else str(dest), error=error,
         ))
 
     async def _on_verify(self, msg: VerifyRequest) -> None:
+        # Downloads, replays and uploads run off the event loop so heartbeats keep flowing.
         try:
             if msg.kind == "canary":
-                stats = run_canary(msg.seed or 0, msg.size or self.opt.cfg.canary_size)
+                stats = await asyncio.to_thread(
+                    run_canary, msg.seed or 0, msg.size or self.opt.cfg.canary_size)
                 await self.send(VerifyResult(verify_id=msg.verify_id, kind="canary", stats=stats))
                 return
             work = self.opt.paths.root / "verify" / msg.verify_id
             work.mkdir(parents=True, exist_ok=True)
-            bundle = self.opt.http.get_file(msg.bundle_url, work / "bundle.safetensors")
+            bundle = await asyncio.to_thread(
+                self.opt.http.get_file, msg.bundle_url, work / "bundle.safetensors")
             dest = work / "replay.safetensors"
-            stats = run_replay(msg, bundle, dest)
-            self.opt.http.put_bytes(f"/verify/{msg.verify_id}/result", dest.read_bytes())
+            stats = await asyncio.to_thread(run_replay, msg, bundle, dest)
+            await asyncio.to_thread(self._upload, f"/verify/{msg.verify_id}/result", dest)
             await self.send(VerifyResult(
                 verify_id=msg.verify_id, kind="replay", stats=stats, output_path=str(dest),
             ))
         except Exception as e:
             log.exception("verify %s failed", msg.kind)
             await self.send(VerifyResult(verify_id=msg.verify_id, kind=msg.kind, error=str(e)))
+
+    def _upload(self, path: str, src: Path) -> None:
+        self.opt.http.put_bytes(path, src.read_bytes())
 
     async def shutdown(self) -> None:
         if self._stop.is_set():
