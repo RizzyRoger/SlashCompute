@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import socket
 import sys
@@ -29,6 +30,7 @@ from slashcompute.common.protocol import (
     StageReady, VerifyBundleReady, VerifyFetch, VerifyRequest, VerifyResult, Welcome, dump,
     parse_coordinator_message,
 )
+from slashcompute.pipeline.model_profile import resolve_model_path
 
 log = logging.getLogger(__name__)
 RECONNECT_MAX_S = 15.0
@@ -290,6 +292,19 @@ class Daemon:
         self._session = session
 
     async def _start_sandboxed(self, asg: StageAssignment, job_dir: Path) -> None:
+        # The sandbox can't write the HF cache (~/.cache/huggingface: locks, refs, blobs), so
+        # fetch the model here, unsandboxed, and run the worker offline against that cache.
+        try:
+            await asyncio.to_thread(resolve_model_path, asg.spec.model)
+        except Exception as e:
+            log.exception("model fetch failed")
+            await self.send(StageFinished(
+                job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
+                reason="error", last_step=asg.resume_step, detail=f"model fetch failed: {e}",
+            ))
+            self.status, self.job_id, self.epoch = "idle", None, None
+            self._write_status()
+            return
         spec_path = job_dir / "assignment.json"
         spec_path.touch(mode=0o600)
         spec_path.chmod(0o600)
@@ -310,6 +325,7 @@ class Daemon:
         log.info("starting sandboxed worker: %s", " ".join(cmd))
         self._proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
+            env={**os.environ, "HF_HUB_OFFLINE": "1"},
         )
         self._pump = asyncio.create_task(self._pump_worker_stdout())
 

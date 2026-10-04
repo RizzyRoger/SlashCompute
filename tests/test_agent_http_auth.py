@@ -2,6 +2,7 @@ import asyncio
 import json
 import stat
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -81,6 +82,7 @@ def test_agent_session_reaches_http_and_sandbox_worker(monkeypatch, tmp_path, ex
         return SimpleNamespace(stdout=None)
 
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command", lambda cmd, *_: cmd)
+    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     asyncio.run(daemon._start_sandboxed(assignment, job_dir))
     spec_path = job_dir / "assignment.json"

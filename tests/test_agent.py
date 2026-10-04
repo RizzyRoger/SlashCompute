@@ -375,6 +375,7 @@ async def test_stop_drains_a_sandboxed_worker_before_disconnecting(tmp_path, mon
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
                         lambda cmd, *_: [sys.executable, "-c", _DRAINABLE_WORKER, *cmd[3:]])
+    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
 
     sent, closed = [], asyncio.Event()
 
@@ -473,3 +474,76 @@ print(o.tolist())
     proc = _run_sandboxed(code, tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "[1.0, 1.0, 1.0, 1.0]" in proc.stdout
+
+
+async def test_sandboxed_worker_resolves_the_model_the_daemon_fetched(tmp_path, monkeypatch):
+    """The worker used to snapshot_download inside the sandbox, which can't write the HF cache
+    (~/.cache/huggingface locks/refs/blobs): "Operation not permitted" on a model not yet cached."""
+    import json
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    import slashcompute
+    from slashcompute.agent import sandbox
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import LoraFinetuneSpec, StageAssignment
+
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not available")
+    # The cache must sit where the profile denies writes, like ~/.cache (tmp dirs are writable).
+    home = Path(tempfile.mkdtemp(prefix=".sbx-home-", dir=Path(__file__).resolve().parent))
+    hf_home = home / ".cache" / "huggingface"
+    model, sha = "slashcompute-test/tiny", "0" * 40
+    src = str(Path(slashcompute.__file__).resolve().parents[1])
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_ENDPOINT", "http://127.0.0.1:9720")    # nothing listens: no real network
+
+    def fetch(name):                 # the daemon's unsandboxed snapshot_download, in HF's cache layout
+        repo = hf_home / "hub" / f"models--{name.replace('/', '--')}"
+        snap = repo / "snapshots" / sha
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text('{"model_type": "tiny"}')
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text(sha)
+        return snap
+
+    opt = AgentOptions(url="http://127.0.0.1:9720", home=tmp_path, localhost=True, sandbox=True)
+    job_dir = opt.paths.job_dir("j", 1)
+    probe = f"""
+import json, os
+from slashcompute.pipeline.model_profile import resolve_model_path
+out = {{}}
+try:
+    out["config"] = json.loads((resolve_model_path({model!r}) / "config.json").read_text())
+except Exception as e:
+    out["error"] = f"{{type(e).__name__}}: {{e}}"
+try:
+    locks = os.path.join(os.environ["HF_HOME"], "hub", ".locks")
+    os.makedirs(locks, exist_ok=True)
+    open(os.path.join(locks, "probe.lock"), "w").close()
+    out["cache"] = "writable"
+except PermissionError:
+    out["cache"] = "read-only"
+open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
+"""
+    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", fetch, raising=False)
+    monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
+                        lambda cmd, *a: sandbox.wrap_command([sys.executable, "-c", probe], *a))
+    daemon = Daemon(opt)
+    asg = StageAssignment(
+        job_id="j", epoch=1, stage_idx=0, num_stages=1, layer_start=0, layer_end=8,
+        num_layers=8, spec=LoraFinetuneSpec(model=model, dataset_path="dataset.jsonl", steps=2),
+        checkpoint_every=25, verify_ring_size=8,
+    )
+    try:
+        await daemon._start_stage(asg)
+        await asyncio.wait_for(daemon._pump, 120)
+        out = json.loads((job_dir / "probe.json").read_text())
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    assert out.get("config") == {"model_type": "tiny"}, out.get("error")
+    assert out["cache"] == "read-only"
