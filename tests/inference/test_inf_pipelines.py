@@ -275,6 +275,20 @@ async def test_idle_pipeline_of_the_same_model_is_evicted_for_a_larger_ctx(two_n
     assert again.json()["network"]["pipeline_id"] == big.json()["network"]["pipeline_id"]
 
 
+async def test_a_request_too_big_to_ever_fit_does_not_evict_the_idle_pipeline(two_node):
+    h = two_node
+    small = await chat(h, QWEN, max_tokens=16)
+    assert small.status_code == 200, small.text
+    (first,) = pipelines(h)
+    # ctx in the millions fits nowhere even with the idle pipeline gone, so it must not be torn down
+    huge = await chat(h, QWEN, content="endless answer", max_tokens=10 ** 7)
+    assert huge.status_code == 503, huge.text
+    (still,) = pipelines(h)
+    assert (still["id"], still["state"]) == (first["id"], "active")
+    again = await chat(h, QWEN, content="short again", max_tokens=16)
+    assert again.json()["network"]["pipeline_id"] == first["id"]
+
+
 async def test_requests_during_a_drain_wait_instead_of_failing():
     h = await start_harness(fast_settings(), time_scale=1.0)
     try:

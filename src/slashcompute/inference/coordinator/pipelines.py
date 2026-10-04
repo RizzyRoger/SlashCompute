@@ -17,7 +17,8 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import AsyncIterator, Optional
 
 from slashcompute.inference import flops as fl
@@ -131,12 +132,19 @@ class PipelineManager:
 
     # ------------------------------------------------------------ planning
 
-    def plan_for(self, model_id: str, ctx: int, exclude=()) -> Plan | NoPlan:
+    def plan_for(self, model_id: str, ctx: int, exclude=(), freeing=()) -> Plan | NoPlan:
+        """Plan on the memory free now, or as if the `freeing` pipelines had already given theirs back."""
         row = registry.model_row(self.conn, model_id)
         if row is None or row["status"] != "ready":
             return NoPlan(f"model {model_id} is not ready (status {row['status'] if row else 'unknown'})")
         layout = registry.model_layout(row)
-        return plan(layout, nodes.candidates(self.conn, self.s, model_id), registry.est_out_s(layout, self.s),
+        freed = Counter()
+        for r in freeing:
+            for m in r.members:
+                freed[m.node_id] += m.full_bytes + m.kv_bytes
+        cands = [replace(c, reserved_bytes=max(0, c.reserved_bytes - freed[c.node_id]))
+                 for c in nodes.candidates(self.conn, self.s, model_id)]
+        return plan(layout, cands, registry.est_out_s(layout, self.s),
                     self.s, ctx=ctx, latency=nodes.latency_matrix(self.conn), model_key=model_id, exclude=exclude)
 
     def live(self, model_id: Optional[str] = None) -> list[Runtime]:
@@ -186,7 +194,9 @@ class PipelineManager:
                 finally:
                     for w in waits:
                         w.cancel()
-            elif idle:
+            elif idle and not isinstance(self.plan_for(model_id, ctx, exclude, freeing=idle + draining), NoPlan):
+                # evict only when the request fits once the idle pipelines are gone: one that can never
+                # fit (e.g. a huge max_tokens) must not tear down everyone else's warm pipelines first
                 log.info("evicting idle pipeline %s (%s) to make room for %s", idle[0].id, idle[0].model_id, model_id)
                 await self.stop_pipeline(idle[0].id, "evicted for another model" if idle[0].model_id != model_id
                                          else f"evicted for a larger ctx ({ctx})")
