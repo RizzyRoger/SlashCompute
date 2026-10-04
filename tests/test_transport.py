@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import sys
 
 import mlx.core as mx
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from slashcompute.transport import (
     Frame, LinkClosed, LinkServer, LinkTimeout, MemoryLink, ResilientLink, TcpLink, connect, digest,
 )
-from slashcompute.transport.peer import KEEPALIVE_IDLE_S
+from slashcompute.transport.peer import KEEPALIVE_IDLE_S, RETRANSMIT_DROP_S
 from slashcompute.transport.serialization import decode_bytes, encode_bytes
 
 
@@ -165,6 +166,8 @@ async def test_tcp_links_use_keepalive():
         assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
         if idle is not None:
             assert sock.getsockopt(socket.IPPROTO_TCP, idle) == KEEPALIVE_IDLE_S
+        if sys.platform == "darwin":  # TCP_RXT_CONNDROPTIME: give up on undeliverable data
+            assert sock.getsockopt(socket.IPPROTO_TCP, 0x80) == RETRANSMIT_DROP_S
     await up.close()
     await down.close()
     await server.close()
@@ -203,7 +206,9 @@ async def _resilient_pair(window=5.0):
 
 
 async def test_resilient_link_retransmits_across_dropped_connections():
-    server, up, down = await _resilient_pair()
+    # A generous window: when a cut lands mid-retransmit, macOS may ignore the reset and
+    # the sender only learns the connection is gone from a zero-window probe (~5 s).
+    server, up, down = await _resilient_pair(window=30)
     h = mx.random.normal((4, 64, 256))
     got_down, got_up = [], []
 
@@ -223,9 +228,9 @@ async def test_resilient_link_retransmits_across_dropped_connections():
 
     await asyncio.wait_for(asyncio.gather(
         send_all(up, "fwd", {12, 30}), send_all(down, "bwd", {21}),
-        recv_all(down, got_down), recv_all(up, got_up)), 30)
+        recv_all(down, got_down), recv_all(up, got_up)), 60)
     assert got_down == list(range(40)) and got_up == list(range(40))  # each once, in order
-    assert up.reconnects >= 3
+    assert up.reconnects >= 1  # cuts that land mid-reconnect are noticed as one drop
     await up.close()
     await down.close()
     await server.close()

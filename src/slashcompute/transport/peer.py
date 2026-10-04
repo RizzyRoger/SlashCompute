@@ -9,7 +9,8 @@ can't cross-talk.
 Real LANs drop packets, sleep laptops and lose Wi-Fi, so nothing here waits
 forever: sockets use TCP keepalive (a vanished peer is noticed in about
 ``KEEPALIVE_IDLE_S + KEEPALIVE_INTERVAL_S * KEEPALIVE_COUNT`` seconds even when
-no data is moving), and receives, sends and dials take timeouts. When both
+no data is moving) and stop retransmitting undeliverable data after
+``RETRANSMIT_DROP_S``, and receives, sends and dials take timeouts. When both
 ends support it, a link is a ``ResilientLink``: a dropped connection is redialled
 and the frames the peer missed are retransmitted, so a network blip doesn't cost
 the job an epoch.
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import sys
 from collections import OrderedDict
 from typing import Awaitable, Callable, Optional
 
@@ -36,6 +38,13 @@ _CLOSED = object()
 KEEPALIVE_IDLE_S = 15
 KEEPALIVE_INTERVAL_S = 5
 KEEPALIVE_COUNT = 4
+# Keepalive doesn't run while data is unacknowledged, so a sender on a dead path would
+# otherwise retransmit for many minutes before the kernel gives up. Drop it sooner; a
+# ResilientLink then reconnects.
+RETRANSMIT_DROP_S = 60
+_TCP_USER_TIMEOUT = getattr(socket, "TCP_USER_TIMEOUT", None)  # Linux, milliseconds
+# macOS: <netinet/tcp.h> TCP_RXT_CONNDROPTIME, seconds (not exported by the socket module).
+_TCP_RXT_CONNDROPTIME = 0x80 if sys.platform == "darwin" else None
 # One dial attempt; a silently dropped SYN would otherwise block for the OS
 # connect timeout (about 75 s on macOS) before the overall deadline is checked.
 CONNECT_ATTEMPT_S = 10.0
@@ -50,22 +59,25 @@ class LinkTimeout(LinkClosed):
     """The peer sent nothing, or took nothing, for longer than the link allows."""
 
 
-def _enable_keepalive(sock) -> None:
+def _tune_socket(sock) -> None:
+    """Keepalive, and a bound on how long undeliverable data is retransmitted."""
     if sock is None:
         return
     opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
     # TCP_KEEPIDLE on Linux; macOS calls the same option TCP_KEEPALIVE.
     idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
-    for name, opt, val in (("idle", idle, KEEPALIVE_IDLE_S),
-                           ("interval", getattr(socket, "TCP_KEEPINTVL", None), KEEPALIVE_INTERVAL_S),
-                           ("count", getattr(socket, "TCP_KEEPCNT", None), KEEPALIVE_COUNT)):
+    for opt, val in ((idle, KEEPALIVE_IDLE_S),
+                     (getattr(socket, "TCP_KEEPINTVL", None), KEEPALIVE_INTERVAL_S),
+                     (getattr(socket, "TCP_KEEPCNT", None), KEEPALIVE_COUNT),
+                     (_TCP_USER_TIMEOUT, RETRANSMIT_DROP_S * 1000),
+                     (_TCP_RXT_CONNDROPTIME, RETRANSMIT_DROP_S)):
         if opt is not None:
             opts.append((socket.IPPROTO_TCP, opt, val))
-    try:
-        for level, opt, val in opts:
+    for level, opt, val in opts:
+        try:
             sock.setsockopt(level, opt, val)
-    except OSError as e:
-        log.debug("could not enable TCP keepalive: %s", e)
+        except OSError as e:
+            log.debug("could not set socket option %s: %s", opt, e)
 
 
 class Link:
@@ -104,7 +116,7 @@ class TcpLink(Link):
         self._writer = writer
         self.send_timeout = send_timeout
         self._send_lock = asyncio.Lock()
-        _enable_keepalive(writer.get_extra_info("socket"))
+        _tune_socket(writer.get_extra_info("socket"))
         self._task = asyncio.create_task(self._read_loop())
 
     @property
@@ -128,6 +140,9 @@ class TcpLink(Link):
                 self._queue.put_nowait(await self._read_frame())
         except (asyncio.IncompleteReadError, OSError):  # EOF, reset, keepalive ETIMEDOUT
             self._queue.put_nowait(_CLOSED)
+            # Links never half-close: once the peer is gone, fail our pending sends now
+            # rather than leave a drain() waiting on a socket nobody will read.
+            self._writer.transport.abort()
         except asyncio.CancelledError:
             self._queue.put_nowait(_CLOSED)
         except Exception as e:  # malformed frame
