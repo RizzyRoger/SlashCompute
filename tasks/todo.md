@@ -1,3 +1,42 @@
+# Reliability bugs: peer links, agent races, reconnects, scheduling, checkpoints, ring memory, tick
+
+Base: RizzyRoger/SlashCompute main at b357ee3. Branch: fix/reliability-bugs. Baseline: 472 passed
+(non-integration). Plan: `/Users/darren/.claude/plans/solve-these-bugs-transient-lamport.md`.
+
+- [x] 1. Peer links: keepalive, recv/send/connect timeouts, coordinator stall watchdog
+- [x] 2. Peer links survive a dropped connection (seq/ack/retransmit); schedule drops stale/duplicate frames
+- [x] 3. Verification ring in host memory, released with the stage
+- [x] 4. Agent daemon: one stage handle under a lock, stale commands ignored, atomic status file
+- [x] 5. Control messages sequenced, acknowledged and replayed across a reconnect within a grace window
+- [x] 6. Transactional epoch start with rollback
+- [x] 7. Checkpoint merges serialized per job, atomic, never rewriting a recorded step
+- [x] 8. Coordinator: independent loops, WAL, stall-aware heartbeat expiry, blocking work off the loop
+- [x] Full suite + integration tests, review the diff, push to SlashComputeFinished
+
+## Results
+
+Full suite: 518 passed, 0 failed (472 at base; 46 new tests). Integration (real coordinator + 2 agents) passes.
+
+- **Stress:** 200-300 in-process runs of a resilient link with three connection cuts each delivered
+  every frame exactly once, in order. A 2-stage training run over real TCP with three cuts gives the
+  same losses as the in-memory reference.
+- **End to end:** a real coordinator and 2 sandboxed agents (the macOS default the integration test
+  skips).
+  - Freezing one agent daemon (SIGSTOP) past the heartbeat timeout: the coordinator held its place,
+    the agent resumed and replayed 206 messages, and the job finished with 0 recoveries.
+  - `kill -9` on a worker: reported at once as "worker exited with code -9"; the job recovered from
+    its checkpoint once and completed.
+- **Found while verifying:**
+  - silent drops (no socket close) evicted reliable agents at the heartbeat timeout; they are now
+    held like a disconnect
+  - a sender retransmitting into a connection the peer had abandoned waited out the whole window;
+    links now abort when their read side ends, and bound retransmission at 60 s
+  - shutdown could hang when it ran before the agent's Welcome was handled
+  - three review findings: spawn failures waited for the 15-minute start timeout, a resume racing a
+    close hung LinkServer.close(), and send() succeeded after a link gave up
+- **Not verified:** a real multi-Mac run over Wi-Fi, and coordinator restarts (sessions are in
+  memory, so a restarted coordinator still restarts epochs from their checkpoints, as before).
+
 # Test every feature and fix bugs (one agent per bug)
 
 Base: RizzyRoger/SlashCompute main at a9758ba (PR #14). Branch: claude/slashcompute-testing-bugs-e28013.
