@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from sqlalchemy import func
@@ -152,7 +153,7 @@ class Credits:
                       note=f"tithe from {user_id}")
 
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
-        if flops <= 0:
+        if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Set a FLOP budget greater than zero.")
         if self.balance(user_id) < flops:
             raise CreditError(
@@ -204,7 +205,7 @@ class Credits:
         self.post(recipient_id, "receive", flops, grant_id=grant_id)
 
     def allocate_pot(self, recipient_id: str, grant_id: str, flops: float) -> None:
-        if flops <= 0:
+        if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Allocation must be positive.")
         if self.balance(POT_ID) < flops:
             raise CreditError("Community pot does not have that many FLOPs.")

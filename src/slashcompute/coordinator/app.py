@@ -99,6 +99,9 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
         except CreditError as e:
             core.abandon_job(job, str(e))
             raise HTTPException(e.status, str(e)) from e
+        except Exception:
+            core.abandon_job(job, "Could not reserve credits.")
+            raise
 
     # ------------------------------------------------------------ agents
 

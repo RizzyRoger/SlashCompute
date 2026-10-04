@@ -150,6 +150,15 @@ async def test_banned_chatter_is_refused(pool):
     assert r.status_code == 403 and "banned" in r.text
 
 
+async def test_non_numeric_max_tokens_is_a_400(pool):
+    h = pool
+    await two_nodes(h)
+    _, token = account(h, "chatter@lan.test", balance=1e16)
+    for headers in ({"Authorization": f"Bearer {token}"}, {}):
+        r = await chat(h, QWEN, max_tokens="abc", headers=headers)
+        assert r.status_code == 400 and "max_tokens" in r.text
+
+
 async def test_training_on_a_mac_drains_its_inference_pipelines(pool):
     h = pool
     busy = {"worker": False}

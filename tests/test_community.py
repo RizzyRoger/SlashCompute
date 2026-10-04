@@ -814,6 +814,56 @@ def test_session_without_max_flops_abandons_job(env):
     assert core.jobs == {}
 
 
+def test_non_finite_amounts_are_rejected(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 100.0, 50)
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(CreditError):
+            core.credits.reserve_job(user.id, "job-nan", bad)
+        with pytest.raises(CreditError):
+            core.credits.allocate_pot(user.id, "g1", bad)
+    assert core.credits.job_account("job-nan") is None
+    assert core.credits.balance(user.id) == 50.0
+    assert core.credits.balance(POT_ID) == 50.0
+
+
+@pytest.mark.parametrize("max_flops", ["nan", "inf"])
+def test_http_non_finite_max_flops_abandons_job(env, max_flops):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(token))
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = max_flops
+    r = client.post("/jobs", json=spec, headers=_hdr(token))
+    assert r.status_code == 400
+    assert core.jobs == {}
+    r = client.post("/jobs/upload", headers=_hdr(token),
+                    files={"dataset": ("train.jsonl", tiny_dataset.read_bytes())},
+                    data={"model": str(tiny_model), "steps": 2, "batch_size": 2,
+                          "microbatches": 1, "min_stages": 1, "max_flops": max_flops})
+    assert r.status_code == 400
+    assert core.jobs == {}
+
+
+def test_http_unexpected_reserve_error_abandons_job(env, monkeypatch):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(token))
+
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(core.credits, "reserve_job", boom)
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = 1e9
+    with pytest.raises(RuntimeError):
+        client.post("/jobs", json=spec, headers=_hdr(token))
+    assert core.jobs == {}
+
+
 def test_http_community_lists_live_and_admin(env):
     client, core, tiny_model, tiny_dataset = env
     admin_tok = client.post("/auth/register", json={

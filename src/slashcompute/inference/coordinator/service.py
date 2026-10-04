@@ -557,13 +557,17 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         except AccountingError as e:
             raise HTTPException(e.status, str(e)) from e
         row = svc.model_or_404(body.get("model", ""))
+        try:
+            max_tokens = int(body.get("max_tokens") or 256)
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(400, "max_tokens must be an integer.") from None
         stream = bool(body.get("stream"))
         engine_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "model")}
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
             est = fl.estimate_flops(registry.model_flops(row), estimate_prompt_tokens(body),
-                                    int(body.get("max_tokens") or 256), mgr.gen_weight_for(row["id"]))
+                                    max_tokens, mgr.gen_weight_for(row["id"]))
             try:
                 svc.accounting.reserve(user_id, account_id, est)
             except AccountingError as e:
