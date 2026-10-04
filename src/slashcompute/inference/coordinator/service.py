@@ -599,12 +599,16 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
 
         if not stream:
             try:
-                text, final = [], None
+                text, reasoning, final = [], [], None
                 async for ev in events:
                     if ev["type"] == "reset":
                         text.clear()
+                        reasoning.clear()
                     elif ev["type"] == "chunk":
-                        text.append(ev["data"]["choices"][0]["delta"].get("content") or "")
+                        delta = ev["data"]["choices"][0]["delta"]
+                        text.append(delta.get("content") or "")
+                        # thinking models (Qwen3 etc.) stream their reasoning separately from the answer
+                        reasoning.append(delta.get("reasoning_content") or "")
                     elif ev["type"] == "error":
                         return JSONResponse({"error": {"message": ev["error"], "retryable": ev["retryable"],
                                                        "job_id": ev["job_id"]}}, status_code=ev["status"])
@@ -613,9 +617,12 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
             finally:
                 settle()
             summ = final["summary"]
+            message = {"role": "assistant", "content": "".join(text)}
+            if any(reasoning):
+                message["reasoning_content"] = "".join(reasoning)
             return {
                 "id": summ["job_id"], "object": "chat.completion", "created": int(time.time()), "model": row["id"],
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(text)},
+                "choices": [{"index": 0, "message": message,
                              "finish_reason": final.get("finish_reason") or "stop"}],
                 "usage": {"prompt_tokens": summ["prompt_n"] + summ["cache_n"], "completion_tokens": summ["predicted_n"],
                           "total_tokens": summ["prompt_n"] + summ["cache_n"] + summ["predicted_n"]},

@@ -482,7 +482,7 @@ const settle = () => new Promise((r) => setTimeout(r, 30));
     }
     await settle();
     seen.push({ pill: element("#g-pill").textContent, open: element("#g-open").textContent,
-      list: element("#g-list").innerHTML });
+      list: element("#g-list").innerHTML, probe: phase.probe && vm.runInContext(phase.probe, ctx) });
   }
   console.log(JSON.stringify(seen));
 })();
@@ -523,6 +523,41 @@ def test_grants_tab_follows_coordinator_on_poll(tmp_path):
     assert (seen[2]["pill"], seen[2]["open"]) == ("Live", "1")
     assert seen[3]["open"] == "1"
     assert seen[4]["open"] == "2"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_chat_shows_a_thinking_models_reasoning(tmp_path):
+    """reasoning_content deltas render as a dim Thinking… block before the answer, so a thinking
+    model's reply is never blank, even when it runs out of tokens before answering."""
+    log = 'renderChat(); $("#l-log").innerHTML'
+    phases = [
+        {"routes": {}},
+        {"routes": {}, "probe": log, "run": """
+            state.llm.messages = [{ role: "user", content: "Is 1001 a prime number?" },
+                                  { role: "assistant", content: "", live: true }];
+            applyChatEvent(state.llm.messages[1], { choices: [{ delta: { role: "assistant" } }] });
+            applyChatEvent(state.llm.messages[1], { choices: [{ delta: { reasoning_content: "1001 = 7 * 11" } }] });
+            applyChatEvent(state.llm.messages[1], { choices: [{ delta: { reasoning_content: " * 13 <so no>" } }] });"""},
+        {"routes": {}, "probe": log,
+         "run": 'applyChatEvent(state.llm.messages[1], { choices: [{ delta: { content: "No." } }] })'},
+        # the user opened it: the next render keeps it open
+        {"routes": {}, "probe": log, "run": "state.llm.messages[1].thinkOpen = true"},
+        {"routes": {}, "probe": log, "run": """
+            const r = { role: "assistant", content: "", live: true };
+            state.llm.messages.push(r);
+            applyChatEvent(r, { choices: [{ delta: { reasoning_content: "Hmm" }, finish_reason: "length" }] });
+            r.live = false;"""},
+    ]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    thinking, answered, reopened, ran_out = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert "<summary>Thinking…</summary>" in thinking and 'open=""' in thinking
+    assert "1001 = 7 * 11 * 13 &lt;so no&gt;" in thinking and "<p>…</p>" not in thinking
+    assert "<summary>Thoughts</summary>" in answered and 'open=""' not in answered
+    assert answered.index("1001 = 7") < answered.index("<p>No.</p>")
+    assert 'open=""' in reopened
+    assert "Ran out of tokens while thinking" in ran_out.split("Hmm")[1]
 
 
 def test_live_grants_flow(tmp_path):

@@ -428,3 +428,40 @@ async def test_rejected_request_is_a_client_error_and_keeps_the_pipeline(stream)
         assert r.status_code == 200 and r.json()["network"]["pipeline_id"] == p["id"]
     finally:
         await h.stop()
+
+
+class ThinkingEngine(FakeEngine):
+    """Streams like llama-server serving a thinking model: 8 reasoning_content deltas, then the answer."""
+
+    async def complete(self, pipeline_id, body):
+        n = 0
+        async for ev in super().complete(pipeline_id, body):
+            if ev["type"] == "chunk":
+                delta = ev["data"]["choices"][0]["delta"]
+                if n < 8:
+                    delta["reasoning_content"] = delta.pop("content")
+                n += 1
+            yield ev
+
+
+@pytest.mark.parametrize("max_tokens", [16, 6], ids=["answered", "ran-out-while-thinking"])
+async def test_non_streaming_reply_keeps_the_reasoning(max_tokens):
+    """A thinking model's reasoning comes back in message.reasoning_content (OpenAI/llama.cpp style),
+    matching what streaming sends, instead of being dropped and leaving the reply empty."""
+    h = await start_harness(fast_settings())
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)],
+                          engine_cls=ThinkingEngine)
+        r = await chat(h, QWEN, content="Is 1001 a prime number?", max_tokens=max_tokens)
+        assert r.status_code == 200, r.text
+        msg = r.json()["choices"][0]["message"]
+        assert msg["reasoning_content"] and bool(msg["content"]) == (max_tokens > 8)
+
+        streamed = await chat(h, QWEN, content="Is 1001 a prime number?", max_tokens=max_tokens, stream=True)
+        chunks = [json.loads(l[6:]) for l in streamed.text.splitlines() if l.startswith("data: {")]
+        deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+        assert msg["reasoning_content"] == "".join(d.get("reasoning_content", "") for d in deltas)
+        assert msg["content"] == "".join(d.get("content", "") for d in deltas)
+    finally:
+        await h.stop()
