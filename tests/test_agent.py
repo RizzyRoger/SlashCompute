@@ -39,6 +39,7 @@ async def test_hello_reject_does_not_leak_expect():
     ack = await link.recv(5)
     assert ack.kind == "hello_reject"
     assert "expect" not in ack.meta and "secret" not in str(ack.meta)
+    assert "job_id" in ack.meta["reason"]               # says what's wrong, not the value
     await link.close()
     await server.close()
 

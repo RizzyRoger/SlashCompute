@@ -3,7 +3,7 @@ import asyncio
 import mlx.core as mx
 import pytest
 
-from slashcompute.transport import Frame, LinkClosed, LinkServer, MemoryLink, connect, digest
+from slashcompute.transport import Frame, LinkClosed, LinkServer, MemoryLink, TcpLink, connect, digest
 from slashcompute.transport.serialization import decode_bytes, encode_bytes
 
 
@@ -78,9 +78,59 @@ async def test_tcp_link_roundtrip_and_hello():
 
 async def test_tcp_hello_mismatch_rejected():
     server = await LinkServer("127.0.0.1", 0, {"job": "j1", "epoch": 2}).start()
-    with pytest.raises(LinkClosed):
-        await connect("127.0.0.1", server.port, {"job": "j1", "epoch": 1}, timeout=5)
+    with pytest.raises(LinkClosed, match="listening for epoch 2, got 1"):
+        await connect("127.0.0.1", server.port, {"job": "j1", "epoch": 1}, timeout=0.5)
     await server.close()
+
+
+async def test_connect_waits_out_previous_epoch_listener():
+    # The downstream still has epoch 1's listener on its data port when the
+    # epoch-2 upstream dials; the dialer must keep trying until epoch 2 binds.
+    old = await LinkServer("127.0.0.1", 0, {"job_id": "j1", "epoch": 1}).start()
+    port = old.port
+    up_task = asyncio.create_task(
+        connect("127.0.0.1", port, {"job_id": "j1", "epoch": 2}, timeout=10, retry_interval=0.05))
+    await asyncio.sleep(0.5)
+    assert not up_task.done()
+    await old.close()
+    new = await LinkServer("127.0.0.1", port, {"job_id": "j1", "epoch": 2}).start()
+    up = await asyncio.wait_for(up_task, 10)
+    down = await new.accept(5)
+    await up.send(Frame("ping", {"n": 1}))
+    assert (await down.recv(5)).meta == {"n": 1}
+    await up.close()
+    await down.close()
+    await new.close()
+
+
+async def test_connect_retries_legacy_reject_without_reason():
+    # An older peer rejects with an empty meta; the dialer must not depend on a reason.
+    async def legacy(reader, writer):
+        link = TcpLink(reader, writer)
+        await link.recv(5)
+        await link.send(Frame("hello_reject", {}))
+        await link.close()
+
+    server = await asyncio.start_server(legacy, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    t0 = asyncio.get_running_loop().time()
+    with pytest.raises(LinkClosed, match=r"peer rejected hello: \{\}"):
+        await connect("127.0.0.1", port, {"job_id": "j1", "epoch": 2}, timeout=0.5,
+                      retry_interval=0.05)
+    assert asyncio.get_running_loop().time() - t0 >= 0.5
+    server.close()
+    await server.wait_closed()
+
+
+async def test_link_server_close_with_unclaimed_link():
+    # A stage cancelled after its upstream connected but before it called
+    # accept() must still free its listener rather than hang in close().
+    server = await LinkServer("127.0.0.1", 0, {"job_id": "j1", "epoch": 1}).start()
+    up = await connect("127.0.0.1", server.port, {"job_id": "j1", "epoch": 1}, timeout=5)
+    await asyncio.wait_for(server.close(), 5)
+    with pytest.raises(LinkClosed):
+        await up.recv(5)
+    await up.close()
 
 
 async def test_memory_link():

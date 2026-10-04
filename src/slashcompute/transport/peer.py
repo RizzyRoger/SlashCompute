@@ -135,24 +135,40 @@ class MemoryLink(Link):
 
 async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
                   retry_interval: float = 0.25) -> TcpLink:
-    """Dial a downstream stage, retrying until it is listening."""
+    """Dial a downstream stage, retrying until it accepts this hello.
+
+    A reject is retried like a refused connection: the port may still be held
+    by the downstream's previous-epoch listener, which goes away once that
+    stage is cancelled and the new epoch's listener binds.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    rejects = 0
     while True:
         try:
             reader, writer = await asyncio.open_connection(host, port)
-            break
         except OSError:
             if loop.time() > deadline:
                 raise
             await asyncio.sleep(retry_interval)
-    link = TcpLink(reader, writer)
-    await link.send(Frame("hello", hello))
-    ack = await link.recv(timeout)
-    if ack.kind != "hello_ack":
+            continue
+        link = TcpLink(reader, writer)
+        try:
+            await link.send(Frame("hello", hello))
+            ack = await link.recv(max(deadline - loop.time(), retry_interval))
+            if ack.kind == "hello_ack":
+                return link
+            # Older peers send an empty meta, so the reason is only for the message.
+            why = f"peer rejected hello: {ack.meta.get('reason') or ack.meta}"
+        except (LinkClosed, asyncio.TimeoutError) as e:
+            why = f"hello failed: {str(e) or 'no reply'}"
         await link.close()
-        raise LinkClosed(f"peer rejected hello: {ack.meta}")
-    return link
+        if loop.time() > deadline:
+            raise LinkClosed(why)
+        rejects += 1
+        log.log(logging.INFO if rejects == 1 else logging.DEBUG,
+                "%s:%s not ready for this stage (%s); retrying", host, port, why)
+        await asyncio.sleep(retry_interval)
 
 
 class LinkServer:
@@ -161,6 +177,8 @@ class LinkServer:
     def __init__(self, host: str, port: int, expect: dict) -> None:
         self.host, self.port, self.expect = host, port, expect
         self._accepted: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._claimed = False                 # accept() handed the link to the caller
+        self._pending: set[TcpLink] = set()   # connections still in the hello exchange
         self._server: Optional[asyncio.base_events.Server] = None
 
     async def start(self) -> "LinkServer":
@@ -169,25 +187,51 @@ class LinkServer:
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 
+    def _reject_reason(self, hello: Frame) -> Optional[str]:
+        if hello.kind != "hello":
+            return "expected a hello frame"
+        wrong = [k for k, v in self.expect.items() if hello.meta.get(k) != v]
+        if wrong == ["epoch"]:
+            # Same job, so the dialer may learn which epoch this stage is on.
+            return f"stage is listening for epoch {self.expect['epoch']}, got {hello.meta.get('epoch')}"
+        if wrong:
+            return f"hello does not match this stage ({', '.join(wrong)})"
+        if self._accepted.done():
+            return "stage already has an upstream link"
+        return None
+
     async def _on_conn(self, reader, writer) -> None:
         link = TcpLink(reader, writer)
+        self._pending.add(link)
         try:
             hello = await link.recv(10.0)
         except Exception:
             await link.close()
             return
-        ok = hello.kind == "hello" and all(hello.meta.get(k) == v for k, v in self.expect.items())
-        if not ok or self._accepted.done():
-            await link.send(Frame("hello_reject", {}))
+        finally:
+            self._pending.discard(link)
+        reason = self._reject_reason(hello)
+        if reason is not None:
+            await link.send(Frame("hello_reject", {"reason": reason}))
             await link.close()
             return
         await link.send(Frame("hello_ack", {}))
         self._accepted.set_result(link)
 
     async def accept(self, timeout: Optional[float] = None) -> TcpLink:
-        return await asyncio.wait_for(asyncio.shield(self._accepted), timeout)
+        link = await asyncio.wait_for(asyncio.shield(self._accepted), timeout)
+        self._claimed = True
+        return link
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        if self._server is None:
+            return
+        self._server.close()                  # stops listening, so the port frees now
+        # wait_closed() waits for every connection, so close the ones nobody else
+        # will: half-done hellos and a link accepted after the caller gave up on it.
+        links = list(self._pending)
+        if self._accepted.done() and not self._accepted.cancelled() and not self._claimed:
+            links.append(self._accepted.result())
+        for link in links:
+            await link.close()
+        await self._server.wait_closed()
