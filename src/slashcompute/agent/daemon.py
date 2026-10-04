@@ -115,6 +115,7 @@ class Daemon:
         self._send_lock = asyncio.Lock()
         self._session: Optional[StageSession] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._pump: Optional[asyncio.Task] = None    # forwards the sandboxed worker's stdout
         self._stop = asyncio.Event()
         self._draining = False
         self._welcomed = False
@@ -232,11 +233,7 @@ class Daemon:
             await self._start_stage(msg)
         elif isinstance(msg, Drain):
             log.info("drain requested for job %s", msg.job_id)
-            if self._session:
-                self._session.request_drain()
-            if self._proc and self._proc.stdin:
-                self._proc.stdin.write(b'{"type":"drain"}\n')
-                await self._proc.stdin.drain()
+            await self._request_drain()
         elif isinstance(msg, CancelStage):
             log.info("cancel stage job %s epoch %d", msg.job_id, msg.epoch)
             await self._cancel_stage()
@@ -311,7 +308,7 @@ class Daemon:
         self._proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
         )
-        asyncio.create_task(self._pump_worker_stdout())
+        self._pump = asyncio.create_task(self._pump_worker_stdout())
 
     async def _pump_worker_stdout(self) -> None:
         proc = self._proc
@@ -346,6 +343,16 @@ class Daemon:
             if self.status == "running":
                 self.status, self.job_id, self.epoch = "idle", None, None
                 self._write_status()
+
+    async def _request_drain(self) -> None:
+        if self._session:
+            self._session.request_drain()
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.write(b'{"type":"drain"}\n')
+                await self._proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                             # the worker already exited
 
     async def _cancel_stage(self) -> None:
         if self._session:
@@ -417,6 +424,13 @@ class Daemon:
             try:
                 await asyncio.wait_for(self._session.task, timeout=self.opt.cfg.grace_period_s)
             except (asyncio.TimeoutError, asyncio.CancelledError, TypeError):
+                await self._cancel_stage()
+        elif self._proc:
+            # Sandboxed: the worker drains on a stdin line; the pump forwards its StageFinished.
+            await self._request_drain()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._pump), timeout=self.opt.cfg.grace_period_s)
+            except (asyncio.TimeoutError, TypeError):
                 await self._cancel_stage()
         self._stop.set()
         if self._ws is not None:

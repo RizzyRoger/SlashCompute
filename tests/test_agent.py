@@ -316,3 +316,75 @@ async def test_bad_dataset_reports_a_fatal_stage_error(tmp_path, tiny_model):
     assert len(sent) == 1 and isinstance(sent[0], StageFinished)
     assert sent[0].reason == "error" and sent[0].fatal
     assert "unrecognised dataset row keys" in sent[0].detail
+
+
+# A sandboxed worker whose stage runs until drained: the real stdio CLI around a fake stage.
+_DRAINABLE_WORKER = """
+import asyncio, sys
+from types import SimpleNamespace
+from slashcompute.agent import worker
+from slashcompute.common.protocol import StageFinished, StageReady
+
+async def run_stage(ctx, emit):
+    asg = ctx.assignment
+    ctx.session.runner = SimpleNamespace(drain=asyncio.Event())
+    await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
+    await ctx.session.runner.drain.wait()
+    await emit(StageFinished(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
+                             reason="drained", last_step=7))
+
+worker.run_stage = run_stage
+worker._stdio_app()
+"""
+
+
+async def test_stop_drains_a_sandboxed_worker_before_disconnecting(tmp_path, monkeypatch):
+    """`stop` used to drop the websocket under a sandboxed worker, so the job rolled back."""
+    import json
+    import os
+    import sys
+
+    import slashcompute
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import LoraFinetuneSpec, StageAssignment
+
+    src = str(Path(slashcompute.__file__).resolve().parents[1])
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
+    monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
+                        lambda cmd, *_: [sys.executable, "-c", _DRAINABLE_WORKER, *cmd[3:]])
+
+    sent, closed = [], asyncio.Event()
+
+    class FakeWS:
+        async def send(self, raw):
+            assert not closed.is_set(), "sent after the websocket closed"
+            sent.append(json.loads(raw))
+
+        async def close(self):
+            closed.set()
+
+    opt = AgentOptions(url="http://127.0.0.1:9920", home=tmp_path, localhost=True, sandbox=True)
+    opt.cfg.grace_period_s = 20
+    daemon = Daemon(opt)
+    daemon._ws = FakeWS()
+    asg = StageAssignment(
+        job_id="j", epoch=1, stage_idx=0, num_stages=1, layer_start=0, layer_end=8,
+        num_layers=8, spec=LoraFinetuneSpec(dataset_path="dataset.jsonl", steps=100),
+        checkpoint_every=25, verify_ring_size=8,
+    )
+    await daemon._start_stage(asg)
+    proc = daemon._proc
+    try:
+        for _ in range(200):
+            if any(m["type"] == "stage_ready" for m in sent):
+                break
+            await asyncio.sleep(0.05)
+        assert daemon.status == "running"
+        await asyncio.wait_for(daemon.shutdown(), 15)
+        finished = [m for m in sent if m["type"] == "stage_finished"]
+        assert finished and finished[0]["reason"] == "drained" and finished[0]["last_step"] == 7
+        assert closed.is_set() and proc.returncode == 0
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
