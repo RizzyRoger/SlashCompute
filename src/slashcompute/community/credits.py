@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from typing import Optional
 
 from sqlalchemy import func
@@ -23,6 +24,8 @@ class CreditError(Exception):
 class Credits:
     def __init__(self, db: Database) -> None:
         self.db = db
+        # Serialises check-balance-then-debit so concurrent spends cannot overdraw.
+        self._spend_lock = threading.Lock()
 
     def post(self, user_id: str, kind: str, amount: float, *, job_id: Optional[str] = None,
              grant_id: Optional[str] = None, node_id: Optional[str] = None,
@@ -155,13 +158,14 @@ class Credits:
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
         if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Set a FLOP budget greater than zero.")
-        if self.balance(user_id) < flops:
-            raise CreditError(
-                f"Need {flops:.3e} FLOPs; you have {self.balance(user_id):.3e}. Contribute first.",
-            )
-        self.post(user_id, "reserve", -flops, job_id=job_id)
-        acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
-        self.db.add(acct)
+        with self._spend_lock:
+            have = self.balance(user_id)
+            if have < flops:
+                raise CreditError(
+                    f"Need {flops:.3e} FLOPs; you have {have:.3e}. Contribute first.",
+                )
+            acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
+            self.db.add(CreditTxn(user_id=user_id, kind="reserve", amount=-flops, job_id=job_id), acct)
         return acct
 
     def job_account(self, job_id: str) -> Optional[JobAccount]:
@@ -199,18 +203,24 @@ class Credits:
     def donate(self, donor_id: str, recipient_id: str, grant_id: str, flops: float) -> None:
         if flops <= 0:
             raise CreditError("Donation must be positive.")
-        if self.balance(donor_id) < flops:
-            raise CreditError("Not enough personal credits to donate.")
-        self.post(donor_id, "donate", -flops, grant_id=grant_id)
-        self.post(recipient_id, "receive", flops, grant_id=grant_id)
+        self._transfer(donor_id, "donate", recipient_id, grant_id, flops,
+                       "Not enough personal credits to donate.")
 
     def allocate_pot(self, recipient_id: str, grant_id: str, flops: float) -> None:
         if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Allocation must be positive.")
-        if self.balance(POT_ID) < flops:
-            raise CreditError("Community pot does not have that many FLOPs.")
-        self.post(POT_ID, "allocate", -flops, grant_id=grant_id)
-        self.post(recipient_id, "receive", flops, grant_id=grant_id)
+        self._transfer(POT_ID, "allocate", recipient_id, grant_id, flops,
+                       "Community pot does not have that many FLOPs.")
+
+    def _transfer(self, source_id: str, kind: str, recipient_id: str, grant_id: str,
+                  flops: float, short_msg: str) -> None:
+        with self._spend_lock:
+            if self.balance(source_id) < flops:
+                raise CreditError(short_msg)
+            self.db.add(
+                CreditTxn(user_id=source_id, kind=kind, amount=-flops, grant_id=grant_id),
+                CreditTxn(user_id=recipient_id, kind="receive", amount=flops, grant_id=grant_id),
+            )
 
     def leaderboard(self, limit: int = 20) -> list[dict]:
         with self.db.session() as s:

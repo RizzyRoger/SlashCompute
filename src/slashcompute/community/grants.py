@@ -6,7 +6,7 @@ import math
 import secrets
 from typing import Optional
 
-from sqlmodel import select
+from sqlmodel import select, update
 
 from slashcompute.community.credits import Credits
 from slashcompute.community.fields import text
@@ -93,9 +93,11 @@ class Grants:
             self.credits.allocate_pot(g.author_id, g.id, flops)
         else:
             self.credits.donate(donor.id, g.author_id, g.id, flops)
-        g.received_flops += flops
-        self.db.save(g)
-        return g
+        with self.db.session() as s:
+            s.exec(update(Grant).where(Grant.id == g.id)
+                   .values(received_flops=Grant.received_flops + float(flops)))
+            s.commit()
+        return self.get(g.id)
 
     def comment(self, user: User, grant_id: str, body: str) -> GrantComment:
         g = self.get(grant_id)

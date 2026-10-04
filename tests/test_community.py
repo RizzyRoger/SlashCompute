@@ -7,6 +7,8 @@ import json
 import threading
 import time
 
+
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -341,6 +343,50 @@ def test_pot_allocate_admin_only(core):
     core.grants.donate(admin, g.id, 10.0, from_pot=True)
     assert core.grants.get(g.id).received_flops == 10.0
     assert core.credits.balance(member.id) == 10.0
+
+
+def _race(n, fn):
+    """Run fn from n threads released together; return how many calls succeeded."""
+    gate = threading.Barrier(n)
+    ok = []
+
+    def run():
+        gate.wait()
+        try:
+            fn()
+            ok.append(1)
+        except (CreditError, GrantError):
+            pass
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return len(ok)
+
+
+def test_concurrent_spends_cannot_overdraw(core):
+    admin, _ = _account(core.auth, "admin@lan.test")
+    member, _ = _account(core.auth, "m@lan.test")
+    donor, _ = _account(core.auth, "d@lan.test")
+    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 1e3)
+    core.grants.review(admin, g.id, True)
+    for _ in range(3):
+        core.credits.contribute(donor.id, 10.0, 0)
+        assert _race(16, lambda: core.grants.donate(donor, g.id, 10.0)) == 1
+        assert core.credits.balance(donor.id) == 0.0
+    assert core.grants.get(g.id).received_flops == 30.0
+    assert core.credits.balance(member.id) == 30.0
+
+    core.credits.contribute(member.id, 10.0, 100)
+    assert _race(16, lambda: core.grants.donate(admin, g.id, 10.0, from_pot=True)) == 1
+    assert core.credits.balance(POT_ID) == 0.0
+    assert core.grants.get(g.id).received_flops == 40.0
+
+    jobs = iter(range(16))
+    assert _race(16, lambda: core.credits.reserve_job(member.id, f"job-{next(jobs)}", 40.0)) == 1
+    assert core.credits.balance(member.id) == 0.0
 
 
 def test_flag_and_comment(core):
