@@ -153,6 +153,72 @@ def test_public_register_refuses_another_users_node_id(env):
     assert core.credits.owner_of("honest-node") == victim_id
 
 
+def test_public_account_switch_while_offline_rebinds_node(env):
+    client, core, *_ = env
+    first = _account(client, "first@lan.test")
+    second = _account(client, "second@lan.test")
+    first_id, second_id = core.auth.session_user(first).id, core.auth.session_user(second).id
+    with client.websocket_connect("/ws/agent") as ws:
+        assert isinstance(_register(ws, "same-mac", first), P.Welcome)
+    core.credits.contribute(first_id, 100.0, 0, node_id="same-mac")
+    earned = core.credits.summary(first_id)["balance"]
+    # Signed out, signed in as someone else: the persistent node id comes back under the new account.
+    with client.websocket_connect("/ws/agent") as ws:
+        assert isinstance(_register(ws, "same-mac", second), P.Welcome)
+        assert core.registry.get("same-mac").user_id == second_id
+        assert core.credits.owner_of("same-mac") == second_id
+    assert core.credits.summary(first_id)["balance"] == earned
+    # An inference node id (never a training node) can't be claimed through the agent socket.
+    core.credits.bind_node("n-inference", first_id)
+    with pytest.raises(WebSocketDisconnect) as e:
+        with client.websocket_connect("/ws/agent") as ws:
+            _register(ws, "n-inference", second)
+    assert e.value.code == 4003
+    assert core.credits.owner_of("n-inference") == first_id
+
+
+def test_inference_account_switch_rebinds_node(env):
+    from slashcompute.coordinator.inference_accounting import CoreAccounting
+    client, core, *_ = env
+    first = _account(client, "first@lan.test")
+    second = _account(client, "second@lan.test")
+    acct = CoreAccounting(core)
+    acct.bind_node("n-mac", first)
+    acct.bind_node("n-mac", second)       # the node token already proved it's the same machine
+    assert core.credits.owner_of("n-mac") == core.auth.session_user(second).id
+    # ...but a live training node with that id still answers only to its owner.
+    with client.websocket_connect("/ws/agent") as ws:
+        assert isinstance(_register(ws, "live-mac", first), P.Welcome)
+        acct.bind_node("live-mac", second)
+        assert core.credits.owner_of("live-mac") == core.auth.session_user(first).id
+
+
+def test_lan_anonymous_cannot_displace_live_owned_node(tmp_path):
+    app = create_app(EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.05, verify_rate=0.0))
+    with TestClient(app) as client:
+        core = app.state.core
+        owner = _account(client)
+        owner_id = core.auth.session_user(owner).id
+        with client.websocket_connect("/ws/agent") as honest:
+            assert isinstance(_register(honest, "owned-mac", owner), P.Welcome)
+            state = core.registry.get("owned-mac")
+            with pytest.raises(WebSocketDisconnect) as e:
+                with client.websocket_connect("/ws/agent") as ws:
+                    _register(ws, "owned-mac", None)
+            assert e.value.code == 4003
+            assert core.registry.get("owned-mac") is state
+            assert state.user_id == owner_id
+        # Offline, an owned node still needs a signed-in account; an unowned one reconnects freely.
+        with pytest.raises(WebSocketDisconnect) as e:
+            with client.websocket_connect("/ws/agent") as ws:
+                _register(ws, "owned-mac", None)
+        assert e.value.code == 4003
+        assert core.credits.owner_of("owned-mac") == owner_id
+        for _ in range(2):
+            with client.websocket_connect("/ws/agent") as ws:
+                assert isinstance(_register(ws, "lan-mac", None), P.Welcome)
+
+
 def test_public_transport_and_peered_assignment():
     spec = LoraFinetuneSpec(dataset_path="/tmp/d.jsonl", steps=2)
     peered = P.StageAssignment(

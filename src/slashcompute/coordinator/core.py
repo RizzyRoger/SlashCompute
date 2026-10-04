@@ -205,42 +205,25 @@ class Coordinator:
     # ------------------------------------------------------------ agent sessions
 
     async def on_register(self, msg: Register, send: SendFn) -> None:
-        public_user = None
-        if self.cfg.public_pool:
-            public_user = self.auth.session_user(msg.session_token) if msg.session_token else None
-            if public_user is None:
-                raise PermissionError("sign in")
-            if public_user.banned:
-                raise PermissionError("banned")
-            if public_user.accepted_terms_at is None:
+        user = self.auth.session_user(msg.session_token) if msg.session_token else None
+        if self.cfg.public_pool and user is None:
+            raise PermissionError("sign in")
+        if user is not None and user.banned:
+            raise PermissionError("banned")
+        if user is not None and user.accepted_terms_at is None:
+            if self.cfg.public_pool:
                 raise PermissionError("accept terms")
-        # Node ids are public (GET /nodes): only the account that owns one may re-register it,
-        # so a stranger cannot evict a live node or rebind its earnings.
-        claimant = public_user or (self.auth.session_user(msg.session_token)
-                                   if msg.session_token else None)
-        old = self.registry.get(msg.node_id)
-        owner = self.credits.owner_of(msg.node_id) or (old.user_id if old else None)
-        if claimant is not None and owner is not None and owner != claimant.id:
-            raise PermissionError("node id belongs to another account")
-        if old is not None:
+            log.warning("node %s session has not accepted terms — compute only", msg.node_id[:8])
+            user = None
+        elif msg.session_token and user is None:
+            log.warning("node %s presented a bad session token", msg.node_id[:8])
+        self._check_claim(msg.node_id, user.id if user else None)
+        if self.registry.get(msg.node_id) is not None:
             await self.recovery.on_node_lost(msg.node_id, "re-registered")
         state = self.registry.register(msg, send)
-        if public_user is not None:
-            state.user_id = public_user.id
-            self.credits.bind_node(msg.node_id, public_user.id)
-        elif msg.session_token:
-            user = self.auth.session_user(msg.session_token)
-            if user is None:
-                log.warning("node %s presented a bad session token", msg.node_id[:8])
-            elif user.banned:
-                self.registry.remove(msg.node_id)
-                raise PermissionError("banned")
-            elif user.accepted_terms_at is None:
-                log.warning("node %s session has not accepted terms — compute only",
-                            msg.node_id[:8])
-            else:
-                state.user_id = user.id
-                self.credits.bind_node(msg.node_id, user.id)
+        if user is not None:
+            state.user_id = user.id
+            self.credits.bind_node(msg.node_id, user.id, take_over=True)
         d = msg.device
         row = self.db.get(Node, msg.node_id) or Node(
             id=msg.node_id, name=msg.name, chip=d.chip, memory_contrib_bytes=d.memory_contrib_bytes,
@@ -253,6 +236,21 @@ class Coordinator:
                  msg.node_id[:8], msg.name, d.chip, d.memory_contrib_bytes / 1e9, d.matmul_tflops,
                  msg.gpu_percent)
         await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s))
+
+    def _check_claim(self, node_id: str, claimant: Optional[str]) -> None:
+        """Node ids are public (GET /nodes), so a stranger must not evict a live node or rebind
+        its earnings: a live node answers only to its owner. An offline training node may be taken
+        over by any signed-in account (a Mac that switched accounts; the old owner keeps what it
+        earned), but not anonymously. Inference nodes share the owner table yet never appear in
+        the training node table, so they stay out of reach here."""
+        live = self.registry.get(node_id)
+        owner = (live.user_id if live else None) or self.credits.owner_of(node_id)
+        if owner is None or owner == claimant:
+            return
+        if claimant is None:
+            raise PermissionError("node id belongs to an account: sign in and accept the terms")
+        if live is not None or self.db.get(Node, node_id) is None:
+            raise PermissionError("node id belongs to another account")
 
     async def on_disconnect(self, node_id: str) -> None:
         await self.recovery.on_node_lost(node_id, "disconnected")

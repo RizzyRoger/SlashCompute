@@ -61,7 +61,14 @@ class CoreAccounting:
         if user is None:
             log.warning("inference node %s presented a bad session token", node_id)
         elif not user.banned and user.accepted_terms_at is not None:
-            self.core.credits.bind_node(node_id, user.id)
+            # The node's own token proved this is the same machine, so whoever is signed in on it
+            # now takes over its future earnings (an account switch). A live training node with
+            # this id still answers only to its owner.
+            live = self.core.registry.get(node_id)
+            if live is not None and live.user_id not in (None, user.id):
+                log.warning("inference node %s id belongs to another account's live node", node_id)
+                return
+            self.core.credits.bind_node(node_id, user.id, take_over=True)
 
     def reserve(self, user_id: str, account_id: str, flops: float) -> None:
         user = self.core.auth.get(user_id)
