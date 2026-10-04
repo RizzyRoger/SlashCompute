@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from slashcompute.agent.daemon import Daemon, AgentOptions, peered_assignment, public_transport
 from slashcompute.common import protocol as P
+from slashcompute.common.canary import run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.jobs import LoraFinetuneSpec
@@ -181,3 +183,89 @@ def test_daemon_refuses_peered_assignment_on_https(tmp_path):
     asyncio.run(daemon._start_stage(asg))
     assert daemon._session is None
     assert daemon.status == "idle"
+
+
+def _node(client, node_id, token, mem=8 << 30):
+    ws = client.websocket_connect("/ws/agent").__enter__()
+    ws.send_text(P.dump(P.Register(
+        node_id=node_id, name=node_id, device=_device(mem),
+        data_host="127.0.0.1", data_port=9700, gpu_percent=100, session_token=token,
+    )))
+    assert isinstance(P.parse_coordinator_message(ws.receive_text()), P.Welcome)
+    return ws
+
+
+def _pass_canary(ws):
+    req = P.parse_coordinator_message(ws.receive_text())
+    assert isinstance(req, P.VerifyRequest) and req.kind == "canary"
+    ws.send_text(P.dump(P.VerifyResult(verify_id=req.verify_id, kind="canary",
+                                       stats=run_canary_mlx(req.seed, req.size))))
+
+
+def _flush(core, ws, node_id):
+    """A node's messages are handled in order: once its heartbeat lands, so has
+    everything it sent before."""
+    ws.send_text(P.dump(P.Heartbeat(node_id=node_id, status="draining")))
+    deadline = time.time() + 10
+    while core.registry.get(node_id).status != "draining":
+        assert time.time() < deadline, "heartbeat never handled"
+        time.sleep(0.02)
+
+
+def _usage(flops):
+    return P.UsageSample(flops=flops, tokens=1, peak_mem_bytes=0, resident_mem_bytes=0,
+                         mem_byte_seconds=0, wall_s=0, busy_s=0)
+
+
+@pytest.fixture
+def victim_job(env):
+    """A victim's job assigned to an honest node, plus a signed-in attacker node."""
+    client, core, tiny_model, tiny_dataset = env
+    victim, attacker, host = (_account(client, f"{n}@lan.test") for n in ("victim", "attacker", "host"))
+    core.credits.contribute(core.auth.session_user(victim).id, 1e15, 0)
+    honest = _node(client, "honest", host)
+    _pass_canary(honest)
+    r = client.post(
+        "/jobs/upload", headers=_hdr(victim),
+        files={"dataset": ("train.jsonl", tiny_dataset.read_bytes(), "application/jsonl")},
+        data={"model": str(tiny_model), "steps": 50, "batch_size": 2, "microbatches": 1,
+              "max_flops": 1e15},
+    )
+    assert r.status_code == 200, r.text
+    asg = P.parse_coordinator_message(honest.receive_text())
+    assert isinstance(asg, P.StageAssignment)
+    bad = _node(client, "attacker", attacker, mem=1 << 20)
+    yield client, core, asg, honest, bad, core.auth.session_user(attacker).id
+    honest.__exit__(None, None, None)
+    bad.__exit__(None, None, None)
+
+
+def test_unassigned_node_cannot_bill_another_users_job(victim_job):
+    client, core, asg, honest, bad, attacker_id = victim_job
+    before = core.credits.balance(attacker_id)
+    bad.send_text(P.dump(P.StepMetrics(
+        job_id=asg.job_id, epoch=asg.epoch, stage_idx=0, step=1, loss=0.1,
+        in_digest="x", out_digest="y", usage=_usage(1e15))))
+    _flush(core, bad, "attacker")
+    job = client.get(f"/jobs/{asg.job_id}").json()
+    assert core.credits.balance(attacker_id) == before
+    assert job["spent_flops"] == 0 and job["status"] not in ("cancelled", "failed")
+    assert not [r for r in core.ledger.job_records(asg.job_id) if r.node_id == "attacker"]
+
+    honest.send_text(P.dump(P.StepMetrics(
+        job_id=asg.job_id, epoch=asg.epoch, stage_idx=0, step=1, loss=0.1,
+        in_digest="x", out_digest="y", usage=_usage(1e9))))
+    _flush(core, honest, "honest")
+    assert client.get(f"/jobs/{asg.job_id}").json()["spent_flops"] == 1e9
+
+
+@pytest.mark.parametrize("reason", ["error", "done"])
+def test_unassigned_node_cannot_end_another_users_job(victim_job, reason):
+    client, core, asg, honest, bad, _ = victim_job
+    bad.send_text(P.dump(P.StageFinished(job_id=asg.job_id, epoch=asg.epoch, stage_idx=0,
+                                         reason=reason, last_step=0, detail="pwned")))
+    _flush(core, bad, "attacker")
+    job = client.get(f"/jobs/{asg.job_id}").json()
+    assert job["status"] in ("starting", "running") and job["recoveries"] == 0
+    assert core.jobs[asg.job_id].current.finished == {}
+    assert core.registry.get("honest").assignment is not None
