@@ -10,6 +10,8 @@ from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTra
 from slashcompute.inference.node.config import Commitment
 
 GB = 10 ** 9
+
+
 QWEN = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
 
 
@@ -27,6 +29,7 @@ def members(h, pid):
 
 # ------------------------------------------------------------ state machine
 
+
 def test_transition_table():
     check_transition("planned", "starting")
     check_transition("loading", "active")
@@ -38,6 +41,7 @@ def test_transition_table():
 
 
 # ------------------------------------------------------------ formation, reuse, teardown, failure
+
 
 @pytest.fixture
 async def two_node():
@@ -218,7 +222,6 @@ async def test_requests_during_a_drain_wait_instead_of_failing():
         await h.stop()
 
 
-
 def _late_agent(port):
     from slashcompute.inference.node.agent import Agent
     from slashcompute.inference.node.config import NodeConfig
@@ -308,3 +311,49 @@ async def test_node_reports_a_coordinator_without_inference_instead_of_stale_sta
         await agent.client.aclose()
         server.should_exit = True
         await serving
+
+
+async def test_malformed_messages_are_400_before_any_job(two_node):
+    h = two_node
+    async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+        for extra in ({"messages": []}, {}, {"messages": "hello"}, {"messages": [1]}):
+            r = await c.post("/v1/chat/completions", json={"model": QWEN, **extra})
+            assert r.status_code == 400, (extra, r.text)
+    assert h.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    assert pipelines(h) == []
+
+
+class RejectingEngine(FakeEngine):
+    """Rejects the request like llama-server does a prompt larger than its context."""
+
+    async def complete(self, pipeline_id, body):
+        if body["messages"][0]["content"] == "too long":
+            raise EngineError("invalid request: request (20010 tokens) exceeds the available context size "
+                              "(8192 tokens)", pipeline_broken=False, status=400)
+        async for ev in super().complete(pipeline_id, body):
+            yield ev
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_rejected_request_is_a_client_error_and_keeps_the_pipeline(stream):
+    h = await start_harness(fast_settings())
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)],
+                          engine_cls=RejectingEngine)
+        assert (await chat(h, QWEN)).status_code == 200
+        (p,) = pipelines(h)
+
+        r = await chat(h, QWEN, content="too long", stream=stream)
+        assert r.status_code == 400, r.text
+        err = r.json()["error"]
+        assert err["retryable"] is False and "exceeds the available context size" in err["message"]
+        # not retried, and the pipeline (and everyone else's requests on it) is untouched
+        failed = h.conn.execute("SELECT * FROM jobs WHERE state='failed'").fetchall()
+        assert len(failed) == 1 and failed[0]["retryable"] == 0
+        assert h.conn.execute("SELECT COUNT(*) FROM jobs WHERE retry_of IS NOT NULL").fetchone()[0] == 0
+        assert [(q["id"], q["state"]) for q in pipelines(h)] == [(p["id"], "active")]
+        r = await chat(h, QWEN, content="again")
+        assert r.status_code == 200 and r.json()["network"]["pipeline_id"] == p["id"]
+    finally:
+        await h.stop()

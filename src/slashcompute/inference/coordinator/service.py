@@ -573,6 +573,9 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
             raise HTTPException(e.status, str(e)) from e
         row = svc.model_or_404(body.get("model", ""))
         max_tokens = completion_limit(body)
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) for m in messages):
+            raise HTTPException(400, "messages must be a non-empty list of message objects.")
         stream = body_bool(body, "stream")
         # the engine gets exactly the budget we reserved for (llama-server alone would run to the end of the ctx)
         engine_body = {k: v for k, v in body.items()

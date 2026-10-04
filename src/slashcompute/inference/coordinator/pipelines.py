@@ -54,9 +54,10 @@ class PipelineFailed(RuntimeError):
 
 
 class JobFailed(RuntimeError):
-    def __init__(self, message: str, retryable: bool = True):
+    def __init__(self, message: str, retryable: bool = True, status: Optional[int] = None):
         super().__init__(message)
         self.retryable = retryable
+        self.status = status  # set when the head rejected the request itself (a 4xx for the client)
 
 
 def check_transition(old: str, new: str) -> None:
@@ -375,7 +376,7 @@ class PipelineManager:
                         if ev["type"] == "error":
                             if ev.get("pipeline_broken"):
                                 await self.break_pipeline(rt.id, ev["error"])
-                            raise JobFailed(ev["error"], ev.get("retryable", True))
+                            raise JobFailed(ev["error"], ev.get("retryable", True), ev.get("status"))
                         yield ev
                         if ev["type"] == "final":
                             return
@@ -500,7 +501,8 @@ async def serve(mgr: PipelineManager, model_id: str, body: dict, ctx: int, reque
                 retry_of = job_id
                 yield {"type": "reset"}
                 continue
-            yield {"type": "error", "status": 503, "error": str(e), "retryable": retryable, "job_id": job_id}
+            yield {"type": "error", "status": getattr(e, "status", None) or 503, "error": str(e),
+                   "retryable": retryable, "job_id": job_id}
             return
         except NoCapacity as e:
             fail_job(mgr.conn, job_id, str(e), False)

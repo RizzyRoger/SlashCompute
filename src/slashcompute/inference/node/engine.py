@@ -3,7 +3,8 @@
 Event stream from `complete()` (one dict per event):
   {'type': 'chunk', 'data': <OpenAI chat.completion.chunk>}
   {'type': 'final', 'timings': {...llama-server timings...}, 'usage': {...}, 'finish_reason': str}
-An engine raises `EngineError` when the pipeline breaks (e.g. an RPC worker disappears).
+An engine raises `EngineError` when the pipeline breaks (e.g. an RPC worker disappears), or with a `status`
+when llama-server rejects the request itself (bad messages, prompt larger than the context).
 """
 from __future__ import annotations
 
@@ -21,9 +22,13 @@ from slashcompute.inference.devices import Device, model_devices, parse_list_dev
 
 
 class EngineError(RuntimeError):
-    def __init__(self, message: str, pipeline_broken: bool = True):
+    """`status` is set when the request itself was rejected (the HTTP status for the client): the pipeline
+    is fine, and retrying the same request elsewhere would fail the same way."""
+
+    def __init__(self, message: str, pipeline_broken: bool = True, status: int | None = None):
         super().__init__(message)
         self.pipeline_broken = pipeline_broken
+        self.status = status
 
 
 class Engine(Protocol):

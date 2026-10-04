@@ -402,8 +402,8 @@ class Agent:
                 async for ev in self.engine.complete(p["pipeline_id"], p["body"]):
                     yield (json.dumps(ev) + "\n").encode()
             except EngineError as e:
-                yield (json.dumps({"type": "error", "error": str(e), "retryable": True,
-                                   "pipeline_broken": e.pipeline_broken}) + "\n").encode()
+                yield (json.dumps({"type": "error", "error": str(e), "retryable": e.status is None,
+                                   "pipeline_broken": e.pipeline_broken, "status": e.status}) + "\n").encode()
             except Exception as e:  # noqa: BLE001
                 yield (json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}", "retryable": True,
                                    "pipeline_broken": False}) + "\n").encode()
