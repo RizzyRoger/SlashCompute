@@ -103,6 +103,8 @@ def mount_community(app, core: Coordinator) -> None:
         user = core.auth.session_user(_token(request, authorization))
         if user is None:
             return {"user": None}
+        # A session from before the welcome credit never passes through sign-in again: grant it here.
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         return {"user": core.auth.public_view(user), "credits": core.credits.summary(user.id)}
 
     @r.post("/auth/accept-terms")

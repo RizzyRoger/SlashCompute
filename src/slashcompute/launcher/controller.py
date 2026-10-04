@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import signal
@@ -10,7 +11,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -60,6 +61,7 @@ class LauncherSettings:
     contribute: bool = True
     finish: str = "carbon"
     session_token: str = ""
+    session_url: str = ""              # the pool that issued session_token: it is never sent to another
     grant_split: int = 0
     training: bool = True              # lend this Mac to MLX fine-tunes
     memory_gb: int = 0                 # GiB lent to fine-tunes; 0 = automatic (what is free at start)
@@ -92,7 +94,8 @@ class LauncherSettings:
         return LauncherSettings(
             mode=mode, url=str(self.url or ""), gpu_percent=gpu,
             contribute=bool(self.contribute), finish=finish,
-            session_token=str(self.session_token or ""), grant_split=split,
+            session_token=str(self.session_token or ""), session_url=str(self.session_url or ""),
+            grant_split=split,
             training=bool(self.training), memory_gb=train_mem, inference=bool(self.inference),
             inference_memory_gb=mem,
             inference_head=bool(self.inference_head), models_dir=str(self.models_dir or "~/models"),
@@ -134,6 +137,32 @@ def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
             u = f"{u}:{port}"
         u = f"{scheme}://{u}"
     return u.rstrip("/")
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a file only this user can read: it holds a session or a fingerprint of one."""
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    path.write_text(text)
+
+
+def launch_record(argv: list[str], session: str) -> dict:
+    """What an agent or LLM node was started with. Its session goes through the environment (argv
+    shows in ps), so only a digest of it is kept to notice when it changes."""
+    return {"argv": argv, "session": hashlib.sha256(session.encode()).hexdigest() if session else ""}
+
+
+def recorded_argv(record: Any) -> Optional[list[str]]:
+    """The argv a running agent or node was started with, from its launch record (or the bare argv,
+    session included, that launchers before records wrote). None when unknown."""
+    if isinstance(record, dict):
+        record = record.get("argv")
+    if not isinstance(record, list) or "--url" not in record:
+        return None
+    if "--session-token" in record:
+        i = record.index("--session-token")
+        record = record[:i] + record[i + 2:]
+    return record
 
 
 def health_timeout(url: str) -> float:
@@ -228,13 +257,14 @@ class Launcher:
             return LauncherSettings()
         if not isinstance(raw, dict):
             return LauncherSettings()
-        return LauncherSettings(
+        s = LauncherSettings(
             mode=raw.get("mode", "host"),
             url=raw.get("url", ""),
             gpu_percent=raw.get("gpu_percent", 50),
             contribute=raw.get("contribute", True),
             finish=raw.get("finish", "carbon"),
             session_token=raw.get("session_token", ""),
+            session_url=raw.get("session_url", ""),
             grant_split=raw.get("grant_split", 0),
             training=raw.get("training", True),
             memory_gb=raw.get("memory_gb", 0),
@@ -244,13 +274,31 @@ class Launcher:
             models_dir=raw.get("models_dir", "~/models"),
             transport=raw.get("transport", "direct"),
         ).clamp()
+        if s.session_token and "session_url" not in raw:   # stored before sessions were tied to a pool
+            s.session_url = self.proxy_url(s)
+        return s
 
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
         before = self.load_settings()
         if (s.mode, s.url) != (before.mode, before.url):
             self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
-        self.settings_path.write_text(json.dumps(asdict(s), indent=2) + "\n")
+        write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+
+    def session_for(self, settings: LauncherSettings, url: Optional[str] = None) -> str:
+        """The stored session, but only for the pool that issued it (`url`, default the pool the
+        settings point at): pool A's token is never presented to pool B."""
+        s = settings.clamp()
+        url = self.proxy_url(s) if url is None else url
+        return s.session_token if s.session_token and s.session_url == url else ""
+
+    def with_session(self, settings: LauncherSettings, token: str) -> LauncherSettings:
+        """Settings holding a session just issued by the pool they point at ("" = signed out of it)."""
+        s = settings.clamp()
+        url = self.proxy_url(s)
+        if not token and s.session_url != url:
+            return s   # signing out of this pool leaves another pool's session alone
+        return replace(s, session_token=token, session_url=url if token else "")
 
     def coordinator_url(self, settings: LauncherSettings) -> str:
         if settings.mode == "host":
@@ -273,7 +321,7 @@ class Launcher:
             argv.extend(["--inference-transport", transport])
         return argv
 
-    def agent_argv(self, url: str, gpu_percent: int, session_token: str = "", memory_gb: int = 0) -> list[str]:
+    def agent_argv(self, url: str, gpu_percent: int, memory_gb: int = 0) -> list[str]:
         argv = [
             self.python, "-m", "slashcompute.agent.main", "start",
             "--url", url, "--gpu-percent", str(int(gpu_percent)),
@@ -281,20 +329,15 @@ class Launcher:
         ]
         if memory_gb:
             argv.extend(["--max-memory-gb", str(int(memory_gb))])
-        if session_token:
-            argv.extend(["--session-token", session_token])
         return argv
 
     def inference_argv(self, url: str, settings: LauncherSettings) -> list[str]:
         s = settings.clamp()
-        argv = [
+        return [
             self.python, "-m", "slashcompute.inference.node", "start",
             "--url", url, "--home", str(self.home), "--models-dir", s.models_dir,
             "--memory-gb", str(s.inference_memory_gb), "--head" if s.inference_head else "--no-head",
         ]
-        if s.session_token:
-            argv.extend(["--session-token", s.session_token])
-        return argv
 
     @property
     def inference_pid_path(self) -> Path:
@@ -462,7 +505,7 @@ class Launcher:
         if s.mode == "public" and not url:
             self.last_error = "Enter the public coordinator URL."
             raise LauncherError(self.last_error)
-        if s.mode == "public" and not s.session_token:
+        if s.mode == "public" and not self.session_for(s):
             self.last_error = "Sign in first."
             raise LauncherError(self.last_error)
 
@@ -502,39 +545,60 @@ class Launcher:
         if not want_agent and self._agent_running():
             request_stop(self.paths)
         if want_agent:
-            token = s.session_token or os.environ.get("SLASHCOMPUTE_SESSION", "")
-            argv = self.agent_argv(agent_url, s.gpu_percent, token, s.memory_gb)
-            if self._agent_running() and self._read_agent_args() != argv:
-                request_stop(self.paths)
-                deadline = time.monotonic() + 3.0
-                while time.monotonic() < deadline and self._agent_running():
-                    time.sleep(0.05)
-                if self._agent_running():
-                    self.last_error = (
-                        "Training agent is still stopping. Settings have not been applied; "
-                        "start again after its current work finishes."
-                    )
-            if not self._agent_running():
-                self._spawn(argv, self.log_dir / "agent.log")
-                args_path = self._agent_args_path()
-                args_path.touch(mode=0o600)
-                args_path.chmod(0o600)
-                args_path.write_text(json.dumps(argv))
+            self._ensure_agent(self.agent_argv(agent_url, s.gpu_percent, s.memory_gb),
+                               self._agent_session(s, agent_url))
 
         if want_inference:
             if s.mode == "join" and not self.poll_health(url):
                 self.last_error = f"No coordinator at {url}."
                 raise LauncherError(self.last_error)
-            argv = self.inference_argv(agent_url, s)
-            if self.read_inference_pid() is not None and self._read_inference_args() != argv:
-                self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
-            if self.read_inference_pid() is None:
-                self._spawn(argv, self.log_dir / "inference.log")
-                self._inference_args_path().write_text(json.dumps(argv))
+            self._ensure_inference(self.inference_argv(agent_url, s), self.session_for(s, agent_url))
         else:
             self._stop_inference()
 
         return self.snapshot(s)
+
+    def rebind_session(self) -> StatusSnapshot:
+        """After a sign-in or sign-out: restart the agent and LLM node running here with the session
+        now stored for their pool, so they earn for the signed-in account without another Start."""
+        s = self.load_settings()
+        try:
+            if self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
+                self._ensure_agent(argv, self._agent_session(s, argv[argv.index("--url") + 1]))
+            if self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
+                self._ensure_inference(argv, self.session_for(s, argv[argv.index("--url") + 1]))
+        except LauncherError:
+            pass   # last_error says why
+        return self.snapshot(s)
+
+    def _agent_session(self, s: LauncherSettings, url: str) -> str:
+        return self.session_for(s, url) or os.environ.get("SLASHCOMPUTE_SESSION", "")
+
+    def _ensure_agent(self, argv: list[str], session: str) -> None:
+        """Run the training agent as `argv` with `session`, restarting one started differently."""
+        record = launch_record(argv, session)
+        if self._agent_running() and self._read_agent_args() != record:
+            request_stop(self.paths)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self._agent_running():
+                time.sleep(0.05)
+            if self._agent_running():
+                self.last_error = (
+                    "Training agent is still stopping. Settings have not been applied; "
+                    "start again after its current work finishes."
+                )
+        if not self._agent_running():
+            self._spawn(argv, self.log_dir / "agent.log", session=session)
+            write_private(self._agent_args_path(), json.dumps(record))
+
+    def _ensure_inference(self, argv: list[str], session: str) -> None:
+        """Run the LLM node as `argv` with `session`, restarting one started differently."""
+        record = launch_record(argv, session)
+        if self.read_inference_pid() is not None and self._read_inference_args() != record:
+            self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
+        if self.read_inference_pid() is None:
+            self._spawn(argv, self.log_dir / "inference.log", session=session)
+            write_private(self._inference_args_path(), json.dumps(record))
 
     def stop(self) -> StatusSnapshot:
         self.last_error = ""
@@ -619,7 +683,7 @@ class Launcher:
             memory_available_bytes=mem_free,
         )
 
-    def _read_inference_args(self) -> list[str]:
+    def _read_inference_args(self) -> Any:
         try:
             return json.loads(self._inference_args_path().read_text())
         except (OSError, ValueError):
@@ -628,7 +692,7 @@ class Launcher:
     def _agent_args_path(self) -> Path:
         return self.home / "agent.args"
 
-    def _read_agent_args(self) -> list[str]:
+    def _read_agent_args(self) -> Any:
         try:
             return json.loads(self._agent_args_path().read_text())
         except (OSError, ValueError):
@@ -639,15 +703,20 @@ class Launcher:
         return bool(pid and process_alive(pid))
 
     def _spawn(self, argv: list[str], log_path: Path,
-               pid_writer: Optional[Callable[[int], None]] = None) -> Any:
+               pid_writer: Optional[Callable[[int], None]] = None, session: Optional[str] = None) -> Any:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if session is not None:   # through the environment: argv is visible to every user in ps
+            env.pop("SLASHCOMPUTE_SESSION", None)
+            if session:
+                env["SLASHCOMPUTE_SESSION"] = session
         # Append, never truncate: a failed start's reason must survive the next attempt. Unbuffered,
         # so a child that dies at once still leaves its last words in the log.
         with open(log_path, "ab") as fh:
             try:
                 proc = self._popen(
                     argv, stdout=fh, stderr=subprocess.STDOUT,
-                    start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                    start_new_session=True, env=env,
                 )
             except OSError as e:
                 self.last_error = f"Could not start process: {e}"

@@ -469,6 +469,22 @@ def test_welcome_credit_backfilled_on_login(env):
     assert len(_welcome_rows(client, token)) == 1
 
 
+def test_welcome_credit_backfilled_for_a_stored_session(env):
+    # Upgraded while signed in: the app keeps polling /auth/me and never signs in again.
+    client, core, *_ = env
+    user, token = _account(core.auth, "kept@lan.test")
+    assert core.credits.balance(user.id) == 0.0
+    for _ in range(3):
+        me = client.get("/auth/me", headers=_hdr(token)).json()
+    assert me["credits"]["balance"] == WELCOME_FLOPS
+    assert len(_welcome_rows(client, token)) == 1
+
+    banned, banned_token = _account(core.auth, "ban@lan.test")
+    core.auth.set_banned(banned, True)
+    client.get("/auth/me", headers=_hdr(banned_token))
+    assert core.credits.balance(banned.id) == 0.0
+
+
 def test_welcome_credit_on_google_sign_in(env, monkeypatch):
     client, core, *_ = env
     monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")

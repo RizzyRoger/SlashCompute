@@ -192,6 +192,21 @@ def test_settings_never_expose_session_token(tmp_path):
     assert launcher.load_settings().session_token == ""
 
 
+def test_sign_in_rebinds_running_processes_to_the_pool_that_issued_it(tmp_path):
+    app, launcher, _ = _shell(tmp_path)
+    rebinds = []
+    launcher.rebind_session = lambda: rebinds.append(launcher.session_for(launcher.load_settings()))
+    pool_a, pool_b = {"mode": "join", "url": "10.0.0.1"}, {"mode": "join", "url": "10.0.0.2"}
+    with TestClient(app, base_url=SHELL) as c:
+        assert c.post("/api/settings", json={**pool_a, "session_token": "sess"}).json()["has_session"] is True
+        assert rebinds == ["sess"]                    # the running agent and LLM node now earn for it
+        c.post("/api/settings", json={**pool_a, "gpu_percent": 30})
+        assert rebinds == ["sess"]
+        # Another pool never sees this session; coming back to the first one finds it again.
+        assert c.post("/api/settings", json=pool_b).json()["has_session"] is False
+        assert c.post("/api/settings", json=pool_a).json()["has_session"] is True
+
+
 def test_start_stop_and_discover(tmp_path, monkeypatch):
     http = FakeHTTP()
     app, launcher, spawned = _shell(tmp_path, http=http)

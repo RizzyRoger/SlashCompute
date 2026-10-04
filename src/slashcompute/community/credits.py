@@ -35,6 +35,7 @@ class Credits:
         self.db = db
         # Serialises check-balance-then-debit so concurrent spends cannot overdraw.
         self._spend_lock = threading.Lock()
+        self._welcomed: set[str] = set()   # users known to hold their welcome credit: skip the insert
 
     def post(self, user_id: str, kind: str, amount: float, *, job_id: Optional[str] = None,
              grant_id: Optional[str] = None, node_id: Optional[str] = None,
@@ -184,7 +185,7 @@ class Credits:
 
     def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
         """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""
-        if not math.isfinite(flops) or flops <= 0:
+        if not math.isfinite(flops) or flops <= 0 or user_id in self._welcomed:
             return 0.0
         user = self.db.get(User, user_id)
         if user is None or user.banned:
@@ -192,7 +193,9 @@ class Credits:
         try:
             self.post(user_id, "welcome", flops, note="Welcome credit")
         except IntegrityError:  # uq_credit_txns_welcome: someone else got there first
+            self._welcomed.add(user_id)
             return 0.0
+        self._welcomed.add(user_id)
         return float(flops)
 
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
