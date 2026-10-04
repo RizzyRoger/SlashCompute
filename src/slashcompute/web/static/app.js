@@ -1048,6 +1048,10 @@ const actions = {
     await saveSettings({ session_token: "" });
     state.user = null;
     state.credits = null;
+    // The grant board is per user (admin review queue, pledges): rebuild it
+    // so nothing from the old session stays on screen.
+    $("#g-request").hidden = true;
+    await loadGrants();
     toast("Signed out.");
   }),
 

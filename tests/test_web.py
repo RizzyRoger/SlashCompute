@@ -92,6 +92,19 @@ def test_index_and_css(tmp_path):
         assert c.get("/static/fonts/ibm-plex-mono-regular.woff2").status_code == 200
 
 
+def test_logout_rebuilds_grant_board(tmp_path):
+    # The admin review queue is only toggled by renderGrants(); signing out has
+    # to reload the board or Approve/Decline stays on screen for the next user.
+    app, _, _ = _shell(tmp_path)
+    with TestClient(app) as c:
+        js = c.get("/static/app.js").text
+    start = js.index("  logout: (btn) =>")
+    body = js[start:js.index("\n  }),", start)]
+    assert "state.user = null" in body
+    assert "await loadGrants()" in body
+    assert body.index("state.user = null") < body.index("await loadGrants()")
+
+
 def test_settings_and_status(tmp_path):
     app, launcher, _ = _shell(tmp_path)
     with TestClient(app) as c:
