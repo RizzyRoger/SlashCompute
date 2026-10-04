@@ -10,11 +10,17 @@ Stage 0 drives the pipeline. Between steps it may emit ``stop`` (drain) or
 that step boundary, forwards the frame, and exits. Because stage 0 finishes a
 step's backward last, every downstream stage has already applied that step
 when the frame arrives, so all checkpoints land on the same step.
+
+Links deliver each frame once, in order (a ``ResilientLink`` retransmits after
+a reconnect), so a frame from an earlier step or a repeated microbatch is a
+harmless leftover and is dropped. Only a frame no step can explain raises
+``PipelineDesync``, which restarts the epoch from its last checkpoint.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -26,6 +32,12 @@ import mlx.core as mx
 from slashcompute.pipeline.data import Batch, Example, make_batch
 from slashcompute.pipeline.stage import RingEntry, StageCompute
 from slashcompute.transport import Frame, Link, digest
+
+log = logging.getLogger(__name__)
+
+
+class PipelineDesync(RuntimeError):
+    """A neighbour sent a frame this stage can't place in its schedule."""
 
 
 @dataclass
@@ -162,9 +174,9 @@ class StageRunner:
                         entry = RingEntry(mb.inputs, h, adapters)
                     await self.next.send(Frame("fwd", {"step": step, "mb": j, "ntoks": batch.ntoks},
                                                {"h": h, "targets": mb.targets, "mask": mb.mask}))
+                seen: set[int] = set()
                 for _ in range(self.microbatches):
-                    g = await self.next.recv(self.peer_timeout)
-                    self._expect(g, "bwd", step)
+                    g = await self._recv_mb(self.next, "bwd", step, seen)
                     j = g.meta["mb"]
                     await self._run(c.backward, mbs[j].inputs, g.tensors["g"])
                 in_d, out_d = digest(entry.x_in), digest(entry.out)
@@ -176,7 +188,7 @@ class StageRunner:
         c = self.compute
         last_step = self.start_step
         while True:
-            first = await self.prev.recv(self.peer_timeout)
+            first = await self._recv_first(last_step)
             if first.kind in ("stop", "done"):
                 step = first.meta["step"]
                 if first.kind == "stop":
@@ -185,8 +197,8 @@ class StageRunner:
                     await self.next.send(Frame(first.kind, {"step": step}))
                 return StageResult("done" if first.kind == "done" else "drained", step)
 
-            self._expect(first, "fwd", None)
             step = first.meta["step"]
+            seen = {first.meta["mb"]}
             t0 = self._begin_step()
             adapters = c.current_adapters()
             inputs: dict[int, mx.array] = {}
@@ -196,8 +208,7 @@ class StageRunner:
             tokens = 0
             for k in range(self.microbatches):
                 if k > 0:
-                    frame = await self.prev.recv(self.peer_timeout)
-                    self._expect(frame, "fwd", step)
+                    frame = await self._recv_mb(self.prev, "fwd", step, seen)
                 j = frame.meta["mb"]
                 x = frame.tensors["h"]
                 tokens += x.shape[0] * x.shape[1]
@@ -216,9 +227,9 @@ class StageRunner:
                         entry = RingEntry(x, h, adapters)
 
             if not c.is_last:
+                seen = set()
                 for _ in range(self.microbatches):
-                    g = await self.next.recv(self.peer_timeout)
-                    self._expect(g, "bwd", step)
+                    g = await self._recv_mb(self.next, "bwd", step, seen)
                     j = g.meta["mb"]
                     gx = await self._run(c.backward, inputs[j], g.tensors["g"])
                     await self.prev.send(Frame("bwd", {"step": step, "mb": j}, {"g": gx}))
@@ -230,7 +241,39 @@ class StageRunner:
                                     in_d, out_d)
             last_step = step
 
-    @staticmethod
-    def _expect(frame: Frame, kind: str, step: Optional[int]) -> None:
-        if frame.kind != kind or (step is not None and frame.meta.get("step") != step):
-            raise RuntimeError(f"pipeline desync: expected {kind}@{step}, got {frame.kind}@{frame.meta}")
+    # ------------------------------------------------------------ receiving
+
+    def _valid_mb(self, frame: Frame) -> bool:
+        mb = frame.meta.get("mb")
+        return isinstance(mb, int) and 0 <= mb < self.microbatches
+
+    async def _recv_first(self, last_step: int) -> Frame:
+        """Downstream: the first ``fwd`` of the step after ``last_step``, or stop/done."""
+        while True:
+            f = await self.prev.recv(self.peer_timeout)
+            fstep = f.meta.get("step")
+            if f.kind in ("stop", "done"):
+                return f
+            if f.kind == "fwd" and isinstance(fstep, int) and fstep <= last_step:
+                log.warning("dropping stale fwd for step %s (at step %d)", fstep, last_step)
+                continue
+            if f.kind == "fwd" and fstep == last_step + 1 and self._valid_mb(f):
+                return f
+            raise PipelineDesync(f"expected fwd@{last_step + 1} or stop/done, got {f.kind}@{f.meta}")
+
+    async def _recv_mb(self, link: Link, kind: str, step: int, seen: set[int]) -> Frame:
+        """The next ``kind`` frame of ``step`` for a microbatch not yet in ``seen``."""
+        while True:
+            f = await link.recv(self.peer_timeout)
+            fstep = f.meta.get("step")
+            if f.kind == kind and fstep == step and self._valid_mb(f):
+                if f.meta["mb"] in seen:  # applying it twice would double its gradients
+                    log.warning("dropping repeated %s for step %d microbatch %s", kind, step,
+                                f.meta["mb"])
+                    continue
+                seen.add(f.meta["mb"])
+                return f
+            if f.kind == kind and isinstance(fstep, int) and fstep < step:
+                log.warning("dropping stale %s for step %s (at step %d)", kind, fstep, step)
+                continue
+            raise PipelineDesync(f"expected {kind}@{step}, got {f.kind}@{f.meta}")

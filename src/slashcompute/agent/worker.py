@@ -75,12 +75,13 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     # Downstream listens; upstream dials (see transport.peer).
     if asg.stage_idx > 0:
         server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
-                                  send_timeout=asg.peer_timeout_s).start()
+                                  send_timeout=asg.peer_timeout_s,
+                                  resume_window=asg.peer_timeout_s).start()
         log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
     if asg.next_peer is not None:
         log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
         nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
-                            send_timeout=asg.peer_timeout_s)
+                            send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
     if server is not None:
         prev = await server.accept(timeout=180.0)
         log.info("upstream connected from %s", getattr(prev, "peername", "?"))

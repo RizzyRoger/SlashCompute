@@ -9,7 +9,10 @@ can't cross-talk.
 Real LANs drop packets, sleep laptops and lose Wi-Fi, so nothing here waits
 forever: sockets use TCP keepalive (a vanished peer is noticed in about
 ``KEEPALIVE_IDLE_S + KEEPALIVE_INTERVAL_S * KEEPALIVE_COUNT`` seconds even when
-no data is moving), and receives, sends and dials take timeouts.
+no data is moving), and receives, sends and dials take timeouts. When both
+ends support it, a link is a ``ResilientLink``: a dropped connection is redialled
+and the frames the peer missed are retransmitted, so a network blip doesn't cost
+the job an epoch.
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Optional
+from collections import OrderedDict
+from typing import Awaitable, Callable, Optional
 
 from slashcompute.transport.serialization import (
     Frame, _HDR, decode_header, encode, tensor_from_bytes,
@@ -148,6 +152,20 @@ class TcpLink(Link):
             except OSError as e:
                 raise LinkClosed(str(e)) from e
 
+    def send_nowait(self, frame: Frame) -> None:
+        """Queue a small control frame without waiting for the socket to drain, so a
+        read loop can answer without blocking on its own sends. It can't split another
+        frame: ``send`` writes all of a frame's chunks without yielding in between."""
+        if self._writer.is_closing():
+            return
+        for c in encode(frame):
+            self._writer.write(c)
+            self.bytes_sent += len(c)
+
+    def abort(self) -> None:
+        """Drop the connection now (no flush); the read loop then reports it closed."""
+        self._writer.transport.abort()
+
     async def close(self) -> None:
         self._task.cancel()
         self._writer.close()
@@ -159,6 +177,168 @@ class TcpLink(Link):
             self._writer.transport.abort()
         except Exception:
             pass
+
+
+class ResilientLink(Link):
+    """A peer link that survives its TCP connection dropping.
+
+    Each data frame carries a sequence number (``meta["_seq"]``) and the sender
+    keeps it until the peer acknowledges it with an ``_ack`` frame. When the
+    connection breaks, the dialing side redials with a ``resume`` hello naming the
+    last frame it received, and the listening side answers with its own. Each side
+    then retransmits what the other hasn't received, in order and before anything
+    new, so the stage above sees every frame exactly once, in order. If no new
+    connection arrives within ``window`` seconds the link closes for good. ``_fin``
+    marks a deliberate close, so a stage that finished isn't redialled.
+    """
+
+    def __init__(self, tcp: TcpLink, *, window: float,
+                 redial: Optional[Callable[[int, float], Awaitable[tuple[TcpLink, dict]]]] = None) -> None:
+        super().__init__()
+        self._tcp = tcp
+        self._ready = tcp            # the connection that has had the backlog retransmitted
+        self._window = window
+        self._redial = redial        # only the dialing side redials
+        self._send_seq = 0
+        self._recv_seq = 0
+        self._unacked: OrderedDict[int, Frame] = OrderedDict()
+        self._send_lock = asyncio.Lock()
+        self._replaced = asyncio.Event()
+        self._closed = False
+        self._down_since: Optional[float] = None  # first failure not yet fully resumed
+        self.reconnects = 0
+        self._pump_task = asyncio.create_task(self._pump())
+
+    @property
+    def peername(self):
+        return self._tcp.peername
+
+    @property
+    def recv_seq(self) -> int:
+        return self._recv_seq
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def send(self, frame: Frame) -> None:
+        if self._closed:
+            raise LinkClosed("peer link closed")
+        self._send_seq += 1
+        f = Frame(frame.kind, {**frame.meta, "_seq": self._send_seq}, frame.tensors)
+        self._unacked[self._send_seq] = f
+        async with self._send_lock:
+            tcp = self._tcp
+            if tcp is not self._ready:
+                return  # a resume is retransmitting the backlog, which now includes this frame
+            try:
+                await tcp.send(f)
+            except LinkClosed as e:
+                # Kept in _unacked: retransmitted after the reconnect, or recv() reports
+                # the link closed once the window runs out.
+                log.info("peer link send failed (%s); will retransmit after reconnecting", e)
+                tcp.abort()
+
+    async def _pump(self) -> None:
+        try:
+            while True:
+                tcp = self._tcp
+                try:
+                    f = await tcp.recv()
+                except LinkClosed as e:
+                    if tcp is not self._tcp:
+                        continue  # already replaced by a resumed connection
+                    if self._closed or not await self._reconnect(tcp, e):
+                        self._queue.put_nowait(_CLOSED)
+                        return
+                    continue
+                if f.kind == "_ack":
+                    self._on_ack(f.meta.get("seq", 0))
+                    continue
+                if f.kind == "_fin":  # the peer closed on purpose: nothing to resume
+                    self._queue.put_nowait(_CLOSED)
+                    return
+                seq = f.meta.pop("_seq", None)
+                if seq is None or seq <= self._recv_seq:  # retransmitted after a resume
+                    tcp.send_nowait(Frame("_ack", {"seq": self._recv_seq}))
+                    continue
+                if seq != self._recv_seq + 1:
+                    log.warning("peer link skipped from frame %d to %d; reconnecting to resend",
+                                self._recv_seq, seq)
+                    tcp.abort()
+                    continue
+                self._recv_seq = seq
+                self._queue.put_nowait(f)
+                tcp.send_nowait(Frame("_ack", {"seq": seq}))
+        except asyncio.CancelledError:
+            pass
+
+    def _on_ack(self, seq: int) -> None:
+        while self._unacked and next(iter(self._unacked)) <= seq:
+            self._unacked.popitem(last=False)
+
+    async def _reconnect(self, dead: TcpLink, why: Exception) -> bool:
+        self.reconnects += 1
+        log.warning("peer link to %s dropped (%s); %s for up to %.0fs", dead.peername, why,
+                    "redialling" if self._redial else "waiting for the peer to redial", self._window)
+        dead.abort()
+        loop = asyncio.get_running_loop()
+        if self._down_since is None:
+            self._down_since = loop.time()
+        deadline = self._down_since + self._window  # repeated drops share one window
+        if self._redial is not None:
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError(f"no working connection for {self._window:.0f}s")
+                tcp, ack = await self._redial(self._recv_seq, remaining)
+            except (OSError, TimeoutError) as e:  # LinkClosed is an OSError
+                log.warning("could not reconnect the peer link: %s", e)
+                return False
+            await self._resume(tcp, int(ack.get("recv_seq", 0)))
+        while self._tcp is dead:
+            self._replaced.clear()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                log.warning("peer did not reconnect within %.0fs", self._window)
+                return False
+            try:
+                await asyncio.wait_for(self._replaced.wait(), remaining)
+            except TimeoutError:
+                pass
+        log.info("peer link resumed (reconnect %d)", self.reconnects)
+        return True
+
+    async def attach(self, tcp: TcpLink, peer_recv_seq: int) -> None:
+        """Listening side: the upstream redialled with a resume hello."""
+        await self._resume(tcp, peer_recv_seq)
+
+    async def _resume(self, tcp: TcpLink, peer_recv_seq: int) -> None:
+        old, self._tcp = self._tcp, tcp
+        if old is not tcp:
+            old.abort()  # a send stuck on the dead connection fails now instead of at its timeout
+        self._replaced.set()
+        async with self._send_lock:
+            if self._tcp is not tcp:
+                return  # replaced again meanwhile
+            self._on_ack(peer_recv_seq)
+            try:
+                for f in list(self._unacked.values()):
+                    await tcp.send(f)
+            except LinkClosed as e:
+                log.info("peer link dropped while retransmitting (%s)", e)
+                tcp.abort()
+                return
+            self._ready = tcp
+            self._down_since = None
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._tcp.send_nowait(Frame("_fin", {}))
+        self._pump_task.cancel()
+        await self._tcp.close()
 
 
 class MemoryLink(Link):
@@ -187,13 +367,35 @@ class MemoryLink(Link):
 
 
 async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
-                  retry_interval: float = 0.25, send_timeout: Optional[float] = None) -> TcpLink:
+                  retry_interval: float = 0.25, send_timeout: Optional[float] = None,
+                  resume_window: Optional[float] = None) -> Link:
     """Dial a downstream stage, retrying until it accepts this hello.
 
     A reject is retried like a refused connection: the port may still be held
     by the downstream's previous-epoch listener, which goes away once that
     stage is cancelled and the new epoch's listener binds.
+
+    With ``resume_window`` the link is offered as resilient; a peer that agrees
+    gets a ``ResilientLink`` that redials here after a drop. Older peers don't
+    answer the offer and get a plain ``TcpLink``.
     """
+    if resume_window is None:
+        link, _ = await _dial(host, port, hello, timeout, retry_interval, send_timeout)
+        return link
+    hello = {**hello, "resilient": 1}
+    tcp, ack = await _dial(host, port, hello, timeout, retry_interval, send_timeout)
+    if not ack.get("resilient"):
+        return tcp
+
+    async def redial(recv_seq: int, window: float) -> tuple[TcpLink, dict]:
+        return await _dial(host, port, {**hello, "resume": recv_seq}, window, retry_interval,
+                           send_timeout)
+
+    return ResilientLink(tcp, window=resume_window, redial=redial)
+
+
+async def _dial(host: str, port: int, hello: dict, timeout: float, retry_interval: float,
+                send_timeout: Optional[float]) -> tuple[TcpLink, dict]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     rejects = 0
@@ -211,7 +413,7 @@ async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
             await link.send(Frame("hello", hello))
             ack = await link.recv(max(deadline - loop.time(), retry_interval))
             if ack.kind == "hello_ack":
-                return link
+                return link, ack.meta
             # Older peers send an empty meta, so the reason is only for the message.
             why = f"peer rejected hello: {ack.meta.get('reason') or ack.meta}"
         except (LinkClosed, asyncio.TimeoutError) as e:
@@ -226,12 +428,20 @@ async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
 
 
 class LinkServer:
-    """Accepts exactly one upstream link whose hello matches ``expect``."""
+    """Accepts exactly one upstream link whose hello matches ``expect``.
+
+    With ``resume_window`` an upstream that offers a resilient link gets a
+    ``ResilientLink``, and later ``resume`` hellos for the same (job, epoch)
+    reattach to it instead of being rejected.
+    """
 
     def __init__(self, host: str, port: int, expect: dict,
-                 send_timeout: Optional[float] = None) -> None:
+                 send_timeout: Optional[float] = None,
+                 resume_window: Optional[float] = None) -> None:
         self.host, self.port, self.expect = host, port, expect
         self.send_timeout = send_timeout
+        self.resume_window = resume_window
+        self._resilient: Optional[ResilientLink] = None
         self._accepted: asyncio.Future = asyncio.get_running_loop().create_future()
         self._claimed = False                 # accept() handed the link to the caller
         self._pending: set[TcpLink] = set()   # connections still in the hello exchange
@@ -252,6 +462,10 @@ class LinkServer:
             return f"stage is listening for epoch {self.expect['epoch']}, got {hello.meta.get('epoch')}"
         if wrong:
             return f"hello does not match this stage ({', '.join(wrong)})"
+        if "resume" in hello.meta:
+            if self._resilient is None or self._resilient.closed:
+                return "no link to resume"
+            return None
         if self._accepted.done():
             return "stage already has an upstream link"
         return None
@@ -271,10 +485,20 @@ class LinkServer:
             await link.send(Frame("hello_reject", {"reason": reason}))
             await link.close()
             return
+        if "resume" in hello.meta:
+            resilient = self._resilient
+            await link.send(Frame("hello_ack", {"resilient": 1, "recv_seq": resilient.recv_seq}))
+            await resilient.attach(link, int(hello.meta["resume"]))
+            return
+        if hello.meta.get("resilient") and self.resume_window is not None:
+            await link.send(Frame("hello_ack", {"resilient": 1}))
+            self._resilient = ResilientLink(link, window=self.resume_window)
+            self._accepted.set_result(self._resilient)
+            return
         await link.send(Frame("hello_ack", {}))
         self._accepted.set_result(link)
 
-    async def accept(self, timeout: Optional[float] = None) -> TcpLink:
+    async def accept(self, timeout: Optional[float] = None) -> Link:
         link = await asyncio.wait_for(asyncio.shield(self._accepted), timeout)
         self._claimed = True
         return link

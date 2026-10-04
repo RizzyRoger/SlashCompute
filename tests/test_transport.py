@@ -5,7 +5,7 @@ import mlx.core as mx
 import pytest
 
 from slashcompute.transport import (
-    Frame, LinkClosed, LinkServer, LinkTimeout, MemoryLink, TcpLink, connect, digest,
+    Frame, LinkClosed, LinkServer, LinkTimeout, MemoryLink, ResilientLink, TcpLink, connect, digest,
 )
 from slashcompute.transport.peer import KEEPALIVE_IDLE_S
 from slashcompute.transport.serialization import decode_bytes, encode_bytes
@@ -190,3 +190,98 @@ async def test_send_times_out_when_the_peer_stops_reading():
     release.set()
     server.close()
     await server.wait_closed()
+
+
+async def _resilient_pair(window=5.0):
+    hello = {"job_id": "j", "epoch": 1}
+    server = await LinkServer("127.0.0.1", 0, hello, resume_window=window).start()
+    up = await connect("127.0.0.1", server.port, hello, timeout=5, retry_interval=0.05,
+                       resume_window=window)
+    down = await server.accept(5)
+    assert isinstance(up, ResilientLink) and isinstance(down, ResilientLink)
+    return server, up, down
+
+
+async def test_resilient_link_retransmits_across_dropped_connections():
+    server, up, down = await _resilient_pair()
+    h = mx.random.normal((4, 64, 256))
+    got_down, got_up = [], []
+
+    async def send_all(link, kind, cut_at):
+        for i in range(40):
+            if i in cut_at:
+                while link._ready is not link._tcp or link._tcp._writer.is_closing():
+                    await asyncio.sleep(0.01)  # let the previous drop recover first
+                link._tcp.abort()  # the network drops mid-stream, frames in flight are lost
+            await link.send(Frame(kind, {"i": i}, {"h": h + i}))
+
+    async def recv_all(link, out):
+        for _ in range(40):
+            f = await link.recv(10)
+            assert mx.array_equal(f.tensors["h"], h + f.meta["i"]).item()
+            out.append(f.meta["i"])
+
+    await asyncio.wait_for(asyncio.gather(
+        send_all(up, "fwd", {12, 30}), send_all(down, "bwd", {21}),
+        recv_all(down, got_down), recv_all(up, got_up)), 30)
+    assert got_down == list(range(40)) and got_up == list(range(40))  # each once, in order
+    assert up.reconnects >= 3
+    await up.close()
+    await down.close()
+    await server.close()
+
+
+async def test_resilient_link_gives_up_after_its_window():
+    server, up, down = await _resilient_pair(window=0.5)
+    server._server.close()  # the downstream stops listening: redials are refused
+    down._tcp.abort()
+    t0 = asyncio.get_running_loop().time()
+    for link in (up, down):
+        with pytest.raises(LinkClosed) as e:
+            await link.recv(10)
+        assert not isinstance(e.value, LinkTimeout)
+    assert asyncio.get_running_loop().time() - t0 < 5
+    await up.close()
+    await down.close()
+    await server.close()
+
+
+async def test_resilient_close_is_final_for_the_peer():
+    server, up, down = await _resilient_pair(window=30)
+    await up.send(Frame("done", {"step": 3}))
+    await up.close()
+    assert (await down.recv(5)).kind == "done"
+    t0 = asyncio.get_running_loop().time()
+    with pytest.raises(LinkClosed):
+        await down.recv(10)
+    assert asyncio.get_running_loop().time() - t0 < 2  # not after the 30 s resume window
+    assert down.reconnects == 0
+    await down.close()
+    await server.close()
+
+
+async def test_resume_hello_must_match_the_stage():
+    server, up, down = await _resilient_pair()
+    with pytest.raises(LinkClosed, match=r"does not match this stage \(job_id\)"):
+        await connect("127.0.0.1", server.port, {"job_id": "other", "epoch": 1, "resume": 0},
+                      timeout=0.3, retry_interval=0.05)
+    await up.send(Frame("x", {"v": 1}))
+    assert (await down.recv(5)).meta == {"v": 1}
+    await up.close()
+    await down.close()
+    await server.close()
+
+
+@pytest.mark.parametrize("dial_window,listen_window", [(5.0, None), (None, 5.0)])
+async def test_resilience_needs_both_ends(dial_window, listen_window):
+    # Agents from before resilient links answer (or offer) a plain hello.
+    hello = {"job_id": "j", "epoch": 1}
+    server = await LinkServer("127.0.0.1", 0, hello, resume_window=listen_window).start()
+    up = await connect("127.0.0.1", server.port, hello, timeout=5, resume_window=dial_window)
+    down = await server.accept(5)
+    assert type(up) is TcpLink and type(down) is TcpLink
+    await up.send(Frame("x", {"v": 1}))
+    assert (await down.recv(5)).meta == {"v": 1}
+    await up.close()
+    await down.close()
+    await server.close()
