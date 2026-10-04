@@ -36,7 +36,7 @@ from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
 from slashcompute.inference.coordinator.db import connect, tx
 from slashcompute.inference.coordinator.layers import build_layout
-from slashcompute.inference.coordinator.pipelines import PipelineManager, serve
+from slashcompute.inference.coordinator.pipelines import PipelineManager, estimate_prompt_tokens, serve
 from slashcompute.inference.coordinator.planner import NoPlan, build_matches
 from slashcompute.inference.coordinator.relay import Relay
 from slashcompute.inference.gguf import read_header_file
@@ -46,10 +46,6 @@ TOKEN_HEADER = "x-inference-token"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.gguf$")
 DOWNLOAD_TIMEOUT_S = 6 * 3600
 DEFAULT_MAX_TOKENS = 256
-
-
-def estimate_prompt_tokens(body: dict) -> int:
-    return max(8, len(json.dumps(body.get("messages", ""))) // 4)
 
 
 def completion_limit(body: dict) -> int:
@@ -661,6 +657,9 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                         break
                 yield "data: [DONE]\n\n"
             finally:
+                # a disconnect closes us here: close serve() too, so it cancels the job on the head and
+                # records the tokens generated so far *before* settle() releases the reservation
+                await events.aclose()
                 settle()
 
         return StreamingResponse(sse(), media_type="text/event-stream")

@@ -12,6 +12,7 @@ Lifecycle: planned -> starting -> loading -> active -> draining -> stopped | bro
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -370,20 +371,24 @@ class PipelineManager:
                 rt.last_used = time.time()
                 self.conn.execute("UPDATE jobs SET state='running', pipeline_id=? WHERE id=?", (rt.id, job_id))
                 self.bus.post(rt.head.node_id, "run_job", {"job_id": job_id, "pipeline_id": rt.id, "body": body})
+                done = False  # the head stopped by itself (final or error)
                 try:
                     while True:
                         ev = await asyncio.wait_for(q.get(), self.s.JOB_TIMEOUT_SECONDS)
+                        done = ev["type"] in ("final", "error")
                         if ev["type"] == "error":
                             if ev.get("pipeline_broken"):
                                 await self.break_pipeline(rt.id, ev["error"])
                             raise JobFailed(ev["error"], ev.get("retryable", True), ev.get("status"))
                         yield ev
-                        if ev["type"] == "final":
+                        if done:
                             return
                 except asyncio.TimeoutError:
                     await self.break_pipeline(rt.id, "job timed out")
                     raise JobFailed("job timed out", retryable=True)
                 finally:
+                    if not done:  # the requester went away: stop the head generating for nobody
+                        self.bus.post(rt.head.node_id, "cancel_job", {"job_id": job_id})
                     rt.inflight.discard(job_id)
                     rt.last_used = time.time()
                     self.conn.execute("UPDATE pipelines SET last_used_at=? WHERE id=?", (rt.last_used, rt.id))
@@ -400,7 +405,7 @@ class PipelineManager:
                              self.s.GEN_WEIGHT_MAX)
 
     def finish_job(self, rt: Runtime, job_id: str, final: dict, account_id: Optional[str],
-                   output_head: list[str], started_at: float) -> dict:
+                   output_head: list[str], started_at: float, state: str = "done") -> dict:
         """Credit a finished request: FLOPs per member from the head's token counts and timings."""
         s = self.s
         t = final.get("timings") or {}
@@ -421,9 +426,9 @@ class PipelineManager:
                 log.exception("recording credits for %s failed", job_id)
         with tx(self.conn):
             self.conn.execute(
-                "UPDATE jobs SET state='done', prompt_n=?, cache_n=?, predicted_n=?, flops=?, gen_weight=?, tok_s=?, "
+                "UPDATE jobs SET state=?, prompt_n=?, cache_n=?, predicted_n=?, flops=?, gen_weight=?, tok_s=?, "
                 "output_head=?, finished_at=? WHERE id=?",
-                (prompt_n, cache_n, predicted_n, total, w, g_tps, json.dumps(output_head), time.time(), job_id))
+                (state, prompt_n, cache_n, predicted_n, total, w, g_tps, json.dumps(output_head), time.time(), job_id))
             if g_tps:
                 self.conn.execute("UPDATE pipelines SET live_tok_s=? WHERE id=?", (g_tps, rt.id))
         names = nodes.node_names(self.conn)
@@ -436,9 +441,23 @@ class PipelineManager:
                         for m in rt.members],
         }
 
+    def abandon_job(self, rt: Optional[Runtime], job_id: str, account_id: Optional[str], output_head: list[str],
+                    started_at: float, prompt_n: int, predicted_n: int) -> None:
+        """The requester went away mid-request: credit the tokens generated so far and mark the job cancelled.
+        Synchronous, so it completes even inside a cancelled task."""
+        if rt is None or not predicted_n:
+            self.conn.execute("UPDATE jobs SET state='cancelled', finished_at=? WHERE id=?", (time.time(), job_id))
+            return
+        final = {"timings": {"prompt_n": prompt_n, "predicted_n": predicted_n}}
+        self.finish_job(rt, job_id, final, account_id, output_head, started_at, state="cancelled")
+
     async def shutdown(self) -> None:
         for t in list(self._tasks):
             t.cancel()
+
+
+def estimate_prompt_tokens(body: dict) -> int:
+    return max(8, len(json.dumps(body.get("messages", ""))) // 4)
 
 
 def new_job(conn, model_id: str, requester_id: Optional[str], body: dict, stream: bool, attempt: int = 1,
@@ -463,10 +482,20 @@ def chunk_text(ev: dict) -> str:
         return ""
 
 
+def is_token(ev: dict) -> bool:
+    """A chunk carrying generated output (not llama-server's opening role-only delta)."""
+    try:
+        return any(v for k, v in ev["data"]["choices"][0]["delta"].items() if k != "role")
+    except (KeyError, IndexError, AttributeError):
+        return False
+
+
 async def serve(mgr: PipelineManager, model_id: str, body: dict, ctx: int, requester_id: Optional[str],
                 stream: bool, account_id: Optional[str] = None, head_tokens: int = 32) -> AsyncIterator[dict]:
     """Route a request to a pipeline (forming one if needed) and run it; on a retryable failure
     re-plan without the failed node and retry once (if nothing was streamed to the requester yet).
+    Closed or cancelled mid-request (the requester disconnected): the head is told to stop and the
+    tokens generated so far are credited, before the caller settles the reservation.
 
     Yields: chunk events, an optional {'type': 'reset'} before a retry, then 'final' (with the
     credit summary) or 'error'."""
@@ -476,21 +505,27 @@ async def serve(mgr: PipelineManager, model_id: str, body: dict, ctx: int, reque
         job_id = new_job(mgr.conn, model_id, requester_id, body, stream, attempt, retry_of)
         sent = False
         head: list[str] = []
+        generated = 0
         rt = None
         started = time.time()
         try:
             rt = await mgr.get_pipeline(model_id, ctx, exclude)
-            async for ev in mgr.execute(rt, job_id, body):
-                if ev["type"] == "chunk":
-                    if len(head) < head_tokens:
-                        head.append(chunk_text(ev))
-                    sent = sent or stream
-                    yield ev
-                elif ev["type"] == "final":
-                    summary = mgr.finish_job(rt, job_id, ev, account_id, head, started)
-                    yield {"type": "final", "summary": summary, "finish_reason": ev.get("finish_reason"),
-                           "usage": ev.get("usage"), "output_head": head}
-                    return
+            async with contextlib.aclosing(mgr.execute(rt, job_id, body)) as events:
+                async for ev in events:
+                    if ev["type"] == "chunk":
+                        if len(head) < head_tokens:
+                            head.append(chunk_text(ev))
+                        generated += is_token(ev)
+                        sent = sent or stream
+                        yield ev
+                    elif ev["type"] == "final":
+                        final = ev
+                        summary = mgr.finish_job(rt, job_id, ev, account_id, head, started)
+                        break
+        except (asyncio.CancelledError, GeneratorExit):
+            mgr.abandon_job(rt, job_id, account_id, head, started,
+                            estimate_prompt_tokens(body) if generated else 0, generated)
+            raise
         except (JobFailed, PipelineFailed, CommandFailed) as e:
             retryable = getattr(e, "retryable", True)
             fail_job(mgr.conn, job_id, str(e), retryable)
@@ -508,3 +543,6 @@ async def serve(mgr: PipelineManager, model_id: str, body: dict, ctx: int, reque
             fail_job(mgr.conn, job_id, str(e), False)
             yield {"type": "error", "status": 503, "error": str(e), "retryable": False, "job_id": job_id}
             return
+        yield {"type": "final", "summary": summary, "finish_reason": final.get("finish_reason"),
+               "usage": final.get("usage"), "output_head": head}
+        return

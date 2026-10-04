@@ -160,8 +160,10 @@ class LlamaCppRpcEngine:
             raise EngineError(f'no head process for pipeline {pipeline_id}')
         proc, port = entry
         try:
-            async for ev in self._head.stream_chat(port, body):
-                yield ev
+            # closing us (a cancelled job) closes the HTTP stream right away, so llama-server stops generating
+            async with contextlib.aclosing(self._head.stream_chat(port, body)) as events:
+                async for ev in events:
+                    yield ev
         except EngineError:
             raise
         except Exception as e:

@@ -6,7 +6,7 @@ import pytest
 
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.inference.coordinator.layers import synthetic_layout
-from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition
+from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition, serve
 from slashcompute.inference.node.config import Commitment
 from slashcompute.inference.node.engine import EngineError
 from slashcompute.inference.node.fake_engine import FakeEngine
@@ -88,6 +88,75 @@ async def test_streaming_response(two_node):
     summary = json.loads(lines[-2][6:])
     assert summary["network"]["predicted_n"] == 16
     assert summary["network"]["gen_weight"] >= 1.0
+
+
+async def test_client_disconnect_mid_stream_cancels_the_head_and_credits_partial_work():
+    """The requester hangs up (curl -m, the UI's Stop button): the head stops generating, the job is
+    cancelled rather than left running, and the tokens produced so far are credited."""
+    h = await start_harness(fast_settings(), time_scale=1.0)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)])
+        assert (await chat(h, QWEN, max_tokens=2)).status_code == 200
+        records = len(h.svc.accounting.records)
+        head = h.agents["head"]
+
+        async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+            async with c.stream("POST", "/v1/chat/completions", json={
+                    "model": QWEN, "messages": [{"role": "user", "content": "go on forever"}],
+                    "max_tokens": 3000, "stream": True}) as r:
+                assert r.status_code == 200
+                seen = 0
+                async for line in r.aiter_lines():
+                    seen += line.startswith("data: ")
+                    if seen == 3:
+                        break
+                assert head.jobs  # the head is generating
+        job = None
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            job = h.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if job["state"] != "running" and not head.jobs:
+                break
+        assert job["state"] == "cancelled" and job["finished_at"]
+        assert not head.jobs  # cancel_job reached the head and closed its engine stream
+        assert 3 <= job["predicted_n"] < 3000
+        (rec,) = h.svc.accounting.records[records:]
+        assert set(rec["per_node"]) == {h.ids["head"], h.ids["worker"]}
+        assert all(f > 0 for f in rec["per_node"].values())
+        assert rec["tokens"] == job["prompt_n"] + job["predicted_n"]
+        # the pipeline is free for the next request
+        assert (await chat(h, QWEN, max_tokens=2, content="next")).status_code == 200
+    finally:
+        await h.stop()
+
+
+async def test_closing_serve_mid_stream_records_before_returning():
+    """sse() closes serve() when the requester goes away and then settles: the partial work must
+    already be recorded by the time aclose() returns, or settle() releases the reservation first."""
+    h = await start_harness(fast_settings(), time_scale=1.0)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)])
+        body = {"messages": [{"role": "user", "content": "long"}], "max_tokens": 3000}
+        events = serve(h.svc.mgr, QWEN, body, 4096, None, True, "inf-acct")
+        n = 0
+        async for ev in events:
+            n += ev["type"] == "chunk"
+            if n == 3:
+                break
+        await events.aclose()
+        job = h.conn.execute("SELECT * FROM jobs").fetchone()
+        assert job["state"] == "cancelled" and job["predicted_n"] == 3
+        (rec,) = [r for r in h.svc.accounting.records if r["account_id"] == "inf-acct"]
+        assert rec["tokens"] == job["prompt_n"] + 3
+        for _ in range(50):
+            if not h.agents["head"].jobs:
+                break
+            await asyncio.sleep(0.1)
+        assert not h.agents["head"].jobs
+    finally:
+        await h.stop()
 
 
 async def test_idle_pipeline_is_torn_down():

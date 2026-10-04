@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS pipeline_members (
 );
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, requester_id TEXT, model_id TEXT, pipeline_id TEXT,
-  state TEXT,                               -- queued | running | done | failed
+  state TEXT,                               -- queued | running | done | failed | cancelled
   attempt INTEGER NOT NULL DEFAULT 1, retry_of TEXT, stream INTEGER,
   prompt_n INTEGER, cache_n INTEGER, predicted_n INTEGER,
   flops REAL, gen_weight REAL, tok_s REAL, error TEXT, retryable INTEGER,
