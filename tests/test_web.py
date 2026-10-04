@@ -470,7 +470,11 @@ def test_live_grants_are_not_mixed_with_samples(tmp_path):
 
 # Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
 # test swaps in, so a poll can see the coordinator come and go.
+
+
 APP_JS = Path(__file__).resolve().parents[1] / "src/slashcompute/web/static/app.js"
+
+
 DOM_HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -493,10 +497,11 @@ let routes = {};
 const ctx = {
   document: { querySelector: element, querySelectorAll: () => [], addEventListener() {},
     createElement: element, body: stub(), activeElement: null },
-  window: { setInterval() {}, setTimeout() {}, clearTimeout() {} },
+  window: { setInterval() {}, setTimeout() {}, clearTimeout() {}, confirm: () => true },
   CSS: { escape: (s) => s }, navigator: stub(), XMLHttpRequest: function () {},
-  FormData: function () {}, console,
-  fetch: async (path) => {
+  FormData: function () {}, console, calls: [],
+  fetch: async (path, opts = {}) => {
+    ctx.calls.push({ path, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
     const body = routes[path.split("?")[0]];
     const ok = body !== undefined;
     return { ok, status: ok ? 200 : 404, statusText: "x",
@@ -696,8 +701,6 @@ def test_live_grants_flow(tmp_path):
         assert all(g["id"] != "g3" for g in declined.json()["grants"])
 
 
-
-
 def test_grant_amounts_must_be_positive_and_finite(tmp_path):
     http = GrantHTTP()
     app, launcher, _ = _shell(tmp_path, http=http)
@@ -729,3 +732,38 @@ def test_non_finite_settings_are_clamped_not_500(tmp_path):
     body = r.json()
     assert (body["gpu_percent"], body["grant_split"], body["memory_gb"], body["inference_memory_gb"]) == \
         (50, 0, 0, 0)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_connect_moves_what_this_mac_lends_and_labels_follow_the_mode(tmp_path):
+    """Connect restarts the running agent and LLM node on the new pool (it used to only save the
+    address), and a coordinator still running here reads as Hosting only in host mode."""
+    up = {"agent_running": True, "inference_running": True, "coordinator_pid": 4001, "coordinator_up": True}
+    routes = {"/api/start": {"last_error": ""},
+              "/api/overview": {"status": {"coordinator_up": True, "coordinator_url": "http://10.0.0.8:8765"}}}
+
+    def labels(mode):
+        return (f'state.settings = {{ mode: "{mode}" }}; state.ov = {{ status: {json.dumps(up)} }}; '
+                'renderSidebar(); renderPool(); [$("#side-title").textContent, $("#p-status").innerHTML]')
+
+    def connect(confirmed):
+        return (f'calls.length = 0; window.confirm = () => {json.dumps(confirmed)}; '
+                f'state.settings = {{ mode: "join", url: "", gpu_percent: 50 }}; state.ov = {{ status: {json.dumps(up)} }}; '
+                '$("#url").value = "10.0.0.8"; actions.connect({})')
+
+    starts = 'calls.filter((c) => c.path === "/api/start").map((c) => c.body)'
+    phases = [{"routes": {}},
+              {"routes": {}, "run": "0", "probe": labels("host")},
+              {"routes": {}, "run": "0", "probe": labels("join")},
+              {"routes": routes, "run": connect(False), "probe": starts},
+              {"routes": routes, "run": connect(True), "probe": starts}]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    host, join, declined, started = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert host[0] == "Hosting" and "hosting here" in host[1] and "Pool hosted here" not in host[1]
+    assert join[0] == "Joined" and "reachable" in join[1] and "Pool hosted here" in join[1]
+    assert declined == []   # keeping the pool hosted here: nothing changes
+    assert len(started) == 1
+    assert {k: started[0][k] for k in ("mode", "url", "training", "inference")} == {
+        "mode": "join", "url": "10.0.0.8", "training": True, "inference": True}

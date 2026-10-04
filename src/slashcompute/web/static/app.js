@@ -301,6 +301,9 @@ function showTab(name) {
   if (name === "llm" && status().coordinator_up) loadLlm().then(renderLlm);
 }
 
+// The pool on screen is ours only in host mode, not one left running from before joining another.
+const hostingHere = (st) => (state.settings || {}).mode === "host" && st.coordinator_pid != null;
+
 function renderSidebar() {
   const st = status();
   if (!state.ov) {
@@ -309,7 +312,7 @@ function renderSidebar() {
     setText("#side-sub", "The local /compute service is not answering.");
   } else if (st.coordinator_up) {
     setDot("#side-dot", "ok");
-    setText("#side-title", st.coordinator_pid ? "Hosting" : "Joined");
+    setText("#side-title", hostingHere(st) ? "Hosting" : "Joined");
     setText("#side-sub", `${plural(st.nodes || 0, "Mac")} · ${plural(st.jobs || 0, "job")}`);
   } else {
     setDot("#side-dot", "");
@@ -674,13 +677,15 @@ function renderPool() {
 
   const job = st.agent_job_id ? ` · job ${String(st.agent_job_id).slice(0, 8)}` : "";
   const rows = [
-    ["Coordinator", st.coordinator_up, st.coordinator_up ? (st.coordinator_pid ? "hosting here" : "reachable") : "offline"],
+    ["Coordinator", st.coordinator_up, st.coordinator_up ? (hostingHere(st) ? "hosting here" : "reachable") : "offline"],
     ["This Mac's agent", st.agent_running, st.agent_running ? `${st.agent_status || "running"}${job}` : "not contributing"],
     ["Macs in pool", (st.nodes || 0) > 0, st.coordinator_up ? String(st.nodes || 0) : "—"],
     ["Jobs", (st.jobs || 0) > 0, st.coordinator_up ? String(st.jobs || 0) : "—"],
     ["LLM node", !!st.inference_running, st.inference_running ? llmNodeState(st) : "not serving"],
     ["Address", st.coordinator_up, st.coordinator_url || "—"],
   ];
+  // Left the Host tab with our pool still up: it keeps serving whoever joined it until Connect stops it.
+  if (mode !== "host" && st.coordinator_pid != null) rows.push(["Pool hosted here", true, "still running · Connect stops it"]);
   renderOnce("status", rows, $("#p-status"), () => rows.map(([name, ok, value]) =>
     `<dt><i class="sq ${ok ? "ok" : ""}"></i>${esc(name)}</dt><dd>${esc(value)}</dd>`).join(""));
 
@@ -976,6 +981,12 @@ async function withBusy(key, button, busyText, fn) {
   }
 }
 
+// Joining another pool stops the coordinator hosted here once that pool answers: ask first.
+function leaveHostedPool() {
+  return status().coordinator_pid == null || window.confirm(
+    "Connecting stops the pool hosted on this Mac. Macs that joined it lose their coordinator. Continue?");
+}
+
 const actions = {
   "toggle-llm": (btn) => {
     const st = status();
@@ -1033,19 +1044,31 @@ const actions = {
     toast("Pool stopped.");
   }),
 
-  connect: (btn) => withBusy("connect", btn, "Connecting…", async () => {
-    const url = $("#url").value.trim();
-    if (!url) throw new Error("Enter the host Mac's address, or press Find on LAN.");
-    await saveSettings({ mode: "join", url });
-    const ov = await api("/api/overview");
-    if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
-    toast(`Connected to ${ov.status.coordinator_url}`);
-  }),
+  connect: (btn) => {
+    const st = status();
+    // Joining moves whatever this Mac lends to the new pool (and stops a pool hosted here).
+    const keep = {
+      contribute: !!(st.agent_running || st.inference_running),
+      training: !!st.agent_running,
+      inference: !!st.inference_running,
+    };
+    return withBusy("connect", btn, "Connecting…", async () => {
+      const url = $("#url").value.trim();
+      if (!url) throw new Error("Enter the host Mac's address, or press Find on LAN.");
+      if (!leaveHostedPool()) return;
+      const snap = await post("/api/start", { ...state.settings, ...keep, mode: "join", url });
+      if (snap.last_error) throw new Error(snap.last_error);
+      const ov = await api("/api/overview");
+      if (!ov.status.coordinator_up) throw new Error(`No coordinator answering at ${ov.status.coordinator_url}.`);
+      toast(`Connected to ${ov.status.coordinator_url}`);
+    });
+  },
 
   "connect-public": (btn) => withBusy("connect", btn, "Connecting…", async () => {
     if (!signedIn()) throw new Error("Sign in first.");
     const url = $("#public-url").value.trim() || status().public_url || "";
     if (!url) throw new Error("Enter the public coordinator URL.");
+    if (!leaveHostedPool()) return;
     const snap = await post("/api/start", { ...state.settings, mode: "public", url });
     if (snap.last_error) throw new Error(snap.last_error);
     const ov = await api("/api/overview");

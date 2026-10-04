@@ -506,6 +506,35 @@ def test_unreachable_error_clears_once_the_coordinator_answers(tmp_path):
     assert launcher.last_error == ""
 
 
+def test_switching_pool_drops_the_old_pools_error(tmp_path):
+    launcher = _launcher(tmp_path, port_free_fn=lambda host, port: False)
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    launcher.save_settings(LauncherSettings(mode="host", gpu_percent=80))   # same pool: still true
+    assert launcher.snapshot().last_error.startswith("Port 8765 is already in use")
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+    assert launcher.snapshot().last_error == ""   # nothing answers there yet, but it was never hosting
+
+
+def test_join_stops_the_pool_hosted_here_and_moves_the_agent(tmp_path, monkeypatch):
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: paths.clear_pid())
+    launcher = _launcher(tmp_path)
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    launcher.start(LauncherSettings(mode="host", contribute=True))
+    coord, agent = launcher._spawned  # type: ignore[attr-defined]
+    launcher.paths.pid_file.write_text(f"{agent.pid}\n")
+
+    snap = launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765", training=True))
+    assert (coord.pid, signal.SIGTERM) in kills
+    moved = launcher._spawned[-1].argv  # type: ignore[attr-defined]
+    assert moved[2] == "slashcompute.agent.main" and moved[moved.index("--url") + 1] == "http://10.0.0.8:8765"
+    coord.returncode = -signal.SIGTERM   # the stop we asked for is not an error
+    assert launcher.snapshot().last_error == snap.last_error == ""
+
+
 def test_reachable_coordinator_keeps_other_errors(tmp_path):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.last_error = "Training agent is still stopping. Settings have not been applied."

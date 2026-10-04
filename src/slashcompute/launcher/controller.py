@@ -247,6 +247,9 @@ class Launcher:
 
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
+        before = self.load_settings()
+        if (s.mode, s.url) != (before.mode, before.url):
+            self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
         self.settings_path.write_text(json.dumps(asdict(s), indent=2) + "\n")
 
     def coordinator_url(self, settings: LauncherSettings) -> str:
@@ -402,7 +405,8 @@ class Launcher:
             return False
         self._coordinator_proc = None
         self.coordinator_pid_path.unlink(missing_ok=True)
-        self.last_error = self._coordinator_exit_reason(code)
+        if self.load_settings().mode == "host":   # after a switch to another pool it is not news
+            self.last_error = self._coordinator_exit_reason(code)
         return True
 
     def _coordinator_exit_reason(self, code: int) -> str:
@@ -493,6 +497,8 @@ class Launcher:
         if s.mode in ("join", "public") and not self.poll_health(url):
             self.last_error = f"No coordinator at {url}."
             raise LauncherError(self.last_error)
+        if s.mode in ("join", "public"):
+            self._stop_coordinator()   # the new pool answers: stop hosting ours, nothing here dials it now
         if not want_agent and self._agent_running():
             request_stop(self.paths)
         if want_agent:
@@ -534,6 +540,10 @@ class Launcher:
         self.last_error = ""
         request_stop(self.paths)
         self._stop_inference()
+        self._stop_coordinator()
+        return self.snapshot()
+
+    def _stop_coordinator(self) -> None:
         self._forget_coordinator()
         # Also those found by command line: Stop must not leave ours up when its pid file was lost.
         for pid in dict.fromkeys([self.read_coordinator_pid(), *self.find_coordinators()]):
@@ -543,7 +553,6 @@ class Launcher:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 self.coordinator_pid_path.unlink(missing_ok=True)
-        return self.snapshot()
 
     def stop_agent(self) -> StatusSnapshot:
         """Stop contributing; a coordinator hosted here keeps running."""
