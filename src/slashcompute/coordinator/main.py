@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,8 @@ from slashcompute.common.config import EngineConfig
 from slashcompute.common.logging import setup_logging
 
 app = typer.Typer(no_args_is_help=True, help="/compute coordinator")
+
+SHUTDOWN_GRACE_S = 2.0  # in-flight requests (chat streams, uploads) get this long after SIGTERM
 
 
 def _url(url: Optional[str]) -> str:
@@ -65,9 +68,23 @@ def serve(
         if inference_transport not in TRANSPORTS:
             raise typer.BadParameter(f"--inference-transport must be one of {', '.join(TRANSPORTS)}")
         inference = inference.replace(TRANSPORT=inference_transport)
-    uvicorn.run(create_app(cfg, advertise=bool(mdns) and not cfg.public_pool, inference=inference),
-                host=cfg.coordinator_host, port=cfg.coordinator_port, log_level="warning",
-                ws_ping_interval=20, ws_max_size=64 * 1024 * 1024)
+    api = create_app(cfg, advertise=bool(mdns) and not cfg.public_pool, inference=inference)
+
+    class Server(uvicorn.Server):
+        # On SIGTERM uvicorn waits for every in-flight request before the lifespan shutdown, and
+        # inference nodes hold 25 s `/agent/commands` long-polls open (even after they've gone):
+        # release those first, and cap the wait for anything else.
+        async def shutdown(self, sockets=None):
+            api.state.inference.bus.close()
+            await super().shutdown(sockets)
+
+    server = Server(uvicorn.Config(api, host=cfg.coordinator_host, port=cfg.coordinator_port,
+                                   log_level="warning", ws_ping_interval=20, ws_max_size=64 * 1024 * 1024,
+                                   timeout_graceful_shutdown=SHUTDOWN_GRACE_S))
+    with contextlib.suppress(KeyboardInterrupt):
+        server.run()
+    if not server.started:
+        raise typer.Exit(3)  # couldn't bind, like uvicorn.run
 
 
 @app.command()

@@ -108,6 +108,7 @@ class InferenceService:
 
     def start(self) -> None:
         self.latency_kick = asyncio.Event()
+        self.bus.closing = asyncio.Event()  # bound to this run's event loop
         if self.s.BACKGROUND_TASKS:
             for loop in (self.monitor_loop, self.tick_loop, self.latency_loop):
                 self.spawn(loop())
