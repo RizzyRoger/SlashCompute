@@ -82,30 +82,44 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     return prev, nxt, server
 
 
+class DatasetError(ValueError):
+    """The job's dataset is malformed, so every retry would fail the same way."""
+
+
+def _load_dataset(path: Path, spec) -> list:
+    try:
+        return load_examples(path, spec.model, spec.max_seq_len)
+    except (ValueError, TypeError, KeyError) as e:
+        raise DatasetError(f"bad dataset: {e}") from e
+
+
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
-    ckdir = ctx.job_dir / "checkpoints"
-    ckdir.mkdir(parents=True, exist_ok=True)
-
-    dataset_path = None
-    if asg.dataset_url:
-        dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
-    resume_from = None
-    if asg.resume_step > 0 and asg.checkpoint_url:
-        resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
-
-    compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
-                            ring_size=asg.verify_ring_size)
-    if resume_from is not None:
-        compute.load_checkpoint(resume_from)
-
-    profile = profile_model(spec.model)
-    recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
-    examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
-
-    prev, nxt, server = await _peer_links(ctx)
+    prev = nxt = server = None
+    # Setup is inside the try so a failure still reports StageFinished(error)
+    # rather than leaving the coordinator waiting on a stage that never starts.
     try:
+        ckdir = ctx.job_dir / "checkpoints"
+        ckdir.mkdir(parents=True, exist_ok=True)
+
+        dataset_path = None
+        if asg.dataset_url:
+            dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
+        resume_from = None
+        if asg.resume_step > 0 and asg.checkpoint_url:
+            resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
+
+        compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
+                                ring_size=asg.verify_ring_size)
+        if resume_from is not None:
+            compute.load_checkpoint(resume_from)
+
+        profile = profile_model(spec.model)
+        recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
+        examples = _load_dataset(dataset_path, spec) if dataset_path else None
+
+        prev, nxt, server = await _peer_links(ctx)
         await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
 
         async def on_step(s: StepStats) -> None:
@@ -151,6 +165,7 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
         await emit(StageFinished(
             job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
             reason="error", last_step=asg.resume_step, detail=str(e),
+            fatal=isinstance(e, DatasetError),
         ))
         raise
     finally:

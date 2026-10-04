@@ -252,3 +252,27 @@ def test_job_upload_accepts_dataset_file(env):
     body = r.json()
     assert body["kind"] == "lora_finetune"
     assert body["id"] in core.jobs
+
+
+def test_fatal_stage_error_fails_the_job_without_retrying(env):
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        spec = _spec(tiny_model, tiny_dataset)
+        job_id = client.post("/jobs", json=json.loads(spec.model_dump_json())).json()["id"]
+        ag = {m.stage_idx: x for x in agents for m in [x.recv()]}
+        ag[0].send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0,
+                                   detail="bad dataset: unrecognised dataset row keys", fatal=True))
+        assert isinstance(ag[1].recv(), P.CancelStage)
+        _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "failed", timeout=3)
+        job = client.get(f"/jobs/{job_id}").json()
+        assert job["recoveries"] == 0 and "unrecognised dataset row keys" in job["error"]
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass

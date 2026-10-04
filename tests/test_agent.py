@@ -170,3 +170,35 @@ def test_wrap_command_prefixes_sandbox_exec(monkeypatch, tmp_path):
     cmd = sandbox.wrap_command(["python", "-m", "worker"], tmp_path / "job", tmp_path)
     assert cmd[:3] == ["/usr/bin/sandbox-exec", "-f", str(sandbox.profile_path())]
     assert cmd[-4:] == ["--", "python", "-m", "worker"]
+
+
+async def test_bad_dataset_reports_a_fatal_stage_error(tmp_path, tiny_model):
+    from slashcompute.agent.worker import WorkerContext, run_stage
+    from slashcompute.common.protocol import StageAssignment, StageFinished
+    from slashcompute.jobs import LoraFinetuneSpec
+
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"nope": 1}\n')
+
+    class Http:
+        def get_file(self, url, dest):
+            dest.write_bytes(bad.read_bytes())
+            return dest
+
+    spec = LoraFinetuneSpec(model=str(tiny_model), dataset_path=str(bad), steps=2, batch_size=2,
+                            microbatches=1, lora_rank=4)
+    asg = StageAssignment(job_id="j", epoch=1, stage_idx=0, num_stages=1, layer_start=0,
+                          layer_end=6, num_layers=6, spec=spec, dataset_url="/jobs/j/dataset",
+                          checkpoint_every=10, verify_ring_size=2)
+    ctx = WorkerContext(assignment=asg, http=Http(), job_dir=tmp_path / "job", data_bind="127.0.0.1",
+                        data_port=0, gpu_percent=100, node_id="n")
+    sent = []
+
+    async def emit(msg):
+        sent.append(msg)
+
+    with pytest.raises(ValueError):
+        await run_stage(ctx, emit)
+    assert len(sent) == 1 and isinstance(sent[0], StageFinished)
+    assert sent[0].reason == "error" and sent[0].fatal
+    assert "unrecognised dataset row keys" in sent[0].detail
