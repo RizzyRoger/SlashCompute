@@ -102,7 +102,7 @@ def test_logout_rebuilds_grant_board(tmp_path):
     # The admin review queue is only toggled by renderGrants(); signing out has
     # to reload the board or Approve/Decline stays on screen for the next user.
     app, _, _ = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         js = c.get("/static/app.js").text
     start = js.index("  logout: (btn) =>")
     body = js[start:js.index("\n  }),", start)]
@@ -413,7 +413,7 @@ def test_proxy_never_reuses_another_browsers_session(tmp_path, monkeypatch):
     with TestClient(coord_app) as coord:
         app, launcher, _ = _shell(tmp_path / "shell", http=stateless_http(transport=coord._transport))
         launcher.save_settings(LauncherSettings(mode="join", url="http://testserver"))
-        with TestClient(app) as c:
+        with TestClient(app, base_url=SHELL) as c:
             r = c.post("/api/coord/auth/register", json={
                 "email": "ada@lan.test", "password": "password1", "name": "Ada"})
             assert r.status_code == 200, r.text
@@ -495,11 +495,11 @@ def test_grants_tab_follows_coordinator_on_poll(tmp_path):
              "goal_flops": 50e12, "received_flops": 10e12, "status": "approved"}
     app, launcher, _ = _shell(tmp_path / "up", http=RoutedHTTP({**POOL, "/grants": [grant]}))
     launcher.save_settings(LauncherSettings(mode="host"))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         live = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
     assert live["/api/overview"]["status"]["coordinator_up"] and live["/api/grants"]["online"]
     app, _, _ = _shell(tmp_path / "down", http=RoutedHTTP({}))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         down = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
     assert not down["/api/overview"]["status"]["coordinator_up"]
     board = live["/api/grants"]
@@ -573,7 +573,7 @@ def test_grant_amounts_must_be_positive_and_finite(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=http)
     launcher.save_settings(LauncherSettings(mode="host"))
     summary = "Fine-tune a helper on my course notes for first years."
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         # Raw bodies: the JSON spec has no NaN/Infinity, but Python's parser (and float("inf")) accepts them.
         for bad in ("NaN", "Infinity", "-Infinity", "0", "-5", '"nan"', '"inf"', '"1e999"'):
             made = c.post("/api/grants", content=f'{{"title": "Lecture notes", "summary": "{summary}", '
@@ -591,7 +591,7 @@ def test_grant_amounts_must_be_positive_and_finite(tmp_path):
 
 def test_non_finite_settings_are_clamped_not_500(tmp_path):
     app, _, _ = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/settings", content='{"gpu_percent": Infinity, "grant_split": -Infinity, '
                                             '"memory_gb": NaN, "inference_memory_gb": 1e999}',
                    headers={"content-type": "application/json"})

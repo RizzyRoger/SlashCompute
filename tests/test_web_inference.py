@@ -118,7 +118,7 @@ def test_chat_rejects_bodies_that_are_not_a_json_object(tmp_path):
         sent.append(request)
         return httpx.Response(200)
 
-    with TestClient(_shell(tmp_path, handler)) as c:
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         for raw in (b"notjson", b"[1,2]", b'"hi"', b"", b"\xff"):
             r = c.post("/api/chat", content=raw, headers={"content-type": "application/json"})
             assert r.status_code == 400, (raw, r.text)
