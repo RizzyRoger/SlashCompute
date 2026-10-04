@@ -33,6 +33,29 @@ class CoreAccounting:
             raise AccountingError("This account is banned.", 403)
         return user.id
 
+    def admit_node(self, session_token: Optional[str]) -> None:
+        # same gate as a training node joining a public pool (Coordinator.on_register)
+        if not self.core.cfg.public_pool:
+            return
+        user = self.core.auth.session_user(session_token)
+        if user is None:
+            raise AccountingError("Sign in first.", 401)
+        if user.banned:
+            raise AccountingError("This account is banned.", 403)
+        if user.accepted_terms_at is None:
+            raise AccountingError("Accept the terms first.", 403)
+
+    def require_admin(self, request: Request) -> None:
+        if not self.core.cfg.public_pool:
+            return
+        user = self.core.auth.session_user(_token(request, request.headers.get("authorization")))
+        if user is None:
+            raise AccountingError("Sign in first.", 401)
+        if user.banned:
+            raise AccountingError("This account is banned.", 403)
+        if not user.admin:
+            raise AccountingError("Only an admin can manage models and pipelines.", 403)
+
     def bind_node(self, node_id: str, session_token: Optional[str]) -> None:
         user = self.core.auth.session_user(session_token)
         if user is None:

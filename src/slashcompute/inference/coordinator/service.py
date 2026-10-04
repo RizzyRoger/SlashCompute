@@ -140,6 +140,14 @@ class InferenceService:
         if self.s.TOKEN and not secrets.compare_digest(request.headers.get(TOKEN_HEADER, ""), self.s.TOKEN):
             raise HTTPException(401, "missing or wrong inference token")
 
+    def check_admin(self, request: Request) -> None:
+        """Model and pipeline management: the shared secret, plus an admin session on public pools."""
+        self.check_token(request)
+        try:
+            self.accounting.require_admin(request)
+        except AccountingError as e:
+            raise HTTPException(e.status, str(e)) from e
+
     # ------------------------------------------------------------ background loops
 
     async def monitor_loop(self) -> None:
@@ -357,6 +365,10 @@ def make_router(svc: InferenceService) -> APIRouter:
     @r.post("/nodes/register")
     async def register_node(body: dict, request: Request):
         svc.check_token(request)
+        try:
+            svc.accounting.admit_node(body.get("session_token"))
+        except AccountingError as e:
+            raise HTTPException(e.status, str(e)) from e
         build = body.get("llama_build", "")
         if not build_matches(build, s.PINNED_LLAMA_BUILD):
             raise HTTPException(409, f"llama.cpp build {build!r} does not match the pinned build "
@@ -500,7 +512,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.post("/models/upload")
     async def upload_model(request: Request, name: str = ""):
-        svc.check_token(request)
+        svc.check_admin(request)
         return await svc.receive_upload(request, name or request.headers.get("x-filename", ""))
 
     @r.get("/models/files/{name}")
@@ -514,7 +526,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.delete("/models/{name}")
     async def delete_model(name: str, request: Request):
-        svc.check_token(request)
+        svc.check_admin(request)
         row = conn.execute("SELECT name FROM model_files WHERE name=?", (name,)).fetchone()
         if row is None:
             raise HTTPException(404, "no such uploaded model")
@@ -543,7 +555,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.post("/pipelines/{pipeline_id}/stop")
     async def stop_pipeline(pipeline_id: str, request: Request):
-        svc.check_token(request)
+        svc.check_admin(request)
         if pipeline_id not in mgr.runtimes:
             raise HTTPException(404, "unknown pipeline")
         svc.spawn(mgr.stop_pipeline(pipeline_id, "unloaded from the app"))

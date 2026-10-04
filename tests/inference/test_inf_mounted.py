@@ -110,7 +110,8 @@ async def test_anonymous_chat_is_free_and_earns_nobody(pool):
 @pytest.mark.parametrize("pool", [False, True], indirect=True, ids=["lan", "public"])
 async def test_broke_or_unconsented_chatters_are_refused(pool):
     h = pool
-    await two_nodes(h)
+    _, host_token = account(h, "host@lan.test")
+    await two_nodes(h, session_token=host_token)
     _, broke = account(h, "broke@lan.test")
     r = await chat(h, QWEN, headers={"Authorization": f"Bearer {broke}"})
     assert r.status_code == 400 and "Contribute first" in r.text   # CreditError, same as training
@@ -149,6 +150,62 @@ async def test_banned_chatter_is_refused(pool):
     core(pool).auth.set_banned(user, True)
     r = await chat(pool, QWEN, headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 403 and "banned" in r.text
+
+
+async def register(h, session_token=None):
+    async with httpx.AsyncClient(base_url=h.node_url) as c:
+        return await c.post("/nodes/register", json={"name": "stranger", "llama_build": "b11160-fake",
+                                                     "session_token": session_token})
+
+
+@pytest.mark.parametrize("pool", [True], indirect=True, ids=["public"])
+async def test_public_inference_node_must_belong_to_a_consenting_account(pool):
+    h = pool
+    assert (await register(h)).status_code == 401                      # no session: it would serve anonymously
+    assert (await register(h, "invalid-session")).status_code == 401
+    _, no_terms = account(h, "new@lan.test", terms=False)
+    assert (await register(h, no_terms)).status_code == 403
+    banned, banned_token = account(h, "banned@lan.test")
+    core(h).auth.set_banned(banned, True)
+    assert (await register(h, banned_token)).status_code == 403
+    assert not h.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    host, host_token = account(h, "host@lan.test")
+    r = await register(h, host_token)
+    assert r.status_code == 200
+    assert core(h).credits.owner_of(r.json()["node_id"]) == host.id     # its earnings have an owner
+
+
+async def test_lan_inference_node_may_register_without_an_account(pool):
+    assert (await register(pool)).status_code == 200
+
+
+@pytest.mark.parametrize("pool", [False, True], indirect=True, ids=["lan", "public"])
+async def test_public_model_and_pipeline_management_is_admin_only(pool):
+    h = pool
+    public = core(h).cfg.public_pool
+    admin, admin_token = account(h, "admin@lan.test")                   # the first account is the admin
+    _, user_token = account(h, "user@lan.test", balance=1e16)
+    assert admin.admin
+    await two_nodes(h, session_token=admin_token)
+    assert (await chat(h, QWEN, max_tokens=4, headers={"Authorization": f"Bearer {user_token}"})).status_code == 200
+    [pipeline_id] = h.svc.mgr.runtimes
+
+    async def manage(headers, pipeline="p-missing"):
+        async with httpx.AsyncClient(base_url=h.node_url, headers=headers) as c:
+            return [(await c.post("/models/upload", params={"name": "m.txt"}, content=b"")).status_code,
+                    (await c.delete("/models/missing.gguf")).status_code,
+                    (await c.post(f"/pipelines/{pipeline}/stop")).status_code]
+
+    allowed = [400, 404, 404]                                           # past auth: bad file name, unknown names
+    assert await manage({}) == ([401] * 3 if public else allowed)
+    assert await manage({"Authorization": "Bearer invalid"}) == ([401] * 3 if public else allowed)
+    user = {"Authorization": f"Bearer {user_token}"}
+    assert await manage(user) == ([403] * 3 if public else allowed)
+    if public:
+        assert (await manage(user, pipeline_id))[2] == 403 and pipeline_id in h.svc.mgr.runtimes
+    assert await manage({"Cookie": f"slashcompute_session={admin_token}"}) == allowed   # the web shell's cookie
+    stopper = {"Authorization": f"Bearer {admin_token}"} if public else {}
+    assert (await manage(stopper, pipeline_id))[2] == 200
 
 
 async def test_non_numeric_max_tokens_is_a_400(pool):
