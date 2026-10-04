@@ -14,10 +14,12 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from slashcompute.pipeline.lora import adapter_weights, filter_layers, load_adapter_weights
 from slashcompute.pipeline.shard import ShardModule
+from slashcompute.transport.serialization import dtype_name, from_numpy, to_numpy
 
 
 def token_losses(logits: mx.array, targets: mx.array, mask: mx.array) -> mx.array:
@@ -36,6 +38,24 @@ class RingEntry:
     targets: Optional[mx.array] = None
     mask: Optional[mx.array] = None
 
+    def bundle(self) -> dict[str, mx.array]:
+        """The tensors of a verification bundle, by their names in the file."""
+        tensors = {"x_in": self.x_in, "out": self.out}
+        tensors |= {f"adapter/{k}": v for k, v in self.adapters.items()}
+        if self.targets is not None:
+            tensors |= {"targets": self.targets, "mask": self.mask}
+        return tensors
+
+
+# A ring entry held in host memory: bundle name -> (bytes as numpy, MLX dtype name).
+HeldEntry = dict[str, tuple[np.ndarray, str]]
+
+
+def _to_host(a: mx.array) -> tuple[np.ndarray, str]:
+    # A copy, not a view: a view would keep the Metal buffer alive. bfloat16 goes
+    # through its uint16 bytes, so the bundle stays byte-identical to the digest.
+    return np.array(to_numpy(a), copy=True), dtype_name(a)
+
 
 class StageCompute:
     def __init__(self, shard: ShardModule, learning_rate: float, ring_size: int = 8) -> None:
@@ -43,7 +63,7 @@ class StageCompute:
         self.optimizer = optim.Adam(learning_rate=learning_rate)
         self.optimizer.init(shard.trainable_parameters())
         self._grads = None
-        self.ring: OrderedDict[int, RingEntry] = OrderedDict()
+        self.ring: OrderedDict[int, HeldEntry] = OrderedDict()
         self.ring_size = ring_size
 
     @property
@@ -121,9 +141,17 @@ class StageCompute:
     # ------------------------------------------------------------ verification ring
 
     def remember(self, step: int, entry: RingEntry) -> None:
-        self.ring[step] = entry
+        """Keep what a replay of ``step`` needs, copied to host memory. Holding the
+        arrays themselves would pin ``ring_size`` steps of activations and adapter
+        snapshots in GPU (unified) memory for the whole job."""
+        self.ring[step] = {k: _to_host(v) for k, v in entry.bundle().items()}
         while len(self.ring) > self.ring_size:
             self.ring.popitem(last=False)
+
+    def release_ring(self) -> None:
+        """The stage is over: nothing can be fetched any more."""
+        self.ring.clear()
+        mx.clear_cache()
 
     def current_adapters(self) -> dict[str, mx.array]:
         # mx arrays are immutable; the optimizer swaps in new arrays, so these
@@ -131,13 +159,10 @@ class StageCompute:
         return adapter_weights(self.shard)
 
     def save_bundle(self, step: int, path: Path) -> bool:
-        entry = self.ring.get(step)
-        if entry is None:
+        held = self.ring.get(step)
+        if held is None:
             return False
-        tensors = {"x_in": entry.x_in, "out": entry.out}
-        tensors |= {f"adapter/{k}": v for k, v in entry.adapters.items()}
-        if entry.targets is not None:
-            tensors |= {"targets": entry.targets, "mask": entry.mask}
+        tensors = {k: from_numpy(a, name) for k, (a, name) in held.items()}
         mx.save_safetensors(str(path), tensors, metadata={"step": str(step)})
         return True
 

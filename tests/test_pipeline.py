@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from mlx_lm.utils import load_model
 
@@ -13,8 +14,8 @@ from slashcompute.pipeline.local import build_compute, run_local_pipeline
 from slashcompute.pipeline.model_profile import profile_model
 from slashcompute.pipeline.shard import load_shard
 from slashcompute.pipeline.schedule import PipelineDesync, StageRunner
-from slashcompute.pipeline.stage import merge_checkpoints, token_losses
-from slashcompute.transport import Frame, Link, LinkServer, LinkTimeout, MemoryLink, connect
+from slashcompute.pipeline.stage import RingEntry, merge_checkpoints, token_losses
+from slashcompute.transport import Frame, Link, LinkServer, LinkTimeout, MemoryLink, connect, digest
 
 
 def _spec(model, data, **kw):
@@ -226,3 +227,36 @@ async def test_training_survives_cut_peer_connections(tiny_model, tiny_dataset, 
         await server.close()
     assert up.reconnects >= 3
     assert _losses(got) == pytest.approx(_losses(ref), rel=1e-6)  # no step lost or repeated
+
+
+def test_verification_ring_does_not_pin_gpu_memory(tiny_model, tiny_dataset):
+    c = build_compute(_spec(tiny_model, tiny_dataset), 0, 6, 6, ring_size=4)
+    base = mx.get_active_memory()
+    for step in range(1, 7):
+        x = mx.random.normal((4, 1024, 1024)).astype(mx.bfloat16)  # 8 MB
+        c.remember(step, RingEntry(x, x * 2, {"layers.0.lora_a": x[:1]}))
+    del x
+    assert list(c.ring) == [3, 4, 5, 6]
+    assert all(isinstance(a, np.ndarray) for held in c.ring.values() for a, _ in held.values())
+    # Holding the arrays kept ring_size x 16 MB of activations in Metal memory.
+    assert mx.get_active_memory() - base < 8 * 2**20
+
+
+def test_bundle_from_the_ring_matches_step_time_digests(tiny_model, tiny_dataset, tmp_path):
+    c = build_compute(_spec(tiny_model, tiny_dataset), 0, 6, 6)
+    x = mx.random.normal((2, 8, 64)).astype(mx.bfloat16)
+    out = mx.random.normal((2, 8, 64)).astype(mx.bfloat16)
+    targets, mask = mx.array([[1, 2]], dtype=mx.int32), mx.array([[1.0, 0.0]])
+    entry = RingEntry(x, out, c.current_adapters(), targets, mask)
+    in_d, out_d = digest(entry.x_in), digest(entry.out)
+    c.remember(5, entry)
+
+    path = tmp_path / "bundle.safetensors"
+    assert c.save_bundle(5, path)
+    t = mx.load(str(path))
+    assert digest(t["x_in"]) == in_d and digest(t["out"]) == out_d  # byte-identical bf16
+    assert mx.array_equal(t["targets"], targets).item() and mx.array_equal(t["mask"], mask).item()
+    assert {k for k in t if k.startswith("adapter/")} == {f"adapter/{k}" for k in c.current_adapters()}
+
+    c.release_ring()
+    assert not c.ring and not c.save_bundle(5, path)

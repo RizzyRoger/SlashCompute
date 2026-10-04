@@ -102,7 +102,7 @@ def _load_dataset(path: Path, spec) -> list:
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
-    prev = nxt = server = None
+    prev = nxt = server = compute = None
     # Setup is inside the try so a failure still reports StageFinished(error)
     # rather than leaving the coordinator waiting on a stage that never starts.
     try:
@@ -175,6 +175,8 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
         ))
         raise
     finally:
+        if compute is not None:
+            compute.release_ring()
         for link in (prev, nxt):
             if link is not None:
                 try:
