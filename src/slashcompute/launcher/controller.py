@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -33,6 +35,7 @@ TRANSPORTS = ("direct", "relay")
 UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answering ")
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
+PORT_IN_USE = "Port {port} is already in use — quit the other /compute or coordinator, then Start hosting."
 
 
 def stateless_http(**kw: Any) -> httpx.Client:
@@ -145,9 +148,31 @@ def system_memory() -> tuple[int, int]:
 def process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    try:   # an exited child its parent has not reaped yet still answers kill(0)
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def started_after(pid: int, when: float) -> bool:
+    """Whether process `pid` began after `when`, i.e. the pid was reused since we recorded it."""
+    try:
+        return psutil.Process(pid).create_time() > when + 1.0
+    except psutil.Error:
+        return False
+
+
+def port_free(host: str, port: int) -> bool:
+    """Whether a server could bind host:port (uvicorn binds with SO_REUSEADDR too)."""
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            return e.errno != errno.EADDRINUSE
+    return True
 
 
 class Launcher:
@@ -160,6 +185,7 @@ class Launcher:
         discover_fn: Callable[[float], Optional[str]] = discover,
         lan_ip_fn: Callable[[], str] = lan_ip,
         memory_fn: Callable[[], tuple[int, int]] = system_memory,
+        port_free_fn: Callable[[str, int], bool] = port_free,
     ) -> None:
         self.cfg = EngineConfig.from_env(home=home)
         if home is not None:
@@ -172,7 +198,11 @@ class Launcher:
         self._discover = discover_fn
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn
+        self._port_free = port_free_fn
         self.last_error = ""
+        self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
+        self._coordinator_log_at = 0            # coordinator.log size when it was spawned
+        self._stopping: list[Any] = []          # coordinators we stopped, reaped once they exit
         self.paths = AgentPaths(self.home)
 
     @property
@@ -303,6 +333,7 @@ class Launcher:
             self.last_error = ("Inference transport can only change when this app started the coordinator; "
                                "restart it with --inference-transport " + settings.transport + ".")
             return
+        self._forget_coordinator()
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -311,8 +342,7 @@ class Launcher:
         while time.monotonic() < deadline and process_alive(pid):
             time.sleep(0.05)
         self.coordinator_pid_path.unlink(missing_ok=True)
-        self._spawn(self.coordinator_argv(settings.transport), self.log_dir / "coordinator.log",
-                    pid_writer=self.write_coordinator_pid)
+        self._spawn_coordinator(settings.transport)
         self.wait_health(self.proxy_url(settings))
 
     def read_coordinator_pid(self) -> Optional[int]:
@@ -320,12 +350,50 @@ class Launcher:
             return None
         try:
             pid = int(self.coordinator_pid_path.read_text().strip())
-        except ValueError:
+            written = self.coordinator_pid_path.stat().st_mtime
+        except (OSError, ValueError):
             return None
-        if process_alive(pid):
+        if process_alive(pid) and not started_after(pid, written):
             return pid
         self.coordinator_pid_path.unlink(missing_ok=True)
         return None
+
+    def _spawn_coordinator(self, transport: str) -> None:
+        log = self.log_dir / "coordinator.log"
+        self._coordinator_log_at = log.stat().st_size if log.exists() else 0
+        self._coordinator_proc = self._spawn(self.coordinator_argv(transport), log,
+                                             pid_writer=self.write_coordinator_pid)
+
+    def _forget_coordinator(self) -> None:
+        """We are stopping our coordinator: its exit is expected, so only reap it."""
+        if self._coordinator_proc is not None:
+            self._stopping.append(self._coordinator_proc)
+            self._coordinator_proc = None
+
+    def _check_coordinator(self) -> bool:
+        """Reap the coordinator we spawned once it exits (e.g. its port was taken): forget its pid and
+        say why in last_error. True when it had exited."""
+        self._stopping = [p for p in self._stopping if p.poll() is None]
+        proc = self._coordinator_proc
+        if proc is None or (code := proc.poll()) is None:
+            return False
+        self._coordinator_proc = None
+        self.coordinator_pid_path.unlink(missing_ok=True)
+        self.last_error = self._coordinator_exit_reason(code)
+        return True
+
+    def _coordinator_exit_reason(self, code: int) -> str:
+        log = self.log_dir / "coordinator.log"
+        try:
+            with open(log, "rb") as fh:
+                fh.seek(self._coordinator_log_at)   # only what this run wrote
+                lines = [ln.strip() for ln in fh.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+        except OSError:
+            lines = []
+        if code == 3 or any("address already in use" in ln.lower() for ln in lines):
+            return PORT_IN_USE.format(port=self.cfg.coordinator_port)
+        how = f"was stopped by signal {-code}" if code < 0 else f"exited with code {code}"
+        return f"The coordinator {how}: " + (" | ".join(lines[-3:]) if lines else f"see {log}.")
 
     def write_coordinator_pid(self, pid: int) -> None:
         self.coordinator_pid_path.write_text(str(pid) + "\n")
@@ -347,6 +415,8 @@ class Launcher:
         while time.monotonic() < deadline:
             if self.poll_health(url):
                 return True
+            if self._check_coordinator():
+                return False
             time.sleep(0.2)
         return False
 
@@ -374,12 +444,18 @@ class Launcher:
         want_agent = lend and s.training
         want_inference = lend and s.inference
 
-        health = self.poll_health(url) if want_coord else None
+        health = (self.poll_health(url) or self.poll_health(self.proxy_url(s))) if want_coord else None
         if want_coord and not health:
-            self._spawn(self.coordinator_argv(s.transport), self.log_dir / "coordinator.log",
-                        pid_writer=self.write_coordinator_pid)
-            check = self.proxy_url(s) if s.mode == "host" else url
-            if not (self.wait_health(check) or self.poll_health(url)):
+            self._check_coordinator()
+            if self.read_coordinator_pid() is None:   # ours may just be slow to answer: never start two
+                if not self._port_free(self.cfg.coordinator_host, self.cfg.coordinator_port):
+                    self.last_error = PORT_IN_USE.format(port=self.cfg.coordinator_port)
+                    raise LauncherError(self.last_error)
+                self.last_error = ""
+                self._spawn_coordinator(s.transport)
+            if not (self.wait_health(self.proxy_url(s)) or self.poll_health(url)):
+                if self._coordinator_proc is None and self.last_error:
+                    raise LauncherError(self.last_error)   # it exited: nothing to lend to
                 self.last_error = (
                     f"Coordinator started but is not answering {url}/health yet. "
                     f"Watch {self.log_dir / 'coordinator.log'}."
@@ -432,6 +508,7 @@ class Launcher:
         self.last_error = ""
         request_stop(self.paths)
         self._stop_inference()
+        self._forget_coordinator()
         pid = self.read_coordinator_pid()
         if pid is not None:
             try:
@@ -470,6 +547,7 @@ class Launcher:
 
     def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
         s = settings.clamp() if settings is not None else self.load_settings()
+        self._check_coordinator()
         url = self.coordinator_url(s)
         health = self.poll_health(url) or {}
         if not health and s.mode == "host":
@@ -527,16 +605,17 @@ class Launcher:
     def _spawn(self, argv: list[str], log_path: Path,
                pid_writer: Optional[Callable[[int], None]] = None) -> Any:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(log_path, "ab")
-        try:
-            proc = self._popen(
-                argv, stdout=fh, stderr=subprocess.STDOUT,
-                start_new_session=True, env=os.environ.copy(),
-            )
-        except OSError as e:
-            fh.close()
-            self.last_error = f"Could not start process: {e}"
-            raise LauncherError(self.last_error) from e
+        # Append, never truncate: a failed start's reason must survive the next attempt. Unbuffered,
+        # so a child that dies at once still leaves its last words in the log.
+        with open(log_path, "ab") as fh:
+            try:
+                proc = self._popen(
+                    argv, stdout=fh, stderr=subprocess.STDOUT,
+                    start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                )
+            except OSError as e:
+                self.last_error = f"Could not start process: {e}"
+                raise LauncherError(self.last_error) from e
         if pid_writer is not None:
             pid_writer(int(proc.pid))
         return proc

@@ -663,7 +663,8 @@ function renderPool() {
   banner.textContent = st.last_error || "";
 
   if (!state.busy.has("pool")) {
-    const hosting = st.coordinator_pid != null;
+    // A coordinator that failed (port taken, crashed) must leave Start hosting free for a retry.
+    const hosting = st.coordinator_pid != null && !(st.last_error && !st.coordinator_up);
     $("#p-start").textContent = hosting ? "Hosting" : "Start hosting";
     $("#p-start").disabled = hosting || !state.ov;
     $("#p-stop").disabled = !(st.coordinator_up || st.agent_running);

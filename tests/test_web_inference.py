@@ -17,6 +17,9 @@ class FakeProc:
         self.pid = pid
         self.argv = argv
 
+    def poll(self):
+        return None
+
 
 class FakeHTTP:
     def __init__(self, health=None) -> None:
@@ -47,7 +50,8 @@ def _launcher(tmp_path, health=None):
         return spawned[-1]
 
     launcher = Launcher(home=tmp_path, python="/opt/venv/bin/python", popen=popen, http=FakeHTTP(health),
-                        discover_fn=lambda timeout=5.0: None, lan_ip_fn=lambda: "192.168.1.20")
+                        discover_fn=lambda timeout=5.0: None, lan_ip_fn=lambda: "192.168.1.20",
+                        port_free_fn=lambda host, port: True)
     return launcher, spawned
 
 

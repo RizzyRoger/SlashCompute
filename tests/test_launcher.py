@@ -14,6 +14,10 @@ class FakeProc:
     def __init__(self, pid: int, argv: list[str]) -> None:
         self.pid = pid
         self.argv = argv
+        self.returncode = None   # set to make the process "exit"
+
+    def poll(self):
+        return self.returncode
 
 
 class FakeResponse:
@@ -54,6 +58,7 @@ def _launcher(tmp_path: Path, **kw) -> Launcher:
         http=kw.pop("http", FakeHTTP()),
         discover_fn=kw.pop("discover_fn", lambda timeout=5.0: None),
         lan_ip_fn=kw.pop("lan_ip_fn", lambda: "192.168.1.20"),
+        port_free_fn=kw.pop("port_free_fn", lambda host, port: True),
     )
     launcher._spawned = spawned  # type: ignore[attr-defined]
     return launcher
@@ -150,6 +155,116 @@ def test_start_host_spawns_coordinator_and_agent(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "agent.args").read_text()) == argv_lists[1]
     assert stat.S_IMODE((tmp_path / "agent.args").stat().st_mode) == 0o600
     assert snap.last_error == ""
+
+
+BIND_ERROR = (b"ERROR:    [Errno 48] error while attempting to bind on address ('0.0.0.0', 8765): "
+              b"[errno 48] address already in use\n")
+
+
+def test_coordinator_that_cannot_bind_is_reported_and_hosting_can_be_retried(tmp_path, monkeypatch):
+    # Another coordinator held :8765 but did not answer /health: ours logged the bind error and
+    # exited 3. The launcher used to keep reporting its (zombie) pid with no error, so Start
+    # hosting stayed disabled and the pool offline for good.
+    launcher = _launcher(tmp_path)
+    spawn = launcher._popen
+
+    def dies_on_bind(argv, **kw):
+        proc = spawn(argv, **kw)
+        kw["stdout"].write(BIND_ERROR)
+        proc.returncode = 3
+        return proc
+
+    launcher._popen = dies_on_bind
+    # An exited child nobody reaped still answers kill(0).
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive",
+                        lambda pid: any(p.pid == pid for p in launcher._spawned))  # type: ignore[attr-defined]
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    snap = launcher.snapshot()
+    assert snap.coordinator_pid is None and not (tmp_path / "coordinator.pid").exists()
+    assert snap.last_error == ("Port 8765 is already in use — quit the other /compute or coordinator, "
+                               "then Start hosting.")
+    assert "address already in use" in (tmp_path / "logs" / "coordinator.log").read_text()
+
+    launcher._popen = spawn   # the other app quit: Start hosting works again
+    launcher.poll_health = lambda url: {"ok": True} if len(launcher._spawned) == 2 else None  # type: ignore
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert len(launcher._spawned) == 2  # type: ignore[attr-defined]
+    assert snap.coordinator_pid == launcher._spawned[1].pid and snap.last_error == ""  # type: ignore
+
+
+def test_coordinator_exit_reports_the_end_of_its_log_but_a_stop_does_not(tmp_path, monkeypatch):
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: None)
+    launcher = _launcher(tmp_path)
+    (launcher.log_dir / "coordinator.log").write_bytes(BIND_ERROR)   # an earlier run's failure
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    launcher.start(LauncherSettings(mode="host", contribute=False))
+    with open(tmp_path / "logs" / "coordinator.log", "ab") as fh:
+        fh.write(b"Traceback (most recent call last):\nModuleNotFoundError: No module named 'zeroconf'\n")
+    launcher._spawned[0].returncode = 1  # type: ignore[attr-defined]
+    launcher.poll_health = lambda url: None  # type: ignore
+    snap = launcher.snapshot()
+    assert snap.coordinator_pid is None
+    assert snap.last_error.startswith("The coordinator exited with code 1: ")
+    assert "No module named 'zeroconf'" in snap.last_error and "Port" not in snap.last_error
+
+    launcher.poll_health = lambda url: {"ok": True} if len(launcher._spawned) == 2 else None  # type: ignore
+    assert launcher.start(LauncherSettings(mode="host", contribute=False)).last_error == ""
+    launcher.poll_health = lambda url: None  # type: ignore
+    launcher.stop()
+    launcher._spawned[-1].returncode = -signal.SIGTERM  # type: ignore[attr-defined]
+    assert launcher.snapshot().last_error == ""
+
+
+def test_start_hosting_on_a_taken_port(tmp_path):
+    # Something else answers no /health on :8765: say so instead of spawning a coordinator that dies.
+    launcher = _launcher(tmp_path, port_free_fn=lambda host, port: False)
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    # A coordinator that answers on loopback (not the LAN address) is used as it is.
+    launcher.poll_health = lambda url: {"ok": True} if "127.0.0.1" in url else None  # type: ignore
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == [] and snap.last_error == ""  # type: ignore[attr-defined]
+
+
+def test_coordinator_pid_file_of_a_zombie_or_reused_pid_is_not_hosting(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    launcher = _launcher(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while psutil.Process(child.pid).status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (tmp_path / "coordinator.pid").write_text(f"{child.pid}\n")
+        assert launcher.read_coordinator_pid() is None
+        assert not (tmp_path / "coordinator.pid").exists()
+    finally:
+        child.wait()
+    (tmp_path / "coordinator.pid").write_text(f"{os.getpid()}\n")
+    assert launcher.read_coordinator_pid() == os.getpid()
+    os.utime(tmp_path / "coordinator.pid", (0, 0))   # recorded long before this process began
+    assert launcher.read_coordinator_pid() is None
+
+
+def test_port_free_sees_a_listener():
+    import socket
+
+    from slashcompute.launcher.controller import port_free
+
+    with socket.socket() as s:
+        s.bind(("0.0.0.0", 0))
+        s.listen()
+        port = s.getsockname()[1]
+        assert port_free("0.0.0.0", port) is False
+    assert port_free("0.0.0.0", port) is True
 
 
 def test_start_host_without_contribute_skips_agent(tmp_path):

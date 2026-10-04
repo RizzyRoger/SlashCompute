@@ -19,6 +19,9 @@ class FakeProc:
         self.pid = pid
         self.argv = argv
 
+    def poll(self):
+        return None
+
 
 class FakeHTTP:
     def __init__(self, health=None) -> None:
@@ -63,6 +66,7 @@ def _shell(tmp_path, **kw):
         http=kw.pop("http", FakeHTTP()),
         discover_fn=kw.pop("discover_fn", lambda timeout=5.0: "http://10.0.0.9:8765"),
         lan_ip_fn=lambda: "192.168.1.20",
+        port_free_fn=lambda host, port: True,
     )
     app = create_shell(launcher)
     return app, launcher, spawned
@@ -585,6 +589,29 @@ def test_chat_shows_a_thinking_models_reasoning(tmp_path):
     assert answered.index("1001 = 7") < answered.index("<p>No.</p>")
     assert 'open=""' in reopened
     assert "Ran out of tokens while thinking" in ran_out.split("Hmm")[1]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_start_hosting_stays_clickable_after_the_coordinator_fails(tmp_path):
+    """A coordinator that died (its port was taken) must not leave Start hosting disabled."""
+    def probe(st):
+        return (f'state.settings = {{ mode: "host" }}; state.ov = {{ status: {json.dumps(st)} }}; '
+                'renderPool(); [$("#p-start").disabled, $("#p-start").textContent]')
+    port = "Port 8765 is already in use — quit the other /compute or coordinator, then Start hosting."
+    cases = [
+        {"coordinator_pid": 4001, "coordinator_up": True, "last_error": ""},
+        {"coordinator_pid": None, "coordinator_up": False, "last_error": port},
+        # a status from before the launcher noticed the exit, or a pid it cannot vouch for
+        {"coordinator_pid": 4001, "coordinator_up": False, "last_error": port},
+    ]
+    phases = [{"routes": {}}] + [{"routes": {}, "run": "0", "probe": probe(st)} for st in cases]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    hosting, failed, stale = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert hosting == [True, "Hosting"]
+    assert failed == [False, "Start hosting"]
+    assert stale == [False, "Start hosting"]
 
 
 def test_live_grants_flow(tmp_path):
