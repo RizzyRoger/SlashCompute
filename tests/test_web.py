@@ -7,6 +7,8 @@ from slashcompute.coordinator.app import create_app
 from slashcompute.launcher.controller import Launcher, LauncherSettings, stateless_http
 from slashcompute.web.server import create_shell
 
+SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
+
 
 class FakeProc:
     def __init__(self, pid: int, argv: list[str]) -> None:
@@ -64,7 +66,7 @@ def _shell(tmp_path, **kw):
 
 def test_index_and_css(tmp_path):
     app, _, _ = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.get("/")
         assert r.status_code == 200
         assert b"COMPUTE" in r.content
@@ -107,14 +109,14 @@ def test_logout_rebuilds_grant_board(tmp_path):
 
 def test_settings_and_status(tmp_path):
     app, launcher, _ = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/settings", json={"mode": "join", "url": "10.1.2.3",
                                           "gpu_percent": 40, "finish": "signal"})
         assert r.status_code == 200
         body = r.json()
         assert body["mode"] == "join" and body["finish"] == "signal"
         assert body["url"] == "10.1.2.3"
-        assert body["session_token"] == ""
+        assert body["has_session"] is False
         assert body["grant_split"] == 0
         got = c.get("/api/settings").json()
         assert got["gpu_percent"] == 40
@@ -122,6 +124,58 @@ def test_settings_and_status(tmp_path):
         assert st["lan_ip"] == "192.168.1.20"
         assert "carbon" in st["finishes"]
     assert launcher.load_settings().finish == "signal"
+
+
+def test_shell_refuses_foreign_host_and_cross_origin_writes(tmp_path):
+    app, launcher, _ = _shell(tmp_path)
+    launcher.save_settings(LauncherSettings(session_token="secret-sess"))
+    stopped = []
+    real_stop = launcher.stop_agent
+    launcher.stop_agent = lambda: stopped.append(1) or real_stop()
+    with TestClient(app, base_url=SHELL) as c:
+        # DNS rebinding: evil.example resolves to 127.0.0.1 but the Host header gives it away.
+        for path in ("/api/settings", "/api/status", "/"):
+            assert c.get(path, headers={"host": "evil.example:8766"}).status_code == 403
+        # CSRF: a "simple" cross-site POST (no preflight) must not act.
+        for origin in ("https://evil.example", "null", "http://127.0.0.1.evil.example"):
+            r = c.post("/api/stop-agent", headers={"origin": origin, "content-type": "text/plain"})
+            assert r.status_code == 403, origin
+        for path in ("/api/stop", "/api/discover", "/api/coord/auth/logout"):
+            assert c.post(path, headers={"origin": "https://evil.example"}).status_code == 403
+        assert not stopped
+        assert launcher.load_settings().session_token == "secret-sess"
+        # The UI itself: loopback Host and Origin, any port, any loopback name.
+        for host in ("127.0.0.1:8766", "localhost:9810", "[::1]:8766", "localhost"):
+            assert c.get("/api/shell", headers={"host": host}).status_code == 200, host
+        for origin in ("http://127.0.0.1:8766", "http://localhost:9810", "http://[::1]:8766"):
+            r = c.post("/api/stop-agent", headers={"origin": origin})
+            assert r.status_code == 200, origin
+        assert c.post("/api/stop-agent").status_code == 200   # no Origin: not a browser
+        assert c.get("/api/settings", headers={"origin": "https://evil.example"}).status_code == 200
+    assert len(stopped) == 4
+
+
+def test_shell_allows_configured_lan_bind_host(tmp_path, monkeypatch):
+    monkeypatch.setattr("slashcompute.web.server.SHELL_HOST", "192.168.1.20")
+    app, _, _ = _shell(tmp_path)
+    with TestClient(app, base_url="http://192.168.1.20:8766") as c:
+        assert c.get("/api/shell").status_code == 200
+        assert c.post("/api/settings", json={}, headers={"origin": "http://192.168.1.20:8766"}).status_code == 200
+        assert c.get("/api/shell", headers={"host": "evil.example"}).status_code == 403
+
+
+def test_settings_never_expose_session_token(tmp_path):
+    app, launcher, _ = _shell(tmp_path)
+    with TestClient(app, base_url=SHELL) as c:
+        assert c.post("/api/settings", json={"session_token": "secret-sess"}).json()["has_session"] is True
+        for path in ("/api/settings", "/api/status", "/api/overview"):
+            assert b"secret-sess" not in c.get(path).content, path
+        assert c.get("/api/settings").json()["has_session"] is True
+        # The UI round-trips settings without the token; that must not sign it out.
+        assert c.post("/api/settings", json={"gpu_percent": 30}).json()["has_session"] is True
+        assert launcher.load_settings().session_token == "secret-sess"
+        assert c.post("/api/settings", json={"session_token": ""}).json()["has_session"] is False
+    assert launcher.load_settings().session_token == ""
 
 
 def test_start_stop_and_discover(tmp_path, monkeypatch):
@@ -137,7 +191,7 @@ def test_start_stop_and_discover(tmp_path, monkeypatch):
         return None
 
     launcher.poll_health = health_after
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/start", json={"mode": "host", "gpu_percent": 50, "contribute": True})
         assert r.status_code == 200, r.text
         assert len(spawned) == 2
@@ -148,7 +202,7 @@ def test_start_stop_and_discover(tmp_path, monkeypatch):
 
 def test_join_start_requires_url(tmp_path):
     app, _, spawned = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/start", json={"mode": "join", "url": ""})
         assert r.status_code == 400
         assert spawned == []
@@ -157,7 +211,7 @@ def test_join_start_requires_url(tmp_path):
 def test_proxy_allows_health_and_blocks_other(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.save_settings(LauncherSettings(mode="host"))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         assert c.get("/api/coord/health").status_code == 200
         assert c.get("/api/coord/auth/me").status_code == 200
         assert c.get("/api/coord/verify/secret").status_code == 404
@@ -207,7 +261,7 @@ POOL = {
 
 def test_overview_offline(tmp_path):
     app, _, _ = _shell(tmp_path, http=RoutedHTTP({}))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         ov = c.get("/api/overview").json()
     assert ov["pool"]["online"] is False
     assert ov["pool"]["jobs"] == [] and ov["leaderboard"] == []
@@ -220,7 +274,7 @@ def test_overview_offline(tmp_path):
 def test_settings_accept_public_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("SLASHCOMPUTE_PUBLIC_URL", "https://pool.example.com")
     app, launcher, _ = _shell(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/settings", json={"mode": "public", "url": "", "gpu_percent": 40})
         assert r.status_code == 200
         assert r.json()["mode"] == "public"
@@ -234,7 +288,7 @@ def test_overview_online_ranks_this_mac(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=RoutedHTTP(POOL))
     launcher.save_settings(LauncherSettings(mode="host", grant_split=25))
     launcher.paths.node_id_file.write_text("me\n")
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         ov = c.get("/api/overview").json()
     assert ov["pool"]["online"] is True
     assert [j["id"] for j in ov["pool"]["jobs"]] == ["new", "old"]
@@ -253,7 +307,7 @@ def test_stop_agent_endpoint_leaves_coordinator(tmp_path, monkeypatch):
     app, launcher, _ = _shell(tmp_path)
     (tmp_path / "coordinator.pid").write_text("111\n")
     launcher.paths.pid_file.write_text("222\n")
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         assert c.post("/api/stop-agent").status_code == 200
     assert (222, 15) in kills and (111, 15) not in kills
 
@@ -343,7 +397,7 @@ class GrantHTTP:
 def test_proxy_forwards_set_cookie(tmp_path):
     app, launcher, _ = _shell(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.save_settings(LauncherSettings(mode="host"))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
         assert r.status_code == 200
         assert "slashcompute_session=sess" in r.headers.get("set-cookie", "")
@@ -368,7 +422,7 @@ def test_proxy_never_reuses_another_browsers_session(tmp_path, monkeypatch):
 
 def test_live_grants_empty_when_coordinator_down(tmp_path):
     app, _, _ = _shell(tmp_path, http=RoutedHTTP({}))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         board = c.get("/api/grants?sort=least").json()
     assert board["sample"] is False
     assert board["grants"] == [] and board["pending"] == []
@@ -379,7 +433,7 @@ def test_live_grants_flow(tmp_path):
     T = 1e12
     app, launcher, _ = _shell(tmp_path, http=GrantHTTP())
     launcher.save_settings(LauncherSettings(mode="host"))
-    with TestClient(app) as c:
+    with TestClient(app, base_url=SHELL) as c:
         board = c.get("/api/grants?sort=top").json()
         assert board["sample"] is False and board["online"] is True
         assert board["grants"][0]["summary"].startswith("Need FLOPs")

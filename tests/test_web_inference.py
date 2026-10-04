@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 from slashcompute.launcher.controller import Launcher, LauncherSettings
 from slashcompute.web.server import create_shell
 
+SHELL = "http://127.0.0.1:8766"   # the shell refuses any Host but loopback
+
 
 class FakeProc:
     def __init__(self, pid: int, argv: list[str]) -> None:
@@ -62,7 +64,7 @@ def _shell(tmp_path, handler, health=CURRENT):
 # ------------------------------------------------------------ UI
 
 def test_llm_view_is_served(tmp_path):
-    with TestClient(_shell(tmp_path, lambda r: httpx.Response(404))) as c:
+    with TestClient(_shell(tmp_path, lambda r: httpx.Response(404)), base_url=SHELL) as c:
         html = c.get("/").content
         assert b'data-tab="llm"' in html and b'id="view-llm"' in html and b'id="chat-form"' in html
         js = c.get("/static/app.js").content
@@ -82,7 +84,7 @@ def test_chat_streams_sse_through_with_session(tmp_path):
         sse = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
         return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
 
-    with TestClient(_shell(tmp_path, handler)) as c:
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         c.cookies.set("slashcompute_session", "tok")
         r = c.post("/api/chat", json={"model": "m.gguf", "messages": [{"role": "user", "content": "x"}]})
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
@@ -96,7 +98,7 @@ def test_chat_errors_keep_their_status(tmp_path):
     def handler(request):
         return httpx.Response(503, json={"error": {"message": "no eligible head node has m.gguf on disk"}})
 
-    with TestClient(_shell(tmp_path, handler)) as c:
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         r = c.post("/api/chat", json={"model": "m.gguf", "messages": []})
     assert r.status_code == 503 and "no eligible head" in r.json()["error"]["message"]
 
@@ -105,7 +107,7 @@ def test_chat_without_a_coordinator_is_502(tmp_path):
     def handler(request):
         raise httpx.ConnectError("refused")
 
-    with TestClient(_shell(tmp_path, handler)) as c:
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         assert c.post("/api/chat", json={"model": "m", "messages": []}).status_code == 502
 
 
@@ -133,7 +135,7 @@ def test_upload_streams_the_file_to_the_coordinator(tmp_path):
         return httpx.Response(200, json={"name": "m.gguf", "size": len(seen["body"])})
 
     data = os.urandom(300_000)
-    with TestClient(_shell(tmp_path, handler)) as c:
+    with TestClient(_shell(tmp_path, handler), base_url=SHELL) as c:
         r = c.post("/api/models/upload", content=data, headers={"x-filename": "m.gguf"})
     assert r.status_code == 200 and r.json()["size"] == len(data)
     assert seen["url"] == "http://127.0.0.1:8765/inference/models/upload?name=m.gguf"
@@ -147,7 +149,7 @@ def test_outdated_coordinator_is_explained_before_anything_is_sent(tmp_path):
         seen.append(str(request.url))
         return httpx.Response(404, json={"detail": "Not Found"})
 
-    with TestClient(_shell(tmp_path, handler, OUTDATED)) as c:
+    with TestClient(_shell(tmp_path, handler, OUTDATED), base_url=SHELL) as c:
         up = c.post("/api/models/upload", content=b"GGUF" + bytes(1000), headers={"x-filename": "m.gguf"})
         chat = c.post("/api/chat", json={"model": "m", "messages": []})
         status = c.get("/api/status").json()
