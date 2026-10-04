@@ -336,8 +336,9 @@ async def test_a_request_too_big_to_ever_fit_does_not_evict_the_idle_pipeline(tw
     small = await chat(h, QWEN, max_tokens=16)
     assert small.status_code == 200, small.text
     (first,) = pipelines(h)
-    # ctx in the millions fits nowhere even with the idle pipeline gone, so it must not be torn down
-    huge = await chat(h, QWEN, content="endless answer", max_tokens=10 ** 7)
+    # a ctx near the model's limit fits nowhere even with the idle pipeline gone, so it must not
+    # be torn down (beyond the limit is a 400 before planning)
+    huge = await chat(h, QWEN, content="endless answer", max_tokens=100_000)
     assert huge.status_code == 503, huge.text
     (still,) = pipelines(h)
     assert (still["id"], still["state"]) == (first["id"], "active")
