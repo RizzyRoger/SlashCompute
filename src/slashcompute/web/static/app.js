@@ -961,11 +961,20 @@ const actions = {
     });
   },
 
-  host: (btn) => withBusy("pool", btn, "Starting…", async () => {
-    const snap = await post("/api/start", { ...state.settings, mode: "host", contribute: false });
-    if (snap.last_error) toast(snap.last_error, "bad");
-    else toast("Pool is up. Share this Mac's address with the others.");
-  }),
+  host: (btn) => {
+    const st = status();
+    // Hosting only switches the mode: whatever this Mac already lends keeps running, now to its own pool.
+    const keep = {
+      contribute: !!(st.agent_running || st.inference_running),
+      training: !!st.agent_running,
+      inference: !!st.inference_running,
+    };
+    return withBusy("pool", btn, "Starting…", async () => {
+      const snap = await post("/api/start", { ...state.settings, ...keep, mode: "host" });
+      if (snap.last_error) toast(snap.last_error, "bad");
+      else toast("Pool is up. Share this Mac's address with the others.");
+    });
+  },
 
   "stop-pool": (btn) => withBusy("pool", btn, "Stopping…", async () => {
     await post("/api/stop");

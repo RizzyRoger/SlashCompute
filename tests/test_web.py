@@ -81,6 +81,7 @@ def test_index_and_css(tmp_path):
         assert b"/api/overview" in js.content
         assert b"GOOGLE" not in js.content
         assert b"connect-public" in js.content
+        assert b'mode: "host", contribute: false' not in js.content   # hosting must not stop contributing
         css = c.get("/static/app.css")
         assert css.status_code == 200
         assert b"IBM Plex Sans" in css.content
