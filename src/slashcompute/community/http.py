@@ -232,6 +232,14 @@ def mount_community(app, core: Coordinator) -> None:
         user = core.auth.get(user_id)
         if user is None:
             raise HTTPException(404, "No such user.")
+        # Never lock the instance out of its own admin surface.
+        if user.id == admin.id:
+            raise HTTPException(400, "You cannot ban yourself.")
+        if user.admin and not user.banned:
+            with core.db.session() as s:
+                admins = s.exec(select(User).where(User.admin == True, User.banned == False)).all()  # noqa: E712
+            if len(admins) <= 1:
+                raise HTTPException(400, "Cannot ban the last admin.")
         return {"user": core.auth.public_view(core.auth.set_banned(user, bool(body.get("banned", True))))}
 
     @r.post("/admin/users/{user_id}/flag")

@@ -487,6 +487,29 @@ def test_http_ban_blocks_take(env):
     assert core.jobs == {}
 
 
+def test_http_admin_cannot_ban_self_or_last_admin(env):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    admin = core.auth.user_from_token(admin_tok)
+    r = client.post(f"/admin/users/{admin.id}/ban", json={}, headers=_hdr(admin_tok))
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/users", headers=_hdr(admin_tok)).status_code == 200
+    # A second admin may ban the first, but not then the one admin left.
+    other_tok = client.post("/auth/register", json={
+        "email": "other@lan.test", "password": "password1", "name": "Other",
+    }).json()["token"]
+    other = core.auth.user_from_token(other_tok)
+    other.admin = True
+    core.db.save(other)
+    r = client.post(f"/admin/users/{admin.id}/ban", json={}, headers=_hdr(other_tok))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/admin/users/{other.id}/ban", json={}, headers=_hdr(other_tok))
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/users", headers=_hdr(other_tok)).status_code == 200
+
+
 # --------------------------------------------------------------------------- engine hooks
 
 
