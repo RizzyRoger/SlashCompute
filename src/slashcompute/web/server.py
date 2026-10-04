@@ -23,6 +23,7 @@ from slashcompute.launcher.controller import (
     FINISHES, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings, supports_inference,
 )
 from slashcompute.launcher.dashboard import PoolData, overview
+from slashcompute.web import sample_grants
 
 STATIC = Path(__file__).resolve().parent / "static"
 SHELL_HOST = os.environ.get("SLASHCOMPUTE_SHELL_HOST", "127.0.0.1")
@@ -172,12 +173,17 @@ def _grant_card(row: dict) -> dict:
     }
 
 
-def _empty_board() -> dict:
-    return {
-        "sample": False, "online": False, "grants": [], "pending": [],
-        "pledged": 0.0, "starter": 0.0, "share": 0.0, "available": 0.0,
-        "leaders": [],
-    }
+def _sample_board(sort: str, *, online: bool, share: float = 0.0,
+                  available: Optional[float] = None, pledged: float = 0.0,
+                  leaders: Optional[list] = None) -> dict:
+    mode = sort if sort in _SORTS else "top"
+    board = sample_grants.board(sample_grants.sample_book(), mode, share)
+    board["online"] = online
+    board["leaders"] = leaders or []
+    board["pledged"] = pledged
+    if available is not None:
+        board["available"] = available
+    return board
 
 
 def create_shell(launcher: Optional[Launcher] = None,
@@ -341,7 +347,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         mode = sort if sort in _SORTS else "top"
         rows = coord_call(request, "GET", "/grants", params={"sort": mode}, required=False)
         if rows is None:
-            return _empty_board()
+            return _sample_board(mode, online=False, available=0.0)
         if not isinstance(rows, list):
             rows = []
         cards = [_grant_card(g) for g in rows if isinstance(g, dict)]
@@ -374,11 +380,15 @@ def create_shell(launcher: Optional[Launcher] = None,
                     "flops": float(row.get("lifetime_earned") or 0),
                     "is_me": bool(me_id and row.get("user_id") == me_id),
                 })
+        share = float((user or {}).get("grant_split") or 0)
+        if not approved and not pending:
+            return _sample_board(mode, online=True, share=share, available=available,
+                                 pledged=pledged, leaders=leaders)
         return {
             "sample": False, "online": True,
             "grants": approved, "pending": pending,
             "pledged": pledged, "starter": 0.0,
-            "share": float((user or {}).get("grant_split") or 0),
+            "share": share,
             "available": available, "leaders": leaders,
         }
 

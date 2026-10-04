@@ -428,9 +428,34 @@ def test_live_grants_empty_when_coordinator_down(tmp_path):
     app, _, _ = _shell(tmp_path, http=RoutedHTTP({}))
     with TestClient(app, base_url=SHELL) as c:
         board = c.get("/api/grants?sort=least").json()
-    assert board["sample"] is False
-    assert board["grants"] == [] and board["pending"] == []
+    assert board["sample"] is True
     assert board["online"] is False
+    assert any("Irish-language" in g["title"] for g in board["grants"])
+    assert board["pending"]
+
+
+def test_sample_grants_when_coordinator_has_none(tmp_path):
+    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP({**POOL, "/grants": []}))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    with TestClient(app, base_url=SHELL) as c:
+        board = c.get("/api/grants?sort=top").json()
+    assert board["sample"] is True
+    assert board["online"] is True
+    assert any("Irish-language" in g["title"] for g in board["grants"])
+    assert all(g["id"].startswith("g") for g in board["grants"])
+
+
+def test_live_grants_are_not_mixed_with_samples(tmp_path):
+    grant = {"id": "live-1", "title": "Parser", "author": "Ada",
+             "body": "Need FLOPs for a parser.", "goal_flops": 50e12,
+             "received_flops": 10e12, "status": "approved"}
+    app, launcher, _ = _shell(tmp_path, http=RoutedHTTP({**POOL, "/grants": [grant]}))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    with TestClient(app, base_url=SHELL) as c:
+        board = c.get("/api/grants?sort=top").json()
+    assert board["sample"] is False
+    assert [g["id"] for g in board["grants"]] == ["live-1"]
+    assert not any("Irish-language" in g["title"] for g in board["grants"])
 
 
 # Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
@@ -518,8 +543,10 @@ def test_grants_tab_follows_coordinator_on_poll(tmp_path):
     seen = json.loads(out.stdout.strip().splitlines()[-1])
     assert (seen[0]["pill"], seen[0]["open"]) == ("Live", "1")
     assert "Fund this grant" in seen[0]["list"]
-    assert (seen[1]["pill"], seen[1]["open"]) == ("Offline", "0")
-    assert "Fund this grant" not in seen[1]["list"] and "Start or join a pool" in seen[1]["list"]
+    assert (seen[1]["pill"], seen[1]["open"]) == ("Demo", "6")
+    assert "Fund this grant" not in seen[1]["list"]
+    assert "Irish-language" in seen[1]["list"]
+    assert "Demo grant" in seen[1]["list"]
     assert (seen[2]["pill"], seen[2]["open"]) == ("Live", "1")
     assert seen[3]["open"] == "1"
     assert seen[4]["open"] == "2"

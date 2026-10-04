@@ -559,8 +559,9 @@ function renderGrantsLive() {
     : "Sign in to fund grants with your credits.");
   setText("#g-pledged", g ? fmtFlops(g.pledged) : "—");
   setText("#g-open", g ? String(g.grants.length) : "—");
-  setText("#g-open-sub", g ? `${g.pending.length} waiting for review` : "");
-  setTag("#g-pill", g && g.online ? "Live" : "Offline", g && g.online ? "ok" : "");
+  setText("#g-open-sub", g ? (g.sample ? "demo grants" : `${g.pending.length} waiting for review`) : "");
+  setTag("#g-pill", g && g.sample ? "Demo" : g && g.online ? "Live" : "Offline",
+    g && g.sample ? "line" : g && g.online ? "ok" : "");
 
   const board = (g && g.leaders && g.leaders.length)
     ? g.leaders
@@ -586,11 +587,11 @@ function renderGrants() {
   const grants = g ? g.grants : [];
   const pending = g ? g.pending : [];
 
-  renderOnce("grants", [grants, online, state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
+  renderOnce("grants", [grants, online, !!(g && g.sample), state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
     ? grants.map(grantCard).join("")
     : `<article class="card"><p class="empty">${online ? "No public grants yet." : "Start or join a pool to see live grants."}</p></article>`);
 
-  $("#g-review").hidden = !admin;
+  $("#g-review").hidden = !admin || !!(g && g.sample);
   setTag("#g-review-count", String(pending.length), pending.length ? "hot" : "");
   renderOnce("pending", pending, $("#g-pending"), () => pending.length ? pending.map((p) => `<div class="pending">
       <div class="top"><b>${esc(p.title)}</b><span class="muted">${esc(withUnit(p.goal))} goal</span></div>
@@ -606,7 +607,9 @@ function renderGrants() {
 function grantCard(g) {
   const funded = g.remaining <= 0;
   const open = state.fundOpen === g.id;
-  const actions = open ? `
+  const demo = !!(state.grants && state.grants.sample);
+  const actions = demo ? `<p class="hint">Demo grant — not spendable.</p>`
+    : open ? `
       <input type="number" min="1" step="1" id="fund-${esc(g.id)}" value="${Math.max(1, Math.min(25, Math.floor(g.remaining / T)))}" aria-label="TFLOPs to pledge">
       <span class="unit">TFLOPs</span>
       <button type="button" class="btn primary sm" data-fund-go="${esc(g.id)}">Pledge</button>
@@ -1150,6 +1153,7 @@ document.addEventListener("click", async (e) => {
     state.fundOpen = null;
     return renderGrants();
   }
+  if ((d.fundGo || d.review) && state.grants && state.grants.sample) return;
   if (d.fundGo) {
     const tflops = Number($(`#fund-${CSS.escape(d.fundGo)}`).value);
     const grant = state.grants.grants.find((g) => g.id === d.fundGo);
