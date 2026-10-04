@@ -8,6 +8,8 @@ from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.inference.coordinator.layers import synthetic_layout
 from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition
 from slashcompute.inference.node.config import Commitment
+from slashcompute.inference.node.engine import EngineError
+from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
 
