@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -91,6 +93,74 @@ def test_register_rejects_bad_email_short_password_duplicate(core):
     core.auth.register("ok@lan.test", "password1", "x")
     with pytest.raises(AuthError, match="already"):
         core.auth.register("OK@lan.test", "password1", "x")
+
+
+def _race(n, fn):
+    """Run fn(i) on n threads released together; return (results, errors)."""
+    barrier = threading.Barrier(n)
+    results, errors = [], []
+
+    def run(i):
+        barrier.wait()
+        try:
+            results.append(fn(i))
+        except Exception as e:  # noqa: BLE001 - the test inspects what was raised
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results, errors
+
+
+def _slow_count(auth, monkeypatch):
+    """Widen the check-then-insert window so a racy admin decision shows up every run."""
+    count = auth.user_count
+
+    def slow():
+        n = count()
+        time.sleep(0.05)
+        return n
+
+    monkeypatch.setattr(auth, "user_count", slow)
+
+
+def test_concurrent_registrations_make_exactly_one_admin(core, monkeypatch):
+    _slow_count(core.auth, monkeypatch)
+    users, errors = _race(8, lambda i: core.auth.register(f"u{i}@lan.test", "password1", f"U{i}"))
+    assert errors == []
+    assert sum(u.admin for u in users) == 1
+    assert sum(core.auth.get(u.id).admin for u in users) == 1
+
+
+def test_concurrent_google_signups_make_exactly_one_admin(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": f"{tok}@lan.test", "name": tok, "sub": f"sub-{tok}",
+    }
+    _slow_count(core.auth, monkeypatch)
+    results, errors = _race(8, lambda i: core.auth.login_google(f"g{i}"))
+    assert errors == []
+    assert sum(u.admin for u, _ in results) == 1
+
+
+def test_concurrent_same_email_registers_once(core):
+    users, errors = _race(8, lambda i: core.auth.register("dup@lan.test", "password1", "Dup"))
+    assert len(users) == 1
+    assert len(errors) == 7
+    assert all(isinstance(e, AuthError) and "already" in str(e) for e in errors)
+
+
+def test_concurrent_same_google_account_signs_in_once(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "g@lan.test", "name": "Gia", "sub": "sub-1",
+    }
+    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
+    assert errors == []
+    assert len({u.id for u, _ in results}) == 1
 
 
 def test_login_wrong_password_and_ban(core):

@@ -6,9 +6,11 @@ import hashlib
 import hmac
 import os
 import secrets
+import threading
 import time
 from typing import Callable, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from slashcompute.coordinator.db import Database, SessionRow, User, now
@@ -80,10 +82,25 @@ class Auth:
                  verify_google: Callable[[str, str], dict] = verify_google_id_token) -> None:
         self.db = db
         self.verify_google = verify_google
+        # Serializes "is this the first account?" with the insert, so concurrent
+        # sign-ups on a fresh coordinator can't all see an empty table and become admin.
+        self._create_lock = threading.Lock()
 
     def user_count(self) -> int:
         with self.db.session() as s:
             return len(s.exec(select(User)).all())
+
+    def _create(self, user: User) -> Optional[User]:
+        """Insert a new account, making it admin if it is the first. None if the email is taken."""
+        with self._create_lock:
+            if self.get_by_email(user.email) is not None:
+                return None
+            user.admin = user.admin or self.user_count() == 0
+            try:
+                self.db.add(user)
+            except IntegrityError:
+                return None
+        return user
 
     def register(self, email: str, password: str, name: str) -> User:
         email = normalize_email(email)
@@ -95,15 +112,15 @@ class Auth:
         if self.get_by_email(email) is not None:
             raise AuthError("That email is already registered.")
         admin_env = (os.environ.get("SLASHCOMPUTE_ADMIN_EMAIL") or "").strip().lower()
-        first = self.user_count() == 0
-        user = User(
+        user = self._create(User(
             id=secrets.token_hex(8),
             email=email,
             password_hash=_hash_password(password),
             name=name,
-            admin=first or (admin_env == email),
-        )
-        self.db.add(user)
+            admin=admin_env == email,
+        ))
+        if user is None:
+            raise AuthError("That email is already registered.")
         return user
 
     def login(self, email: str, password: str) -> tuple[User, str]:
@@ -133,17 +150,18 @@ class Auth:
         user = self.get_by_google_sub(info["sub"]) or self.get_by_email(info["email"])
         if user is None:
             admin_env = (os.environ.get("SLASHCOMPUTE_ADMIN_EMAIL") or "").strip().lower()
-            first = self.user_count() == 0
-            user = User(
+            # A concurrent sign-in may create this account first; then just use theirs.
+            user = self._create(User(
                 id=secrets.token_hex(8),
                 email=info["email"],
                 password_hash="google$" + secrets.token_hex(16),
                 name=(info["name"] or info["email"].split("@")[0])[:80] or "member",
-                admin=first or (admin_env == info["email"]),
+                admin=admin_env == info["email"],
                 google_sub=info["sub"],
-            )
-            self.db.add(user)
-        elif user.google_sub != info["sub"]:
+            )) or self.get_by_email(info["email"])
+        if user is None:
+            raise AuthError("Google sign-in failed.", 401)
+        if user.google_sub != info["sub"]:
             user.google_sub = info["sub"]
             self.db.save(user)
         return self._issue(user)
