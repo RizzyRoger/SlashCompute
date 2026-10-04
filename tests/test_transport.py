@@ -1,9 +1,13 @@
 import asyncio
+import socket
 
 import mlx.core as mx
 import pytest
 
-from slashcompute.transport import Frame, LinkClosed, LinkServer, MemoryLink, TcpLink, connect, digest
+from slashcompute.transport import (
+    Frame, LinkClosed, LinkServer, LinkTimeout, MemoryLink, TcpLink, connect, digest,
+)
+from slashcompute.transport.peer import KEEPALIVE_IDLE_S
 from slashcompute.transport.serialization import decode_bytes, encode_bytes
 
 
@@ -140,3 +144,49 @@ async def test_memory_link():
     await a.close()
     with pytest.raises(LinkClosed):
         await b.recv(1)
+
+
+async def test_recv_timeout_is_a_link_timeout_and_keeps_queued_frames():
+    a, b = MemoryLink.pair()
+    with pytest.raises(LinkTimeout, match="nothing from the peer in 0.05s"):
+        await b.recv(0.05)
+    await a.send(Frame("x", {"v": 1}))
+    assert (await b.recv(1)).meta == {"v": 1}
+
+
+async def test_tcp_links_use_keepalive():
+    # A peer that loses power or Wi-Fi never sends a FIN; keepalive is what notices.
+    server = await LinkServer("127.0.0.1", 0, {"job": "j1", "epoch": 1}).start()
+    up = await connect("127.0.0.1", server.port, {"job": "j1", "epoch": 1}, timeout=5)
+    down = await server.accept(5)
+    idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+    for link in (up, down):
+        sock = link._writer.get_extra_info("socket")
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        if idle is not None:
+            assert sock.getsockopt(socket.IPPROTO_TCP, idle) == KEEPALIVE_IDLE_S
+    await up.close()
+    await down.close()
+    await server.close()
+
+
+async def test_send_times_out_when_the_peer_stops_reading():
+    release = asyncio.Event()
+
+    async def never_reads(reader, writer):
+        await release.wait()
+        writer.close()
+
+    server = await asyncio.start_server(never_reads, "127.0.0.1", 0)
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+    link = TcpLink(reader, writer, send_timeout=0.3)
+    big = mx.zeros((8, 1024, 1024), dtype=mx.float32)  # 32 MB, far beyond the socket buffers
+    with pytest.raises(LinkTimeout, match="took no data for 0.3s"):
+        for _ in range(4):
+            await link.send(Frame("fwd", {}, {"h": big}))
+    with pytest.raises(LinkClosed):  # half a frame may be on the wire: the stream is done
+        await link.send(Frame("x", {}))
+    await asyncio.wait_for(link.close(), 10)  # must not wait for the stuck peer to read
+    release.set()
+    server.close()
+    await server.wait_closed()

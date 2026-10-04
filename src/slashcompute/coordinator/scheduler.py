@@ -37,6 +37,7 @@ class EpochState:
     epoch: int
     plans: list[StagePlan]
     started: float = field(default_factory=time.monotonic)
+    last_progress: float = field(default_factory=time.monotonic)  # last StageReady / StepMetrics
     ready: set[int] = field(default_factory=set)
     finished: dict[int, str] = field(default_factory=dict)
     drain_requested: bool = False
@@ -140,6 +141,7 @@ class Scheduler:
                 dataset_url=f"/jobs/{job.id}/dataset" if p.stage_idx == 0 else None,
                 checkpoint_every=job.spec.checkpoint_every or core.cfg.checkpoint_every,
                 verify_ring_size=core.cfg.verify_ring_size,
+                peer_timeout_s=core.cfg.peer_timeout_s,
             )
             await core.send(p.node_id, msg)
         return True
@@ -149,6 +151,7 @@ class Scheduler:
         if cur is None or cur.epoch != epoch or cur.closed:
             return
         cur.ready.add(stage_idx)
+        cur.last_progress = time.monotonic()
         if len(cur.ready) == len(cur.plans) and job.row.status == "starting":
             # The epoch is healthy again: drop the reason the previous one aborted.
             job.row.status, job.row.error = "running", None

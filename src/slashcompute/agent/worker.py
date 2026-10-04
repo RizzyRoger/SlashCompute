@@ -74,11 +74,13 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     prev = nxt = None
     # Downstream listens; upstream dials (see transport.peer).
     if asg.stage_idx > 0:
-        server = await LinkServer(ctx.data_bind, ctx.data_port, hello).start()
+        server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
+                                  send_timeout=asg.peer_timeout_s).start()
         log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
     if asg.next_peer is not None:
         log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
-        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello)
+        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                            send_timeout=asg.peer_timeout_s)
     if server is not None:
         prev = await server.accept(timeout=180.0)
         log.info("upstream connected from %s", getattr(prev, "peername", "?"))
@@ -145,7 +147,7 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
             checkpoint_dir=ckdir, prev=prev, next=nxt,
             examples=examples, batch_size=spec.batch_size, seed=spec.seed,
             start_step=asg.resume_step, on_step=on_step, on_checkpoint=on_checkpoint,
-            pace=make_pace(ctx.gpu_percent),
+            pace=make_pace(ctx.gpu_percent), peer_timeout=asg.peer_timeout_s,
         )
         ctx_session = getattr(ctx, "session", None)
         if ctx_session is not None:

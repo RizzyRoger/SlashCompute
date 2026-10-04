@@ -5,12 +5,18 @@ so a stage can keep receiving while its own compute or sends are in flight.
 The downstream stage listens on its data port and the upstream stage dials
 it. A ``hello`` frame binds the connection to a (job, epoch) so stale stages
 can't cross-talk.
+
+Real LANs drop packets, sleep laptops and lose Wi-Fi, so nothing here waits
+forever: sockets use TCP keepalive (a vanished peer is noticed in about
+``KEEPALIVE_IDLE_S + KEEPALIVE_INTERVAL_S * KEEPALIVE_COUNT`` seconds even when
+no data is moving), and receives, sends and dials take timeouts.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import Optional
 
 from slashcompute.transport.serialization import (
@@ -21,9 +27,41 @@ log = logging.getLogger(__name__)
 
 _CLOSED = object()
 
+# The peer's kernel answers keepalive probes, so a stage busy in MLX compute
+# never trips them; only a peer that is gone (or a path that is cut) does.
+KEEPALIVE_IDLE_S = 15
+KEEPALIVE_INTERVAL_S = 5
+KEEPALIVE_COUNT = 4
+# One dial attempt; a silently dropped SYN would otherwise block for the OS
+# connect timeout (about 75 s on macOS) before the overall deadline is checked.
+CONNECT_ATTEMPT_S = 10.0
+CLOSE_TIMEOUT_S = 5.0
+
 
 class LinkClosed(ConnectionError):
     pass
+
+
+class LinkTimeout(LinkClosed):
+    """The peer sent nothing, or took nothing, for longer than the link allows."""
+
+
+def _enable_keepalive(sock) -> None:
+    if sock is None:
+        return
+    opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # TCP_KEEPIDLE on Linux; macOS calls the same option TCP_KEEPALIVE.
+    idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+    for name, opt, val in (("idle", idle, KEEPALIVE_IDLE_S),
+                           ("interval", getattr(socket, "TCP_KEEPINTVL", None), KEEPALIVE_INTERVAL_S),
+                           ("count", getattr(socket, "TCP_KEEPCNT", None), KEEPALIVE_COUNT)):
+        if opt is not None:
+            opts.append((socket.IPPROTO_TCP, opt, val))
+    try:
+        for level, opt, val in opts:
+            sock.setsockopt(level, opt, val)
+    except OSError as e:
+        log.debug("could not enable TCP keepalive: %s", e)
 
 
 class Link:
@@ -38,7 +76,10 @@ class Link:
         raise NotImplementedError
 
     async def recv(self, timeout: Optional[float] = None) -> Frame:
-        item = await asyncio.wait_for(self._queue.get(), timeout)
+        try:
+            item = await asyncio.wait_for(self._queue.get(), timeout)
+        except TimeoutError:
+            raise LinkTimeout(f"nothing from the peer in {timeout:g}s") from None
         if item is _CLOSED:
             self._queue.put_nowait(_CLOSED)
             raise LinkClosed("peer link closed")
@@ -52,11 +93,14 @@ class Link:
 
 
 class TcpLink(Link):
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                 send_timeout: Optional[float] = None) -> None:
         super().__init__()
         self._reader = reader
         self._writer = writer
+        self.send_timeout = send_timeout
         self._send_lock = asyncio.Lock()
+        _enable_keepalive(writer.get_extra_info("socket"))
         self._task = asyncio.create_task(self._read_loop())
 
     @property
@@ -78,7 +122,7 @@ class TcpLink(Link):
         try:
             while True:
                 self._queue.put_nowait(await self._read_frame())
-        except (asyncio.IncompleteReadError, ConnectionError):
+        except (asyncio.IncompleteReadError, OSError):  # EOF, reset, keepalive ETIMEDOUT
             self._queue.put_nowait(_CLOSED)
         except asyncio.CancelledError:
             self._queue.put_nowait(_CLOSED)
@@ -95,15 +139,24 @@ class TcpLink(Link):
                 for c in chunks:
                     self._writer.write(c)
                     self.bytes_sent += len(c)
-                await self._writer.drain()
-            except ConnectionError as e:
+                await asyncio.wait_for(self._writer.drain(), self.send_timeout)
+            except TimeoutError:
+                # Part of a frame may be in flight, so this stream can't carry another;
+                # abort rather than close, which would wait for the stuck peer to read.
+                self._writer.transport.abort()
+                raise LinkTimeout(f"the peer took no data for {self.send_timeout:g}s") from None
+            except OSError as e:
                 raise LinkClosed(str(e)) from e
 
     async def close(self) -> None:
         self._task.cancel()
         self._writer.close()
         try:
-            await self._writer.wait_closed()
+            # A graceful close flushes what is buffered first; a peer that stopped
+            # reading would make that wait forever.
+            await asyncio.wait_for(self._writer.wait_closed(), CLOSE_TIMEOUT_S)
+        except TimeoutError:
+            self._writer.transport.abort()
         except Exception:
             pass
 
@@ -134,7 +187,7 @@ class MemoryLink(Link):
 
 
 async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
-                  retry_interval: float = 0.25) -> TcpLink:
+                  retry_interval: float = 0.25, send_timeout: Optional[float] = None) -> TcpLink:
     """Dial a downstream stage, retrying until it accepts this hello.
 
     A reject is retried like a refused connection: the port may still be held
@@ -145,14 +198,15 @@ async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
     deadline = loop.time() + timeout
     rejects = 0
     while True:
+        attempt = min(CONNECT_ATTEMPT_S, max(deadline - loop.time(), retry_interval))
         try:
-            reader, writer = await asyncio.open_connection(host, port)
-        except OSError:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), attempt)
+        except OSError:  # includes TimeoutError: the attempt itself timed out
             if loop.time() > deadline:
                 raise
             await asyncio.sleep(retry_interval)
             continue
-        link = TcpLink(reader, writer)
+        link = TcpLink(reader, writer, send_timeout)
         try:
             await link.send(Frame("hello", hello))
             ack = await link.recv(max(deadline - loop.time(), retry_interval))
@@ -174,8 +228,10 @@ async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
 class LinkServer:
     """Accepts exactly one upstream link whose hello matches ``expect``."""
 
-    def __init__(self, host: str, port: int, expect: dict) -> None:
+    def __init__(self, host: str, port: int, expect: dict,
+                 send_timeout: Optional[float] = None) -> None:
         self.host, self.port, self.expect = host, port, expect
+        self.send_timeout = send_timeout
         self._accepted: asyncio.Future = asyncio.get_running_loop().create_future()
         self._claimed = False                 # accept() handed the link to the caller
         self._pending: set[TcpLink] = set()   # connections still in the hello exchange
@@ -201,7 +257,7 @@ class LinkServer:
         return None
 
     async def _on_conn(self, reader, writer) -> None:
-        link = TcpLink(reader, writer)
+        link = TcpLink(reader, writer, self.send_timeout)
         self._pending.add(link)
         try:
             hello = await link.recv(10.0)

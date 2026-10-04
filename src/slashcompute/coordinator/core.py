@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -293,6 +294,7 @@ class Coordinator:
         job = self.jobs.get(msg.job_id)
         if job is None or job.current is None or job.current.epoch != msg.epoch:
             return
+        job.current.last_progress = time.monotonic()
         self.ledger.record_step(node_id, msg)
         flops = float(msg.usage.flops)
         job.last_step_flops = flops

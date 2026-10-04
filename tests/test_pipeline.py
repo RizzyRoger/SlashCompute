@@ -1,4 +1,7 @@
+import asyncio
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -9,7 +12,9 @@ from slashcompute.pipeline.data import load_examples, make_batch
 from slashcompute.pipeline.local import build_compute, run_local_pipeline
 from slashcompute.pipeline.model_profile import profile_model
 from slashcompute.pipeline.shard import load_shard
+from slashcompute.pipeline.schedule import StageRunner
 from slashcompute.pipeline.stage import merge_checkpoints, token_losses
+from slashcompute.transport import LinkTimeout, MemoryLink
 
 
 def _spec(model, data, **kw):
@@ -122,3 +127,15 @@ def test_checkpoint_missing_layers_rejected(tiny_model, tiny_dataset, tmp_path):
     b = build_compute(spec, 2, 6, 6)
     with pytest.raises(ValueError):
         b.load_checkpoint(tmp_path / "a.safetensors")
+
+
+async def test_stage_gives_up_on_a_silent_upstream():
+    # Before peer timeouts a stage whose neighbour went quiet waited forever.
+    prev, _upstream = MemoryLink.pair()
+    runner = StageRunner(
+        compute=SimpleNamespace(is_first=False, is_last=True), total_steps=1, microbatches=1,
+        microbatch_size=1, checkpoint_every=1, checkpoint_dir=Path("."), prev=prev,
+        peer_timeout=0.05,
+    )
+    with pytest.raises(LinkTimeout):
+        await asyncio.wait_for(runner.run(), 5)

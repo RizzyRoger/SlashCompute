@@ -42,6 +42,18 @@ class Recovery:
                 job = core.jobs.get(node.assignment.job_id)
                 if job is not None:
                     await self.abort_epoch(job, "drain exceeded grace period", count=False)
+        await self._abort_stalled()
+
+    async def _abort_stalled(self) -> None:
+        """Backstop for a hang nothing else notices (a wedged worker, a link that never
+        errors): a running epoch that reports no step for ``stall_timeout_s`` restarts
+        from its last checkpoint."""
+        limit = self.core.cfg.stall_timeout_s
+        for job in list(self.core.jobs.values()):
+            cur = job.current
+            if (job.row.status == "running" and cur is not None and not cur.closed
+                    and time.monotonic() - cur.last_progress > limit):
+                await self.abort_epoch(job, f"no progress for {limit:.0f}s")
 
     async def on_drain(self, node_id: str) -> None:
         core = self.core

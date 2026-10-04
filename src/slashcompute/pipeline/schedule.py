@@ -67,6 +67,8 @@ class StageRunner:
     on_checkpoint: Optional[Callable[[int, Path], Awaitable[None]]] = None
     pace: Optional[Callable[[float], Awaitable[None]]] = None
     executor: Optional[ThreadPoolExecutor] = None
+    # Longest a neighbour may stay silent before this stage gives up on it (None: no limit).
+    peer_timeout: Optional[float] = None
     drain: asyncio.Event = field(default_factory=asyncio.Event)
 
     _busy: float = 0.0
@@ -161,7 +163,7 @@ class StageRunner:
                     await self.next.send(Frame("fwd", {"step": step, "mb": j, "ntoks": batch.ntoks},
                                                {"h": h, "targets": mb.targets, "mask": mb.mask}))
                 for _ in range(self.microbatches):
-                    g = await self.next.recv()
+                    g = await self.next.recv(self.peer_timeout)
                     self._expect(g, "bwd", step)
                     j = g.meta["mb"]
                     await self._run(c.backward, mbs[j].inputs, g.tensors["g"])
@@ -174,7 +176,7 @@ class StageRunner:
         c = self.compute
         last_step = self.start_step
         while True:
-            first = await self.prev.recv()
+            first = await self.prev.recv(self.peer_timeout)
             if first.kind in ("stop", "done"):
                 step = first.meta["step"]
                 if first.kind == "stop":
@@ -194,7 +196,7 @@ class StageRunner:
             tokens = 0
             for k in range(self.microbatches):
                 if k > 0:
-                    frame = await self.prev.recv()
+                    frame = await self.prev.recv(self.peer_timeout)
                     self._expect(frame, "fwd", step)
                 j = frame.meta["mb"]
                 x = frame.tensors["h"]
@@ -215,7 +217,7 @@ class StageRunner:
 
             if not c.is_last:
                 for _ in range(self.microbatches):
-                    g = await self.next.recv()
+                    g = await self.next.recv(self.peer_timeout)
                     self._expect(g, "bwd", step)
                     j = g.meta["mb"]
                     gx = await self._run(c.backward, inputs[j], g.tensors["g"])

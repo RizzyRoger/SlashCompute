@@ -157,6 +157,7 @@ class StageAssignment(BaseModel):
     dataset_url: Optional[str] = None  # only for stage 0
     checkpoint_every: int
     verify_ring_size: int
+    peer_timeout_s: float = 600.0  # defaulted so assignments from older coordinators parse
 
 
 class Drain(BaseModel):
