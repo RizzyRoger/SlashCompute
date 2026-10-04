@@ -229,6 +229,42 @@ def test_start_hosting_on_a_taken_port(tmp_path):
     assert launcher._spawned == [] and snap.last_error == ""  # type: ignore[attr-defined]
 
 
+@pytest.fixture
+def stray_coordinator(tmp_path):
+    """A process that looks like our coordinator (serve --home tmp_path) but has no coordinator.pid."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                             "slashcompute.coordinator.main", "serve", "--home", str(tmp_path)])
+    yield proc
+    proc.kill()
+    proc.wait()
+
+
+def test_hosting_asks_loopback_and_stop_stops_our_coordinator_without_its_pid_file(
+        tmp_path, stray_coordinator):
+    # Our coordinator answered only on loopback (bound to 127.0.0.1, or the LAN reply was slow):
+    # Start spawned a duplicate that overwrote coordinator.pid and died, then Stop left ours up.
+    http = FakeHTTP({"ok": True})
+    launcher = _launcher(tmp_path, http=http)
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert http.urls[0] == "http://127.0.0.1:8765/health"
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    assert snap.coordinator_pid == stray_coordinator.pid   # re-recorded from its command line
+    (tmp_path / "coordinator.pid").unlink()
+    launcher.stop()
+    assert stray_coordinator.wait(timeout=10) == -signal.SIGTERM
+
+
+def test_start_never_spawns_over_our_coordinator_that_is_slow_to_answer(tmp_path, stray_coordinator):
+    launcher = _launcher(tmp_path)
+    launcher.wait_health = lambda url, timeout=8.0: False  # type: ignore[method-assign]
+    launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    assert launcher.read_coordinator_pid() == stray_coordinator.pid
+
+
 def test_coordinator_pid_file_of_a_zombie_or_reused_pid_is_not_hosting(tmp_path):
     import os
     import subprocess

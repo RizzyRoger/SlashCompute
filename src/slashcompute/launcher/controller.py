@@ -341,6 +341,9 @@ class Launcher:
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and process_alive(pid):
             time.sleep(0.05)
+        if process_alive(pid):   # never start a second one over it
+            self.last_error = "The coordinator did not stop in time; Stop it, then Start hosting again."
+            return
         self.coordinator_pid_path.unlink(missing_ok=True)
         self._spawn_coordinator(settings.transport)
         self.wait_health(self.proxy_url(settings))
@@ -357,6 +360,26 @@ class Launcher:
             return pid
         self.coordinator_pid_path.unlink(missing_ok=True)
         return None
+
+    def find_coordinators(self) -> list[int]:
+        """Coordinators serving this home, found by their command line: ours even if coordinator.pid
+        was lost or overwritten."""
+        pids = []
+        for proc in psutil.process_iter(["cmdline", "status"]):
+            argv = proc.info["cmdline"] or []
+            if (proc.info["status"] != psutil.STATUS_ZOMBIE and "slashcompute.coordinator.main" in argv
+                    and "serve" in argv and "--home" in argv[:-1]
+                    and argv[argv.index("--home") + 1] == str(self.home)):
+                pids.append(proc.pid)
+        return pids
+
+    def own_coordinator_pid(self) -> Optional[int]:
+        """Our running coordinator, re-recording its pid when coordinator.pid was lost."""
+        pid = self.read_coordinator_pid()
+        if pid is None and (found := self.find_coordinators()):
+            pid = found[0]
+            self.write_coordinator_pid(pid)
+        return pid
 
     def _spawn_coordinator(self, transport: str) -> None:
         log = self.log_dir / "coordinator.log"
@@ -444,9 +467,12 @@ class Launcher:
         want_agent = lend and s.training
         want_inference = lend and s.inference
 
-        health = (self.poll_health(url) or self.poll_health(self.proxy_url(s))) if want_coord else None
-        if want_coord and not health:
+        # Hosting: ask on loopback first, the LAN address may not answer (bound to 127.0.0.1, slow Wi-Fi).
+        health = (self.poll_health(self.proxy_url(s)) or self.poll_health(url)) if want_coord else None
+        if want_coord:
             self._check_coordinator()
+            self.own_coordinator_pid()
+        if want_coord and not health:
             if self.read_coordinator_pid() is None:   # ours may just be slow to answer: never start two
                 if not self._port_free(self.cfg.coordinator_host, self.cfg.coordinator_port):
                     self.last_error = PORT_IN_USE.format(port=self.cfg.coordinator_port)
@@ -509,8 +535,10 @@ class Launcher:
         request_stop(self.paths)
         self._stop_inference()
         self._forget_coordinator()
-        pid = self.read_coordinator_pid()
-        if pid is not None:
+        # Also those found by command line: Stop must not leave ours up when its pid file was lost.
+        for pid in dict.fromkeys([self.read_coordinator_pid(), *self.find_coordinators()]):
+            if pid is None:
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -549,9 +577,8 @@ class Launcher:
         s = settings.clamp() if settings is not None else self.load_settings()
         self._check_coordinator()
         url = self.coordinator_url(s)
-        health = self.poll_health(url) or {}
-        if not health and s.mode == "host":
-            health = self.poll_health(self.proxy_url(s)) or {}
+        health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
+        health = health or self.poll_health(url) or {}
         if health and self.last_error.startswith(UNREACHABLE_ERRORS):
             self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
         agent = self.paths.read_status()
