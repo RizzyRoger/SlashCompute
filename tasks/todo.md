@@ -1,3 +1,14 @@
+# Test every feature and fix bugs (one agent per bug)
+
+Base: RizzyRoger/SlashCompute main at a9758ba (PR #14). Branch: claude/slashcompute-testing-bugs-e28013.
+
+- [ ] Baseline suite (149 passed before the cluster test; its "failure" was a hidden .pth, see lessons)
+- [ ] QA agents in parallel: training coordinator/agent, community, web shell + launcher, LLM inference (real llama.cpp b11160 + Qwen3.5-0.8B), core libs/packaging
+- [ ] One fixer agent per confirmed bug, each with a regression test
+- [ ] Merge fixes, full suite, real inference check
+- [ ] Working models: Qwen3.5-0.8B-Q4_K_M (smoke) and Qwen3-8B-Q4_K_M (8B) GGUF in ~/models
+- [ ] PR to RizzyRoger/SlashCompute
+
 # Clear inference errors, memory controls, and agent/test robustness
 
 Base: GitHub main at 6034d56. Branch: fix/inference-errors-and-memory.
