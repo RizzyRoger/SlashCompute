@@ -401,3 +401,38 @@ def test_live_grants_flow(tmp_path):
         declined = c.post("/api/grants/g3/review", json={"approve": "false"})
         assert declined.status_code == 200, declined.text
         assert all(g["id"] != "g3" for g in declined.json()["grants"])
+
+
+
+
+def test_grant_amounts_must_be_positive_and_finite(tmp_path):
+    http = GrantHTTP()
+    app, launcher, _ = _shell(tmp_path, http=http)
+    launcher.save_settings(LauncherSettings(mode="host"))
+    summary = "Fine-tune a helper on my course notes for first years."
+    with TestClient(app) as c:
+        # Raw bodies: the JSON spec has no NaN/Infinity, but Python's parser (and float("inf")) accepts them.
+        for bad in ("NaN", "Infinity", "-Infinity", "0", "-5", '"nan"', '"inf"', '"1e999"'):
+            made = c.post("/api/grants", content=f'{{"title": "Lecture notes", "summary": "{summary}", '
+                                                 f'"goal": {bad}}}',
+                          headers={"content-type": "application/json"})
+            assert made.status_code == 400, (bad, made.text)
+            assert "finite" in made.json()["detail"]
+            funded = c.post("/api/grants/g1/fund", content=f'{{"amount": {bad}}}',
+                            headers={"content-type": "application/json"})
+            assert funded.status_code == 400, (bad, funded.text)
+        assert c.post("/api/grants/g1/fund", json={"amount": "lots"}).status_code == 400
+        assert c.get("/api/grants").status_code == 200
+    assert len(http.grants) == 2 and http.donated == 0.0
+
+
+def test_non_finite_settings_are_clamped_not_500(tmp_path):
+    app, _, _ = _shell(tmp_path)
+    with TestClient(app) as c:
+        r = c.post("/api/settings", content='{"gpu_percent": Infinity, "grant_split": -Infinity, '
+                                            '"memory_gb": NaN, "inference_memory_gb": 1e999}',
+                   headers={"content-type": "application/json"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["gpu_percent"], body["grant_split"], body["memory_gb"], body["inference_memory_gb"]) == \
+        (50, 0, 0, 0)

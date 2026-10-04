@@ -172,7 +172,12 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.post("/api/chat")
     async def chat(request: Request):
         """Streaming chat with the pool's LLMs (OpenAI-style SSE from the coordinator)."""
-        body = await request.json()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "Send a JSON chat request.") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Send a JSON chat request.")
         body["stream"] = True
         req = streams.build_request("POST", f"{await inference_base()}/v1/chat/completions", json=body,
                                     headers=_forward_headers(request), timeout=STREAM_TIMEOUT)
@@ -255,6 +260,15 @@ def create_shell(launcher: Optional[Launcher] = None,
         if not math.isfinite(n):
             raise HTTPException(400, "Enter a number.")
         return n
+
+
+            v = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Enter a number.") from None
+        # float() takes "NaN"/"Infinity", which would reach the coordinator as non-standard JSON.
+        if not math.isfinite(v) or v <= 0:
+            raise HTTPException(400, "Enter a positive, finite number.")
+        return v
 
     def coord_call(request: Request, method: str, path: str, *,
                    params: Optional[dict] = None, payload: Optional[dict] = None,

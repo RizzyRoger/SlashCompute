@@ -109,6 +109,21 @@ def test_chat_without_a_coordinator_is_502(tmp_path):
         assert c.post("/api/chat", json={"model": "m", "messages": []}).status_code == 502
 
 
+def test_chat_rejects_bodies_that_are_not_a_json_object(tmp_path):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200)
+
+    with TestClient(_shell(tmp_path, handler)) as c:
+        for raw in (b"notjson", b"[1,2]", b'"hi"', b"", b"\xff"):
+            r = c.post("/api/chat", content=raw, headers={"content-type": "application/json"})
+            assert r.status_code == 400, (raw, r.text)
+            assert "JSON" in r.json()["detail"]
+    assert sent == []
+
+
 def test_upload_streams_the_file_to_the_coordinator(tmp_path):
     seen = {}
 

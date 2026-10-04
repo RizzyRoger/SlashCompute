@@ -72,19 +72,19 @@ class LauncherSettings:
         transport = self.transport if self.transport in TRANSPORTS else "direct"
         try:
             gpu = max(1, min(100, int(self.gpu_percent)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             gpu = 50
         try:
             split = max(0, min(100, int(self.grant_split)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             split = 0
         try:
             mem = max(0, min(1024, int(self.inference_memory_gb)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             mem = 0
         try:
             train_mem = max(0, min(1024, int(self.memory_gb)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             train_mem = 0
         return LauncherSettings(
             mode=mode, url=str(self.url or ""), gpu_percent=gpu,
