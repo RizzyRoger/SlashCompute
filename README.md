@@ -6,7 +6,7 @@ Accounts, credits, and grants are later. This build is the Mac engine plus a loc
 
 ## Install
 
-Fully compiled /dmg file will be linked here.
+[Full .dmg File is Here.](https://drive.google.com/open?id=1lpUIbXkPRyN-sXPkNIsoMFWbBo1BreIu)
 
 ## Public-pool access
 
