@@ -171,5 +171,6 @@ def test_verification_transfers_require_assigned_users(pool):
     core.db.save(row)
     verifier.verifying = None
     assert client.get('/verify/review/bundle', headers=_headers(tokens['verifier'])).status_code == 403
-    _register(core, tokens['other'], 'verifier-node')
+    with pytest.raises(PermissionError):
+        _register(core, tokens['other'], 'verifier-node')
     assert client.get('/verify/review/bundle', headers=_headers(tokens['other'])).status_code == 403

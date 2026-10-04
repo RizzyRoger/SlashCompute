@@ -140,6 +140,10 @@ class Credits:
             return list(s.exec(select(NodeOwner).where(NodeOwner.user_id == user_id)).all())
 
     def bind_node(self, node_id: str, user_id: str) -> None:
+        # Node ids are public: never hand one user's node (and its earnings) to another.
+        owner = self.owner_of(node_id)
+        if owner is not None and owner != user_id:
+            raise PermissionError("node id belongs to another account")
         self.db.save(NodeOwner(node_id=node_id, user_id=user_id))
 
     def owner_of(self, node_id: str) -> Optional[str]:

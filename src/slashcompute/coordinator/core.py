@@ -207,7 +207,14 @@ class Coordinator:
                 raise PermissionError("banned")
             if public_user.accepted_terms_at is None:
                 raise PermissionError("accept terms")
+        # Node ids are public (GET /nodes): only the account that owns one may re-register it,
+        # so a stranger cannot evict a live node or rebind its earnings.
+        claimant = public_user or (self.auth.session_user(msg.session_token)
+                                   if msg.session_token else None)
         old = self.registry.get(msg.node_id)
+        owner = self.credits.owner_of(msg.node_id) or (old.user_id if old else None)
+        if claimant is not None and owner is not None and owner != claimant.id:
+            raise PermissionError("node id belongs to another account")
         if old is not None:
             await self.recovery.on_node_lost(msg.node_id, "re-registered")
         state = self.registry.register(msg, send)

@@ -118,6 +118,39 @@ def test_public_register_welcome_after_terms(env):
         assert core.registry.get("ok").user_id is not None
 
 
+def _register(ws, node_id, token):
+    ws.send_text(P.dump(P.Register(
+        node_id=node_id, name="mac", device=_device(),
+        data_host="127.0.0.1", data_port=9700, gpu_percent=50,
+        session_token=token,
+    )))
+    return P.parse_coordinator_message(ws.receive_text())
+
+
+def test_public_register_refuses_another_users_node_id(env):
+    client, core, *_ = env
+    victim = _account(client, "victim@lan.test")
+    attacker = _account(client, "mallory@lan.test")
+    victim_id = core.auth.session_user(victim).id
+    with client.websocket_connect("/ws/agent") as honest:
+        assert isinstance(_register(honest, "honest-node", victim), P.Welcome)
+        honest_state = core.registry.get("honest-node")
+        with pytest.raises(WebSocketDisconnect) as e:
+            with client.websocket_connect("/ws/agent") as ws:
+                _register(ws, "honest-node", attacker)
+        assert e.value.code == 4003
+        assert core.registry.get("honest-node") is honest_state
+        assert honest_state.user_id == victim_id
+        assert core.credits.owner_of("honest-node") == victim_id
+    # The owner reconnecting with its own node id (agent restart) still works.
+    with client.websocket_connect("/ws/agent") as ws:
+        assert isinstance(_register(ws, "honest-node", victim), P.Welcome)
+        assert core.registry.get("honest-node").user_id == victim_id
+    with pytest.raises(PermissionError):
+        core.credits.bind_node("honest-node", core.auth.session_user(attacker).id)
+    assert core.credits.owner_of("honest-node") == victim_id
+
+
 def test_public_transport_and_peered_assignment():
     spec = LoraFinetuneSpec(dataset_path="/tmp/d.jsonl", steps=2)
     peered = P.StageAssignment(
