@@ -45,14 +45,28 @@ log = logging.getLogger(__name__)
 TOKEN_HEADER = "x-inference-token"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.gguf$")
 DOWNLOAD_TIMEOUT_S = 6 * 3600
+DEFAULT_MAX_TOKENS = 256
 
 
 def estimate_prompt_tokens(body: dict) -> int:
     return max(8, len(json.dumps(body.get("messages", ""))) // 4)
 
 
+def completion_limit(body: dict) -> int:
+    """The one completion budget a request gets: sizes the context, the credit reservation and the engine's cap."""
+    raw = next((body[k] for k in ("max_tokens", "max_completion_tokens", "n_predict") if body.get(k) is not None),
+               DEFAULT_MAX_TOKENS)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        n = 0
+    if n <= 0 or isinstance(raw, bool):
+        raise HTTPException(400, "max_tokens must be a positive integer.")
+    return n
+
+
 def ctx_for(body: dict, s: InferenceSettings) -> int:
-    need = estimate_prompt_tokens(body) + int(body.get("max_tokens") or 256) + 64
+    need = estimate_prompt_tokens(body) + completion_limit(body) + 64
     ctx = s.DEFAULT_CTX
     while ctx < need:
         ctx *= 2
@@ -508,7 +522,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         return {"ok": True}
 
     @r.get("/plan")
-    async def plan_view(model: str, max_tokens: int = 256):
+    async def plan_view(model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
         row = svc.model_or_404(model)
         body = {"model": model, "max_tokens": max_tokens}
         ctx = ctx_for(body, s)
@@ -558,12 +572,12 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         except AccountingError as e:
             raise HTTPException(e.status, str(e)) from e
         row = svc.model_or_404(body.get("model", ""))
-        try:
-            max_tokens = int(body.get("max_tokens") or 256)
-        except (TypeError, ValueError, OverflowError):
-            raise HTTPException(400, "max_tokens must be an integer.") from None
+        max_tokens = completion_limit(body)
         stream = body_bool(body, "stream")
-        engine_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "model")}
+        # the engine gets exactly the budget we reserved for (llama-server alone would run to the end of the ctx)
+        engine_body = {k: v for k, v in body.items()
+                       if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
+        engine_body["max_tokens"] = max_tokens
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:

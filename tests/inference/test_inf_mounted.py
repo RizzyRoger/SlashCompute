@@ -12,6 +12,7 @@ from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.inference.coordinator.layers import synthetic_layout
 from slashcompute.inference.node.agent import training_busy
+from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
 QWEN = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
@@ -157,6 +158,52 @@ async def test_non_numeric_max_tokens_is_a_400(pool):
     for headers in ({"Authorization": f"Bearer {token}"}, {}):
         r = await chat(h, QWEN, max_tokens="abc", headers=headers)
         assert r.status_code == 400 and "max_tokens" in r.text
+
+
+@pytest.mark.parametrize("bad", [0, -5, True, "abc"])
+async def test_max_tokens_must_be_a_positive_integer(pool, bad):
+    h = pool
+    await two_nodes(h)
+    _, token = account(h, "chatter@lan.test", balance=1e16)
+    for headers in ({"Authorization": f"Bearer {token}"}, {}):
+        for field in ("max_tokens", "max_completion_tokens", "n_predict"):
+            async with httpx.AsyncClient(base_url=h.url) as c:
+                r = await c.post("/v1/chat/completions", headers=headers, json={
+                    "model": QWEN, "messages": [{"role": "user", "content": "hi"}], field: bad})
+            assert r.status_code == 400 and "max_tokens" in r.text, (field, r.text)
+
+
+class RecordingEngine(FakeEngine):
+    bodies: list = []
+
+    def complete(self, pipeline_id, body):
+        RecordingEngine.bodies.append(body)
+        return super().complete(pipeline_id, body)
+
+
+@pytest.mark.parametrize("limit, expect", [
+    ({}, 256),                                                 # no limit: capped at the default we reserve for
+    ({"max_completion_tokens": 300}, 300),                     # the newer OpenAI name is honored, not ignored
+    ({"n_predict": 7}, 7),
+    ({"max_tokens": 5, "n_predict": 4000}, 5),                 # one budget; the engine never sees a bigger one
+])
+async def test_engine_is_capped_at_the_budget_the_chatter_paid_for(pool, limit, expect):
+    h = pool
+    RecordingEngine.bodies = []
+    host, host_token = account(h, "host@lan.test")
+    chatter, chat_token = account(h, "chatter@lan.test", balance=1e16)
+    await two_nodes(h, session_token=host_token, engine_cls=RecordingEngine)
+    async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+        r = await c.post("/v1/chat/completions", headers={"Authorization": f"Bearer {chat_token}"}, json={
+            "model": QWEN, "messages": [{"role": "user", "content": "Write a long story about a dragon."}], **limit})
+    assert r.status_code == 200, r.text
+    sent = RecordingEngine.bodies[-1]
+    assert sent["max_tokens"] == expect and "n_predict" not in sent and "max_completion_tokens" not in sent
+    assert r.json()["usage"]["completion_tokens"] == expect
+    flops = r.json()["network"]["flops"]
+    credits = core(h).credits
+    assert credits.lifetime_earned(host.id) == pytest.approx(flops)
+    assert credits.balance(chatter.id) == pytest.approx(1e16 - flops)   # charged for every token generated
 
 
 async def test_training_on_a_mac_drains_its_inference_pipelines(pool):
