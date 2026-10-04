@@ -402,6 +402,38 @@ def test_http_grant_moderation_and_leaderboard(env):
     assert users.status_code == 403
 
 
+def test_http_comment_only_on_grants_you_can_view(env):
+    client, core, *_ = env
+    tokens = {}
+    for who in ("admin", "author", "other"):
+        tokens[who] = client.post("/auth/register", json={
+            "email": f"{who}@lan.test", "password": "password1", "name": who,
+        }).json()["token"]
+        client.post("/auth/accept-terms", headers=_hdr(tokens[who]))
+    client.cookies.clear()
+    g = client.post("/grants", json={
+        "title": "Need compute", "body": "A short paragraph about the need.",
+        "goal_flops": 50,
+    }, headers=_hdr(tokens["author"])).json()
+    path = f"/grants/{g['id']}"
+    assert client.get(path, headers=_hdr(tokens["other"])).status_code == 404
+    denied = client.post(f"{path}/comments", json={"body": "sneaky"},
+                         headers=_hdr(tokens["other"]))
+    assert denied.status_code == 404
+    assert denied.json()["detail"] == "Grant not found."
+    for who in ("author", "admin"):
+        ok = client.post(f"{path}/comments", json={"body": "pending note"},
+                         headers=_hdr(tokens[who]))
+        assert ok.status_code == 200, ok.text
+    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
+                headers=_hdr(tokens["admin"]))
+    ok = client.post(f"{path}/comments", json={"body": "now public"},
+                     headers=_hdr(tokens["other"]))
+    assert ok.status_code == 200, ok.text
+    bodies = [c["body"] for c in client.get(path).json()["comments"]]
+    assert bodies == ["pending note", "pending note", "now public"]
+
+
 def test_http_ban_blocks_take(env):
     client, core, tiny_model, tiny_dataset = env
     admin_tok = client.post("/auth/register", json={

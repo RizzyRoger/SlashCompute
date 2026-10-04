@@ -48,6 +48,9 @@ class Grants:
             raise GrantError("Grant not found.", 404)
         return g
 
+    def visible(self, g: Grant, viewer: Optional[User]) -> bool:
+        return g.status == "approved" or bool(viewer and (viewer.admin or viewer.id == g.author_id))
+
     def review(self, admin: User, grant_id: str, approve: bool,
                note: Optional[str] = None) -> Grant:
         if not admin.admin:
@@ -82,6 +85,8 @@ class Grants:
 
     def comment(self, user: User, grant_id: str, body: str) -> GrantComment:
         g = self.get(grant_id)
+        if not self.visible(g, user):
+            raise GrantError("Grant not found.", 404)
         if g.status == "declined":
             raise GrantError("This grant is not public.")
         text = (body or "").strip()[:2000]

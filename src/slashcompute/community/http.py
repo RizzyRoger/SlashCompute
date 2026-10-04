@@ -170,7 +170,7 @@ def mount_community(app, core: Coordinator) -> None:
         except GrantError as e:
             _raise(e)
         user = core.auth.session_user(_token(request, authorization))
-        if g.status != "approved" and not (user and (user.admin or user.id == g.author_id)):
+        if not core.grants.visible(g, user):
             raise HTTPException(404, "Grant not found.")
         comments = []
         nm = names()
