@@ -143,34 +143,37 @@ async def test_agent_stops_when_the_coordinator_refuses_it(tmp_path, monkeypatch
     assert count["n"] == 1                                 # no retry loop against a refusal
 
 
-async def test_agent_reconnects_when_handling_a_message_raises_an_http_error(tmp_path, monkeypatch):
-    """A blob upload/download failing (httpx error, not OSError) used to kill the daemon outright."""
+async def test_agent_survives_a_message_handler_raising_an_http_error(tmp_path, monkeypatch):
+    """A blob upload/download failing (httpx error, not OSError) used to kill the daemon
+    outright; it must not even cost the session (a reconnect would drop a running stage)."""
     import httpx
 
     from slashcompute.agent.daemon import AgentOptions, Daemon
     from slashcompute.common.protocol import Drain, Welcome, dump
 
     monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
-    rejoined = asyncio.Event()
+    handled = []
+    second = asyncio.Event()
 
     async def on_register(ws, n):
         await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=30)))
-        if n == 1:
-            await ws.send(dump(Drain(job_id="j", epoch=1)))
-        else:
-            rejoined.set()
+        await ws.send(dump(Drain(job_id="j", epoch=1)))
+        await ws.send(dump(Drain(job_id="j", epoch=2)))
         await ws.wait_closed()
 
-    async def boom(_msg):
-        raise httpx.ConnectError("coordinator blob store unreachable")
+    async def boom(msg):
+        handled.append(msg.epoch)
+        if msg.epoch == 1:
+            raise httpx.ConnectError("coordinator blob store unreachable")
+        second.set()
 
     server, url, count = await _fake_coordinator(on_register)
     daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True))
     monkeypatch.setattr(daemon, "_handle", boom)
     running = asyncio.create_task(daemon.run())
     try:
-        await asyncio.wait_for(rejoined.wait(), 10)
-        assert count["n"] == 2 and not running.done()
+        await asyncio.wait_for(second.wait(), 10)
+        assert handled == [1, 2] and count["n"] == 1 and not running.done()
     finally:
         await daemon.shutdown()
         await asyncio.wait_for(running, 5)
@@ -185,6 +188,22 @@ class _HeldBundle:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"bundle")
         return True
+
+
+def _assignment(job_id="j", epoch=1, stage_idx=0):
+    from slashcompute.common.protocol import LoraFinetuneSpec, StageAssignment
+
+    return StageAssignment(
+        job_id=job_id, epoch=epoch, stage_idx=stage_idx, num_stages=1, layer_start=0, layer_end=8,
+        num_layers=8, spec=LoraFinetuneSpec(dataset_path="dataset.jsonl", steps=2),
+        checkpoint_every=25, verify_ring_size=8,
+    )
+
+
+def _held_stage(job_id="j", epoch=1):
+    from slashcompute.agent.daemon import _Stage
+
+    return _Stage(_assignment(job_id, epoch), session=_HeldBundle())
 
 
 def _verify_daemon(tmp_path):
@@ -208,7 +227,7 @@ async def test_failed_bundle_upload_is_reported_not_raised(tmp_path, status):
     from slashcompute.common.protocol import VerifyBundleReady, VerifyFetch
 
     daemon, sent = _verify_daemon(tmp_path)
-    daemon._session = _HeldBundle()
+    daemon._stage = _held_stage()
 
     def put_bytes(path, data, params=None):
         req = httpx.Request("POST", "http://127.0.0.1:9931" + path)
@@ -547,3 +566,122 @@ open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
         shutil.rmtree(home, ignore_errors=True)
     assert out.get("config") == {"model_type": "tiny"}, out.get("error")
     assert out["cache"] == "read-only"
+
+
+# ------------------------------------------------------------ stage lifecycle races
+
+
+def _sandboxed_daemon(tmp_path, monkeypatch, worker="import time; time.sleep(30)"):
+    import sys
+
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+
+    monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
+                        lambda cmd, *_: [sys.executable, "-c", worker])
+    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
+    daemon = Daemon(AgentOptions(url="http://127.0.0.1:9940", home=tmp_path, localhost=True,
+                                 sandbox=True))
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    daemon.send = send
+    return daemon, sent
+
+
+async def test_finished_worker_does_not_clobber_the_next_stage(tmp_path, monkeypatch):
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    await daemon._start_stage(_assignment(epoch=1))
+    a = daemon._stage
+    await daemon._start_stage(_assignment(epoch=2))  # replaces (and stops) epoch 1
+    b = daemon._stage
+    try:
+        await asyncio.wait_for(a.pump, 10)  # epoch 1's pump ran its cleanup after epoch 2 began
+        assert a.proc.returncode is not None
+        assert daemon._stage is b and daemon._proc is b.proc and b.proc.returncode is None
+        assert (daemon.status, daemon.job_id, daemon.epoch) == ("loading", "j", 2)
+    finally:
+        await daemon._cancel_stage()
+    assert b.proc.returncode is not None and daemon._stage is None and daemon.status == "idle"
+
+
+async def test_stale_stage_commands_are_ignored(tmp_path):
+    from slashcompute.agent.daemon import AgentOptions, Daemon, _Stage
+    from slashcompute.common.protocol import CancelStage, Drain, VerifyFetch
+
+    class Session(_HeldBundle):
+        drained = cancelled = False
+
+        def request_drain(self):
+            self.drained = True
+
+        async def cancel(self):
+            self.cancelled = True
+
+    daemon = Daemon(AgentOptions(url="http://127.0.0.1:9941", home=tmp_path, localhost=True))
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    daemon.send = send
+    session = Session()
+    stage = daemon._stage = _Stage(_assignment(epoch=2), session=session)
+
+    await daemon._handle(Drain(job_id="j", epoch=1))
+    await daemon._handle(CancelStage(job_id="j", epoch=1))
+    await daemon._handle(CancelStage(job_id="other", epoch=2))
+    await daemon._on_fetch(VerifyFetch(verify_id="v", job_id="j", epoch=1, stage_idx=0, step=3))
+    assert not session.drained and not session.cancelled and daemon._stage is stage
+    assert sent[-1].error == "bundle no longer held"  # epoch 1's ring is not this one
+
+    await daemon._handle(Drain(job_id="j", epoch=2))
+    assert session.drained
+    await daemon._handle(CancelStage(job_id="j", epoch=2))
+    assert session.cancelled and daemon._stage is None
+
+
+async def test_repeated_assignment_keeps_the_running_stage(tmp_path, monkeypatch):
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    await daemon._start_stage(_assignment(epoch=1))
+    first = daemon._stage
+    try:
+        await daemon._start_stage(_assignment(epoch=1))  # e.g. replayed after a reconnect
+        assert daemon._stage is first and first.proc.returncode is None
+    finally:
+        await daemon._cancel_stage()
+
+
+async def test_worker_that_dies_silently_is_reported(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import StageFinished
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, worker="raise SystemExit(3)")
+    await daemon._start_stage(_assignment(epoch=1))
+    await asyncio.wait_for(daemon._stage.pump, 10)
+    [finished] = [m for m in sent if isinstance(m, StageFinished)]
+    assert finished.reason == "error" and "exited with code 3" in finished.detail
+    assert daemon._stage is None and daemon.status == "idle"
+
+
+async def test_second_shutdown_is_a_no_op_and_blocks_new_stages(tmp_path, monkeypatch):
+    from slashcompute.agent.daemon import _Stage
+
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    daemon.opt.cfg.grace_period_s = 0.5
+    session = _HeldBundle()
+    session.request_drain = lambda: None
+    session.task = asyncio.create_task(asyncio.sleep(30))  # a stage that never drains
+
+    async def cancel():
+        session.task.cancel()
+
+    session.cancel = cancel
+    daemon._stage = _Stage(_assignment(epoch=1), session=session)
+    first = asyncio.create_task(daemon.shutdown())
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(daemon.shutdown(), 0.1)  # returns at once instead of draining again
+    await daemon._start_stage(_assignment(epoch=2))
+    assert daemon._stage is None or daemon._stage.asg.epoch == 1
+    await asyncio.wait_for(first, 5)
+    assert daemon._stage is None and session.task.cancelled()

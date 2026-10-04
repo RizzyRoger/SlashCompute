@@ -84,7 +84,10 @@ def test_agent_session_reaches_http_and_sandbox_worker(monkeypatch, tmp_path, ex
     monkeypatch.setattr("slashcompute.agent.daemon.wrap_command", lambda cmd, *_: cmd)
     monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    asyncio.run(daemon._start_sandboxed(assignment, job_dir))
+    from slashcompute.agent.daemon import _Stage
+
+    stage = daemon._stage = _Stage(assignment)
+    asyncio.run(daemon._start_sandboxed(stage, job_dir))
     spec_path = job_dir / "assignment.json"
     assert json.loads(spec_path.read_text())["session_token"] == expected
     assert stat.S_IMODE(spec_path.stat().st_mode) == 0o600

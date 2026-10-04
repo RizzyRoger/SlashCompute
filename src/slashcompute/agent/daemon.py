@@ -1,4 +1,11 @@
-"""Coordinator WebSocket session: register, heartbeat, run stages."""
+"""Coordinator WebSocket session: register, heartbeat, run stages.
+
+Several tasks share the daemon (the receive loop, heartbeats, the running
+stage and its stdout pump, signal-driven shutdown), so the stage it runs is one
+``_Stage`` handle: lifecycle changes happen under ``_stage_lock`` and act on the
+handle they captured, and a stage's own callbacks only reset state that still
+belongs to it.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +17,9 @@ import os
 import signal
 import socket
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Coroutine, Optional
 
 import httpx
 import websockets
@@ -28,7 +36,7 @@ from slashcompute.common.discovery import discover
 from slashcompute.common.protocol import (
     CancelStage, Drain, DrainNotice, Heartbeat, Register, StageAssignment, StageFinished,
     StageReady, VerifyBundleReady, VerifyFetch, VerifyRequest, VerifyResult, Welcome, dump,
-    parse_coordinator_message,
+    parse_agent_message, parse_coordinator_message,
 )
 from slashcompute.pipeline.model_profile import resolve_model_path
 
@@ -110,6 +118,23 @@ class AgentOptions:
         self.data_bind = "0.0.0.0"
 
 
+@dataclass(eq=False)
+class _Stage:
+    """The stage this agent runs: in-process (``session``) or a sandboxed worker
+    process (``proc``, whose stdout ``pump`` forwards)."""
+
+    asg: StageAssignment
+    session: Optional[StageSession] = None
+    proc: Optional[asyncio.subprocess.Process] = None
+    pump: Optional[asyncio.Task] = None
+
+    def matches(self, job_id: str, epoch: int) -> bool:
+        return self.asg.job_id == job_id and self.asg.epoch == epoch
+
+    def runs(self, asg: StageAssignment) -> bool:
+        return self.matches(asg.job_id, asg.epoch) and self.asg.stage_idx == asg.stage_idx
+
+
 class Daemon:
     def __init__(self, opt: AgentOptions) -> None:
         self.opt = opt
@@ -118,12 +143,42 @@ class Daemon:
         self.epoch: Optional[int] = None
         self._ws = None
         self._send_lock = asyncio.Lock()
-        self._session: Optional[StageSession] = None
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._pump: Optional[asyncio.Task] = None    # forwards the sandboxed worker's stdout
+        self._stage: Optional[_Stage] = None
+        self._stage_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
+        self._stopping = False                      # shutdown started; no new stages
         self._draining = False
         self._welcomed = False
+
+    # Read-only views of the running stage.
+    @property
+    def _session(self) -> Optional[StageSession]:
+        return self._stage.session if self._stage else None
+
+    @property
+    def _proc(self) -> Optional[asyncio.subprocess.Process]:
+        return self._stage.proc if self._stage else None
+
+    @property
+    def _pump(self) -> Optional[asyncio.Task]:
+        return self._stage.pump if self._stage else None
+
+    def _spawn(self, coro: Coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _set_status(self, status: str, job_id: Optional[str], epoch: Optional[int]) -> None:
+        self.status, self.job_id, self.epoch = status, job_id, epoch
+        self._write_status()
+
+    def _release(self, stage: _Stage) -> None:
+        """``stage`` ended; forget it unless a newer stage has already replaced it."""
+        if self._stage is stage:
+            self._stage = None
+            self._set_status("idle", None, None)
 
     def _write_status(self) -> None:
         self.opt.paths.write_status(
@@ -134,10 +189,15 @@ class Daemon:
         )
 
     async def send(self, msg: BaseModel) -> None:
-        if self._ws is None:
-            return
         async with self._send_lock:
-            await self._ws.send(dump(msg))
+            ws = self._ws  # read under the lock: a reconnect may have replaced or cleared it
+            if ws is None:
+                return
+            try:
+                await ws.send(dump(msg))
+            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                # The receive loop notices the closed socket and reconnects.
+                log.info("could not send %s: %s", type(msg).__name__, e)
 
     async def run(self) -> None:
         opt = self.opt
@@ -146,9 +206,9 @@ class Daemon:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+                loop.add_signal_handler(sig, lambda: self._spawn(self.shutdown()))
             except NotImplementedError:
-                signal.signal(sig, lambda *_: asyncio.create_task(self.shutdown()))
+                signal.signal(sig, lambda *_: self._spawn(self.shutdown()))
 
         try:
             log.info("benchmarking device…")
@@ -176,7 +236,7 @@ class Daemon:
                     delay = 1.0                  # we were registered: a fresh outage starts a fresh backoff
                 if self._stop.is_set():
                     break
-                if self._session or self._proc:
+                if self._stage is not None:
                     log.info("lost the coordinator mid-stage; releasing it (the job will be rescheduled)")
                     await self._cancel_stage()
                 log.info("reconnecting in %.0fs", delay)
@@ -216,7 +276,10 @@ class Daemon:
                     except ValidationError as e:
                         log.warning("bad coordinator message: %s", e)
                         continue
-                    await self._handle(msg)
+                    try:
+                        await self._handle(msg)
+                    except Exception:  # one bad message must not take the agent down
+                        log.exception("handling %s failed", type(msg).__name__)
             finally:
                 if hb is not None:
                     hb.cancel()
@@ -225,10 +288,13 @@ class Daemon:
     async def _heartbeats(self, interval: float) -> None:
         try:
             while not self._stop.is_set():
-                await self.send(Heartbeat(
-                    node_id=self.opt.node_id, status=self.status if not self._draining else "draining",
-                    job_id=self.job_id, epoch=self.epoch,
-                ))
+                try:
+                    await self.send(Heartbeat(
+                        node_id=self.opt.node_id, status=self.status if not self._draining else "draining",
+                        job_id=self.job_id, epoch=self.epoch,
+                    ))
+                except Exception:  # a silently dead heartbeat loop gets the node evicted
+                    log.exception("heartbeat failed")
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
@@ -238,14 +304,14 @@ class Daemon:
             await self._start_stage(msg)
         elif isinstance(msg, Drain):
             log.info("drain requested for job %s", msg.job_id)
-            await self._request_drain()
+            await self._request_drain(msg.job_id, msg.epoch)
         elif isinstance(msg, CancelStage):
             log.info("cancel stage job %s epoch %d", msg.job_id, msg.epoch)
-            await self._cancel_stage()
+            await self._cancel_stage(msg.job_id, msg.epoch)
         elif isinstance(msg, VerifyFetch):
             await self._on_fetch(msg)
         elif isinstance(msg, VerifyRequest):
-            await self._on_verify(msg)
+            self._spawn(self._on_verify(msg))  # a replay must not hold up CancelStage
         else:
             log.warning("unhandled coordinator message %s", type(msg).__name__)
 
@@ -253,16 +319,29 @@ class Daemon:
         if public_transport(self.opt.coordinator, self.opt.cfg.public_pool) and peered_assignment(asg):
             log.warning("refusing multi-peer assignment on public/https coordinator")
             return
-        if self._session or self._proc:
-            log.warning("assignment while a stage is running; cancelling the old one")
-            await self._cancel_stage()
-        self.status, self.job_id, self.epoch = "loading", asg.job_id, asg.epoch
-        self._write_status()
+        async with self._stage_lock:
+            if self._stopping:
+                log.warning("ignoring assignment for job %s: shutting down", asg.job_id)
+                return
+            cur = self._stage
+            if cur is not None and cur.runs(asg):
+                log.info("already running job %s epoch %d stage %d", asg.job_id, asg.epoch,
+                         asg.stage_idx)
+                return
+            if cur is not None:
+                log.warning("assignment while a stage is running; cancelling the old one")
+                await self._stop_stage(cur)
+            stage = self._stage = _Stage(asg)
+            self._set_status("loading", asg.job_id, asg.epoch)
         job_dir = self.opt.paths.job_dir(asg.job_id, asg.epoch)
         if self.opt.sandbox:
-            await self._start_sandboxed(asg, job_dir)
-            return
-        session = StageSession()
+            await self._start_sandboxed(stage, job_dir)
+        else:
+            self._start_in_process(stage, job_dir)
+
+    def _start_in_process(self, stage: _Stage, job_dir: Path) -> None:
+        asg = stage.asg
+        session = stage.session = StageSession()
         session.assignment = asg
         ctx = WorkerContext(
             assignment=asg, http=self.opt.http, job_dir=job_dir,
@@ -271,14 +350,11 @@ class Daemon:
         )
 
         async def emit(m) -> None:
-            if isinstance(m, StageReady):
-                self.status = "running"
-                self._write_status()
+            if isinstance(m, StageReady) and self._stage is stage:
+                self._set_status("running", asg.job_id, asg.epoch)
             await self.send(m)
             if isinstance(m, StageFinished):
-                self.status, self.job_id, self.epoch = "idle", None, None
-                self._session = None
-                self._write_status()
+                self._release(stage)
 
         async def _run() -> None:
             try:
@@ -287,23 +363,25 @@ class Daemon:
                 pass
             except Exception:
                 log.exception("worker crashed")
+            finally:
+                self._release(stage)
 
         session.task = asyncio.create_task(_run())
-        self._session = session
 
-    async def _start_sandboxed(self, asg: StageAssignment, job_dir: Path) -> None:
+    async def _start_sandboxed(self, stage: _Stage, job_dir: Path) -> None:
+        asg = stage.asg
         # The sandbox can't write the HF cache (~/.cache/huggingface: locks, refs, blobs), so
         # fetch the model here, unsandboxed, and run the worker offline against that cache.
         try:
             await asyncio.to_thread(resolve_model_path, asg.spec.model)
         except Exception as e:
             log.exception("model fetch failed")
-            await self.send(StageFinished(
-                job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
-                reason="error", last_step=asg.resume_step, detail=f"model fetch failed: {e}",
-            ))
-            self.status, self.job_id, self.epoch = "idle", None, None
-            self._write_status()
+            if self._stage is stage:  # not cancelled meanwhile
+                await self.send(StageFinished(
+                    job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
+                    reason="error", last_step=asg.resume_step, detail=f"model fetch failed: {e}",
+                ))
+                self._release(stage)
             return
         spec_path = job_dir / "assignment.json"
         spec_path.touch(mode=0o600)
@@ -322,17 +400,23 @@ class Daemon:
             [sys.executable, "-m", "slashcompute.agent.worker", "--assignment", str(spec_path)],
             job_dir, self.opt.paths.root,
         )
-        log.info("starting sandboxed worker: %s", " ".join(cmd))
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
-            env={**os.environ, "HF_HUB_OFFLINE": "1"},
-        )
-        self._pump = asyncio.create_task(self._pump_worker_stdout())
+        async with self._stage_lock:
+            if self._stage is not stage:
+                log.info("job %s epoch %d was cancelled before its worker started",
+                         asg.job_id, asg.epoch)
+                return
+            log.info("starting sandboxed worker: %s", " ".join(cmd))
+            stage.proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
+                env={**os.environ, "HF_HUB_OFFLINE": "1"},
+            )
+            stage.pump = self._spawn(self._pump_worker_stdout(stage))
 
-    async def _pump_worker_stdout(self) -> None:
-        proc = self._proc
+    async def _pump_worker_stdout(self, stage: _Stage) -> None:
+        proc = stage.proc
         if proc is None or proc.stdout is None:
             return
+        asg, finished = stage.asg, False
         try:
             while True:
                 line = await proc.stdout.readline()
@@ -342,56 +426,78 @@ class Daemon:
                 if not raw:
                     continue
                 try:
-                    from slashcompute.common.protocol import parse_agent_message
-
                     msg = parse_agent_message(raw)
                 except ValidationError:
                     log.warning("worker stdout: %s", raw[:200])
                     continue
-                if isinstance(msg, StageReady):
-                    self.status = "running"
-                    self._write_status()
+                if isinstance(msg, StageReady) and self._stage is stage:
+                    self._set_status("running", asg.job_id, asg.epoch)
                 await self.send(msg)
                 if isinstance(msg, StageFinished):
-                    self.status, self.job_id, self.epoch = "idle", None, None
-                    self._write_status()
+                    finished = True
+                    self._release(stage)
         finally:
             if proc.returncode is None:
                 await proc.wait()
-            self._proc = None
-            if self.status == "running":
-                self.status, self.job_id, self.epoch = "idle", None, None
-                self._write_status()
+            if not finished and self._stage is stage:
+                # The worker died without reporting (crash, OOM kill): say so now rather
+                # than leave the coordinator waiting for a stall timeout.
+                await self.send(StageFinished(
+                    job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="error",
+                    last_step=asg.resume_step, detail=f"worker exited with code {proc.returncode}",
+                ))
+            self._release(stage)
 
-    async def _request_drain(self) -> None:
-        if self._session:
-            self._session.request_drain()
-        if self._proc and self._proc.stdin:
+    async def _request_drain(self, job_id: Optional[str] = None, epoch: Optional[int] = None) -> None:
+        stage = self._stage
+        if stage is None or (job_id is not None and not stage.matches(job_id, epoch)):
+            return
+        if stage.session:
+            stage.session.request_drain()
+        proc = stage.proc
+        if proc and proc.stdin:
             try:
-                self._proc.stdin.write(b'{"type":"drain"}\n')
-                await self._proc.stdin.drain()
+                proc.stdin.write(b'{"type":"drain"}\n')
+                await proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError):
                 pass                             # the worker already exited
 
-    async def _cancel_stage(self) -> None:
-        if self._session:
-            await self._session.cancel()
-            self._session = None
-        if self._proc:
-            self._proc.terminate()
+    async def _cancel_stage(self, job_id: Optional[str] = None, epoch: Optional[int] = None) -> None:
+        """Stop the running stage; with ``job_id``/``epoch``, only if it is that one (a
+        stale CancelStage must not kill a newer stage)."""
+        async with self._stage_lock:
+            stage = self._stage
+            if stage is None:
+                return
+            if job_id is not None and not stage.matches(job_id, epoch):
+                log.info("ignoring cancel for job %s epoch %s: running job %s epoch %d",
+                         job_id, epoch, stage.asg.job_id, stage.asg.epoch)
+                return
+            await self._stop_stage(stage)
+
+    async def _stop_stage(self, stage: _Stage) -> None:
+        """Stop ``stage``. The caller holds ``_stage_lock``."""
+        self._release(stage)  # first, so the stage's own exit path leaves state alone
+        if stage.session is not None:
+            await stage.session.cancel()
+        proc = stage.proc
+        if proc is not None and getattr(proc, "returncode", 0) is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
+                await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self._proc.kill()
-            self._proc = None
-        self.status, self.job_id, self.epoch = "idle", None, None
-        self._write_status()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
 
     async def _on_fetch(self, msg: VerifyFetch) -> None:
         dest = self.opt.paths.job_dir(msg.job_id, msg.epoch) / f"bundle_{msg.step}.safetensors"
+        stage = self._stage
+        # Only the stage that ran the step holds its bundle; another job's ring must not answer.
+        session = stage.session if stage is not None and stage.matches(msg.job_id, msg.epoch) else None
         error = None
         try:
-            if self._session and self._session.save_bundle(msg.step, dest):
+            if session and session.save_bundle(msg.step, dest):
                 await asyncio.to_thread(self._upload, f"/verify/{msg.verify_id}/bundle", dest)
             else:
                 error = "bundle no longer held"
@@ -429,8 +535,9 @@ class Daemon:
         self.opt.http.put_bytes(path, src.read_bytes())
 
     async def shutdown(self) -> None:
-        if self._stop.is_set():
+        if self._stopping:  # a second SIGTERM while draining
             return
+        self._stopping = True
         log.info("shutting down")
         self._draining = True
         self._write_status()
@@ -438,18 +545,16 @@ class Daemon:
             await self.send(DrainNotice(node_id=self.opt.node_id))
         except Exception:
             pass
-        if self._session:
-            self._session.request_drain()
-            try:
-                await asyncio.wait_for(self._session.task, timeout=self.opt.cfg.grace_period_s)
-            except (asyncio.TimeoutError, asyncio.CancelledError, TypeError):
-                await self._cancel_stage()
-        elif self._proc:
-            # Sandboxed: the worker drains on a stdin line; the pump forwards its StageFinished.
+        stage = self._stage
+        if stage is not None:
+            # In-process stages drain via their runner; sandboxed workers on a stdin line,
+            # with the pump forwarding their StageFinished.
             await self._request_drain()
-            try:
-                await asyncio.wait_for(asyncio.shield(self._pump), timeout=self.opt.cfg.grace_period_s)
-            except (asyncio.TimeoutError, TypeError):
+            ended = stage.session.task if stage.session else stage.pump
+            if ended is not None:
+                with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(ended), timeout=self.opt.cfg.grace_period_s)
+            if self._stage is stage:
                 await self._cancel_stage()
         self._stop.set()
         if self._ws is not None:
