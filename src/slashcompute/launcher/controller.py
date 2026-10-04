@@ -28,6 +28,8 @@ class LauncherError(Exception):
 
 FINISHES = ("carbon", "poster", "signal", "thermal", "void")
 TRANSPORTS = ("direct", "relay")
+# Errors that only say the coordinator could not be reached: stale once it answers.
+UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answering ")
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
 
@@ -415,11 +417,7 @@ class Launcher:
         else:
             self._stop_inference()
 
-        snap = self.snapshot(s)
-        if snap.coordinator_up and "not answering" in (self.last_error or ""):
-            self.last_error = ""
-            snap.last_error = ""
-        return snap
+        return self.snapshot(s)
 
     def stop(self) -> StatusSnapshot:
         self.last_error = ""
@@ -467,6 +465,8 @@ class Launcher:
         health = self.poll_health(url) or {}
         if not health and s.mode == "host":
             health = self.poll_health(self.proxy_url(s)) or {}
+        if health and self.last_error.startswith(UNREACHABLE_ERRORS):
+            self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
         agent = self.paths.read_status()
         agent_pid = self.paths.read_pid()
         agent_running = bool(agent_pid and process_alive(agent_pid))

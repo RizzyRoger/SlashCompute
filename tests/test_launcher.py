@@ -313,6 +313,28 @@ def test_start_join_without_health_fails(tmp_path):
         launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
 
 
+def test_unreachable_error_clears_once_the_coordinator_answers(tmp_path):
+    http = FakeHTTP(None)
+    launcher = _launcher(tmp_path, http=http)
+    with pytest.raises(LauncherError, match="No coordinator"):
+        launcher.start(LauncherSettings(mode="join", url="http://127.0.0.1:9399"))
+    # Still down: the error stays.
+    assert launcher.snapshot().last_error == "No coordinator at http://127.0.0.1:9399."
+
+    # Connect saves a fixed address (no start); the next status poll must drop the stale banner.
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+    http.health = {"ok": True}
+    snap = launcher.snapshot()
+    assert snap.coordinator_up and snap.last_error == ""
+    assert launcher.last_error == ""
+
+
+def test_reachable_coordinator_keeps_other_errors(tmp_path):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.last_error = "Training agent is still stopping. Settings have not been applied."
+    assert launcher.snapshot().last_error == launcher.last_error != ""
+
+
 def test_start_public_requires_url_and_token(tmp_path):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     with pytest.raises(LauncherError, match="public coordinator URL"):
