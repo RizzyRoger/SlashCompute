@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.common import protocol as P
-from slashcompute.common.canary import run_canary_mlx
+from slashcompute.common.canary import compare_stats, expected_stats, run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.jobs import LoraFinetuneSpec
@@ -157,6 +157,14 @@ def test_failed_canary_excludes_node(env):
     _wait(lambda: core.registry.get("liar").canary_passed is False)
     assert core.registry.schedulable() == []
     a.close()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_canary_rejects_non_finite_stats(bad):
+    exp = expected_stats(1, 64)
+    assert compare_stats(dict(exp), exp, 0.5) == (True, 0.0)
+    assert compare_stats({k: bad for k in exp}, exp, 0.5) == (False, float("inf"))
+    assert compare_stats({**exp, "trace": bad}, exp, 0.5) == (False, float("inf"))
 
 
 def test_node_loss_triggers_recovery_and_reschedule(env):
