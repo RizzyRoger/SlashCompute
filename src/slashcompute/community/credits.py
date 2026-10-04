@@ -164,6 +164,19 @@ class Credits:
             self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
                       note=f"tithe from {user_id}")
 
+    def credit_host(self, owner_id: Optional[str], flops: float, *,
+                    node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
+        """Pay out FLOPs a job was charged for a node's work. A share nobody may earn (unbound
+        node, missing or banned owner) goes to the community pot so charged FLOPs never vanish."""
+        if flops <= 0:
+            return
+        owner = self.db.get(User, owner_id) if owner_id else None
+        if owner is None or owner.banned:
+            self.post(POT_ID, "earn", flops, node_id=node_id, job_id=job_id,
+                      note="unclaimed host share")
+            return
+        self.contribute(owner.id, flops, owner.grant_split, node_id=node_id, job_id=job_id)
+
     def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
         """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""
         if not math.isfinite(flops) or flops <= 0:
@@ -261,7 +274,8 @@ class Credits:
             ).all()
             users = {u.id: u for u in s.exec(select(User)).all()}
         ranked = sorted(
-            ((uid, float(total or 0.0)) for uid, total in rows if uid != POT_ID),
+            ((uid, float(total or 0.0)) for uid, total in rows
+             if uid != POT_ID and not (uid in users and users[uid].banned)),
             key=lambda x: x[1], reverse=True,
         )[:limit]
         out = []

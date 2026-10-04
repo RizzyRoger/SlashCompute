@@ -17,7 +17,8 @@ log = logging.getLogger(__name__)
 
 class CoreAccounting:
     """Mirrors training (``Coordinator._on_step``): every request is logged in the usage ledger;
-    hosts earn only what a signed-in user's reservation actually paid, split by their FLOPs."""
+    hosts earn only what a signed-in user's reservation actually paid, split by their FLOPs, and
+    a share no host may earn (unbound node, banned owner) goes to the community pot."""
 
     def __init__(self, core: Coordinator) -> None:
         self.core = core
@@ -57,12 +58,8 @@ class CoreAccounting:
             return
         take = credits.consume_job(account_id, total)   # never more than the reservation holds
         for node_id, flops in per_node.items():
-            owner_id = credits.owner_of(node_id)
-            earned = take * flops / total
-            if owner_id and earned > 0:
-                owner = self.core.auth.get(owner_id)
-                credits.contribute(owner_id, earned, owner.grant_split if owner else 0, node_id=node_id,
-                                   job_id=account_id)
+            credits.credit_host(credits.owner_of(node_id), take * flops / total, node_id=node_id,
+                                job_id=account_id)
 
     def settle(self, account_id: str) -> None:
         self.core.credits.settle_job(account_id)

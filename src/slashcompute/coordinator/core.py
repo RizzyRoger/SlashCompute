@@ -298,10 +298,7 @@ class Coordinator:
         take = self.credits.consume_job(job.id, flops) if acct is not None else 0.0
         node = self.registry.get(node_id)
         owner_id = (node.user_id if node and node.user_id else self.credits.owner_of(node_id))
-        if owner_id and acct is not None and take > 0:
-            owner = self.auth.get(owner_id)
-            split = owner.grant_split if owner else 0
-            self.credits.contribute(owner_id, take, split, node_id=node_id, job_id=msg.job_id)
+        self.credits.credit_host(owner_id, take, node_id=node_id, job_id=msg.job_id)
         if acct is not None and self.credits.job_exhausted(job.id):
             await self.cancel_job(job)
             job.row.error = "FLOP budget spent"
