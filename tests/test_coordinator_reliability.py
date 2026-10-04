@@ -17,7 +17,7 @@ from slashcompute.common.canary import run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
-from slashcompute.coordinator.db import UsageRecord
+from slashcompute.coordinator.db import Job, StageRun, UsageRecord
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
 
@@ -212,3 +212,91 @@ def test_node_evicted_for_missed_heartbeats_is_disconnected(live):
                 a.recv()
     finally:
         a.close()
+
+
+# ------------------------------------------------------------ transactional epoch start
+
+
+def _online(core, node_id, sent, on_send=None):
+    mem = 8 * GB
+
+    async def send(msg):
+        sent.setdefault(node_id, []).append(msg)
+        if on_send is not None:
+            await on_send(node_id, msg)
+
+    core.registry.register(P.Register(
+        node_id=node_id, name=node_id, data_host="127.0.0.1", data_port=9700, gpu_percent=50,
+        device=P.DeviceProfile(chip="test", memory_total_bytes=mem, memory_available_bytes=mem,
+                               working_set_bytes=mem, memory_contrib_bytes=mem, matmul_tflops=1.0,
+                               mem_bandwidth_gbps=100.0)), send)
+
+
+def _two_stage_job(core):
+    return core.submit(_spec(core, min_stages=2, max_stages=2))
+
+
+def test_epoch_start_that_cannot_be_recorded_changes_nothing(core, monkeypatch):
+    sent = {}
+    _online(core, "n1", sent)
+    _online(core, "n2", sent)
+    job = _two_stage_job(core)
+
+    def locked(*rows):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(core.db, "save_all", locked)
+    assert not asyncio.run(core.scheduler.try_start(job))
+    assert (job.row.epoch, job.row.status, job.current) == (0, "queued", None)
+    assert all(n.assignment is None for n in core.registry.nodes.values()) and not sent
+    assert "could not record epoch 1" in job.wait_reason
+
+    monkeypatch.undo()  # the database recovers: the next tick starts the job cleanly
+    assert asyncio.run(core.scheduler.try_start(job))
+    assert (job.row.epoch, job.row.status) == (1, "starting")
+    assert core.db.get(Job, job.id).epoch == 1
+    assert sorted(type(m).__name__ for ms in sent.values() for m in ms) == ["StageAssignment"] * 2
+
+
+def test_node_lost_before_its_assignment_rolls_the_epoch_back(core):
+    sent, told = {}, []
+
+    async def lose_the_other(node_id, msg):  # while one node is told, the other drops out
+        if isinstance(msg, P.StageAssignment) and not told:
+            told.append(node_id)
+            core.registry.remove("n2" if node_id == "n1" else "n1")
+
+    _online(core, "n1", sent, lose_the_other)
+    _online(core, "n2", sent, lose_the_other)
+    job = _two_stage_job(core)
+    assert not asyncio.run(core.scheduler.try_start(job))
+
+    [first] = told
+    assert [type(m).__name__ for m in sent[first]] == ["StageAssignment", "CancelStage"]
+    assert sent[first][1].epoch == 1 and len(sent) == 1  # the lost node was never told
+    assert job.current.closed and job.row.status == "queued" and job.row.recoveries == 0
+    assert core.registry.get(first).assignment is None
+    with core.db.session() as s:
+        runs = s.exec(select(StageRun).where(StageRun.job_id == job.id)).all()
+    assert len(runs) == 2 and {r.end_reason for r in runs} == {"start rolled back"}
+
+    _online(core, "n2" if first == "n1" else "n1", sent)
+    assert asyncio.run(core.scheduler.try_start(job))  # tried again as if nothing happened
+    assert job.row.epoch == 2 and job.row.recoveries == 0
+
+
+def test_epoch_cancelled_while_assignments_go_out_sends_no_more(core):
+    sent, told = {}, []
+
+    async def cancel_job(node_id, msg):
+        if isinstance(msg, P.StageAssignment) and not told:
+            told.append(node_id)
+            await core.cancel_job(job)
+
+    _online(core, "n1", sent, cancel_job)
+    _online(core, "n2", sent, cancel_job)
+    job = _two_stage_job(core)
+    assert not asyncio.run(core.scheduler.try_start(job))
+    other = "n2" if told[0] == "n1" else "n1"
+    assert [type(m).__name__ for m in sent[other]] == ["CancelStage"]  # never a zombie stage
+    assert job.row.status == "cancelled"

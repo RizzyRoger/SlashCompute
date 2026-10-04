@@ -238,3 +238,10 @@ class Database:
         with self.session() as s:
             s.merge(row)
             s.commit()
+
+    def save_all(self, *rows) -> None:
+        """Insert or update every row in one transaction: all are written or none is."""
+        with self.session() as s:
+            for row in rows:
+                s.merge(row)
+            s.commit()
