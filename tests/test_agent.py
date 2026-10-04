@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -133,3 +134,39 @@ def test_chosen_memory_is_lent_even_above_what_is_free_but_not_past_the_working_
     assert bm.benchmark(10 << 30).memory_contrib_bytes == 10 << 30   # the owner's choice
     assert bm.benchmark(3 << 30).memory_contrib_bytes == 3 << 30
     assert bm.benchmark(15 << 30).memory_contrib_bytes == 12 << 30   # capped at 75% of RAM
+
+
+def test_sandbox_profile_ships_inside_the_package():
+    import slashcompute.agent as agent_pkg
+    from slashcompute.agent.sandbox import profile_path
+
+    profile = profile_path()
+    assert profile.is_file()
+    assert profile.parent == Path(agent_pkg.__file__).resolve().parent
+    assert "(deny default)" in profile.read_text()
+
+
+def test_wrap_command_fails_closed_without_profile(monkeypatch, tmp_path):
+    from slashcompute.agent import sandbox
+
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(sandbox, "profile_path", lambda: tmp_path / "missing.sb")
+    with pytest.raises(RuntimeError, match="unsandboxed"):
+        sandbox.wrap_command(["python", "-m", "worker"], tmp_path, tmp_path)
+
+
+def test_wrap_command_fails_closed_without_sandbox_exec(monkeypatch, tmp_path):
+    from slashcompute.agent import sandbox
+
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
+    with pytest.raises(RuntimeError, match="unsandboxed"):
+        sandbox.wrap_command(["python", "-m", "worker"], tmp_path, tmp_path)
+
+
+def test_wrap_command_prefixes_sandbox_exec(monkeypatch, tmp_path):
+    from slashcompute.agent import sandbox
+
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    cmd = sandbox.wrap_command(["python", "-m", "worker"], tmp_path / "job", tmp_path)
+    assert cmd[:3] == ["/usr/bin/sandbox-exec", "-f", str(sandbox.profile_path())]
+    assert cmd[-4:] == ["--", "python", "-m", "worker"]
