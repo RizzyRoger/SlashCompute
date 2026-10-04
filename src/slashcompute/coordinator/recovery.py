@@ -49,6 +49,15 @@ class Recovery:
         core = self.core
         if not self._loop_stalled():
             for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
+                if node.reliable and not node.draining:
+                    # Most network drops are silent: treat it like a disconnect, so an agent that
+                    # comes back within the grace window resumes instead of losing its stage.
+                    log.warning("node %s missed heartbeats; closing its socket and holding its "
+                                "place for %.0fs", node.node_id[:8], core.cfg.reconnect_grace_s)
+                    node.connected, node.disconnected_at = False, time.monotonic()
+                    if node.close is not None:
+                        await node.close()
+                    continue
                 log.warning("node %s missed heartbeats", node.node_id[:8])
                 await self.on_node_lost(node.node_id, "heartbeat timeout")
             for node in core.registry.away(core.cfg.reconnect_grace_s):

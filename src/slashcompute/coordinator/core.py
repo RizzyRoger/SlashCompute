@@ -335,9 +335,10 @@ class Coordinator:
         node = self.registry.get(node_id)
         if node is not None and node.reliable and not node.draining:
             # Hold its place: a reconnect within the grace window resumes the session.
-            node.connected, node.disconnected_at = False, time.monotonic()
-            log.info("node %s disconnected; holding its place for %.0fs", node_id[:8],
-                     self.cfg.reconnect_grace_s)
+            if node.connected:
+                node.connected, node.disconnected_at = False, time.monotonic()
+                log.info("node %s disconnected; holding its place for %.0fs", node_id[:8],
+                         self.cfg.reconnect_grace_s)
             return
         await self.recovery.on_node_lost(node_id, "disconnected")
 

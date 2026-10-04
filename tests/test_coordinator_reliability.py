@@ -434,3 +434,29 @@ def test_liveness_checks_keep_running_while_scheduling_is_stuck(core):
 
     asyncio.run(scenario())
     assert len(recovery_ticks) >= 10
+
+
+def test_silent_agent_with_a_session_is_held_then_resumes(live):
+    client, core, tiny_model, tiny_dataset = live
+    core.cfg.heartbeat_timeout_s = 0.3
+    a = Agent(client, "n1", session="s1")
+    a.ack(a.pass_canary(seq=1))
+    job_id = _submit(client, tiny_model, tiny_dataset)
+    asg = a.recv()
+    a.ack(asg)
+    # The network goes quiet without closing anything: no heartbeats arrive.
+    _wait(lambda: not core.registry.get("n1").connected)
+    with pytest.raises(WebSocketDisconnect):  # its socket is closed so it reconnects...
+        for _ in range(10):
+            a.recv()
+    a.close()
+    job = core.jobs[job_id]
+    assert not job.current.closed and job.row.recoveries == 0  # ...but its place is held
+
+    b = Agent(client, "n1", session="s1", last_seq=asg.seq)
+    assert b.welcome.resumed
+    b.send(P.Heartbeat(node_id="n1", status="loading", job_id=job_id, epoch=1))
+    b.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=0), seq=2)
+    _wait(lambda: job.row.status == "running")
+    assert job.row.recoveries == 0
+    b.close()
