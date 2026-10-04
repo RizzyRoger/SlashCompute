@@ -241,9 +241,6 @@ def mount_community(app, core: Coordinator) -> None:
                 admins = s.exec(select(User).where(User.admin == True, User.banned == False)).all()  # noqa: E712
             if len(admins) <= 1:
                 raise HTTPException(400, "Cannot ban the last admin.")
-        return {"user": core.auth.public_view(core.auth.set_banned(user, bool(body.get("banned", True))))}
-
-
         return {"user": core.auth.public_view(core.auth.set_banned(user, body_bool(body, "banned", True)))}
 
     @r.post("/admin/users/{user_id}/flag")

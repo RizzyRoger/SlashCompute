@@ -254,14 +254,6 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     def amount(value) -> float:
         try:
-            n = float(value)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "Enter a number.") from None
-        if not math.isfinite(n):
-            raise HTTPException(400, "Enter a number.")
-        return n
-
-
             v = float(value)
         except (TypeError, ValueError):
             raise HTTPException(400, "Enter a number.") from None

@@ -562,9 +562,6 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
             max_tokens = int(body.get("max_tokens") or 256)
         except (TypeError, ValueError, OverflowError):
             raise HTTPException(400, "max_tokens must be an integer.") from None
-        stream = bool(body.get("stream"))
-
-
         stream = body_bool(body, "stream")
         engine_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "model")}
         account_id = "inf-" + uuid.uuid4().hex[:12]
