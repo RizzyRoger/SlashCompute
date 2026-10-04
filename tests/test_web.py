@@ -368,6 +368,9 @@ def test_live_grants_flow(tmp_path):
         assert made.status_code == 200, made.text
         assert any(g["title"] == "Lecture notes" for g in made.json()["pending"])
         assert c.post("/api/grants", json={"title": "", "summary": "x", "goal": 1}).status_code == 400
+        assert c.post("/api/grants", json={"title": "t", "summary": "x",
+                                           "goal": "1e309"}).status_code == 400
+        assert c.post("/api/grants/g1/fund", json={"amount": "nan"}).status_code == 400
 
         approved = c.post("/api/grants/g2/review", json={"approve": True}).json()
         assert any(g["id"] == "g2" for g in approved["grants"])

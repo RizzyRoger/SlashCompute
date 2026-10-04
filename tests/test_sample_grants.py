@@ -29,6 +29,8 @@ def test_fund_updates_grant_and_pledged_without_mutating(book):
     (0, 100 * T, "above zero"),
     (20 * T, 10 * T, "available"),
     (10_000 * T, 100_000 * T, "left to reach"),
+    (float("nan"), 100 * T, "above zero"),
+    (float("inf"), float("inf"), "above zero"),
 ])
 def test_fund_rejects_bad_amounts(book, amount, balance, message):
     with pytest.raises(G.GrantError, match=message):
@@ -56,7 +58,9 @@ def test_request_creates_pending_grant(book):
     assert (new.title, new.status, new.raised) == ("GPU for my thesis", "pending", 0.0)
     assert new not in G.public(after)
     for title, summary, goal, msg in [("", "x", 1, "title"), ("t", " ", 1, "Describe"),
-                                      ("t", "x", 0, "goal")]:
+                                      ("t", "x", 0, "goal"),
+                                      ("t", "x", float("nan"), "goal"),
+                                      ("t", "x", float("inf"), "goal")]:
         with pytest.raises(G.GrantError, match=msg):
             G.request(book, title, summary, goal)
 

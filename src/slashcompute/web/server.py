@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -247,9 +248,12 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     def amount(value) -> float:
         try:
-            return float(value)
+            n = float(value)
         except (TypeError, ValueError):
             raise HTTPException(400, "Enter a number.") from None
+        if not math.isfinite(n):
+            raise HTTPException(400, "Enter a number.")
+        return n
 
     def coord_call(request: Request, method: str, path: str, *,
                    params: Optional[dict] = None, payload: Optional[dict] = None,

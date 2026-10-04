@@ -434,6 +434,39 @@ def test_http_comment_only_on_grants_you_can_view(env):
     assert bodies == ["pending note", "pending note", "now public"]
 
 
+
+def test_http_grants_reject_non_finite_goal_and_donation(env):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    member_tok = client.post("/auth/register", json={
+        "email": "m@lan.test", "password": "password1", "name": "Member",
+    }).json()["token"]
+    donor_tok = client.post("/auth/register", json={
+        "email": "d@lan.test", "password": "password1", "name": "Donor",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(member_tok))
+    client.post("/auth/accept-terms", headers=_hdr(donor_tok))
+    core.credits.contribute(core.auth.user_from_token(donor_tok).id, 80.0, 0)
+    grant = {"title": "Need compute", "body": "A short paragraph about the need."}
+    for goal in ("1e309", "inf", "-inf", "nan", 1e31):
+        r = client.post("/grants", json={**grant, "goal_flops": goal},
+                        headers=_hdr(member_tok))
+        assert r.status_code == 400, (goal, r.text)
+    assert client.get("/grants", headers=_hdr(member_tok)).json() == []
+    g = client.post("/grants", json={**grant, "goal_flops": 50},
+                    headers=_hdr(member_tok)).json()
+    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
+                headers=_hdr(admin_tok))
+    for flops in ("nan", "inf", "-inf", "1e309"):
+        r = client.post(f"/grants/{g['id']}/donate", json={"flops": flops},
+                        headers=_hdr(donor_tok))
+        assert r.status_code == 400, (flops, r.text)
+    for sort in ("top", "least", "trending"):
+        r = client.get("/grants", params={"sort": sort})
+        assert r.status_code == 200 and r.json()[0]["received_flops"] == 0
+
 def test_http_ban_blocks_take(env):
     client, core, tiny_model, tiny_dataset = env
     admin_tok = client.post("/auth/register", json={

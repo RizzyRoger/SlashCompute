@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 from typing import Optional
 
@@ -9,6 +10,9 @@ from sqlmodel import select
 
 from slashcompute.community.credits import Credits
 from slashcompute.coordinator.db import Database, Grant, GrantComment, User, UserFlag, now
+
+# Far beyond any real ask; keeps goals finite so progress math and JSON stay sane.
+MAX_GOAL_FLOPS = 1e30
 
 
 class GrantError(Exception):
@@ -33,8 +37,10 @@ class Grants:
             goal = float(goal_flops)
         except (TypeError, ValueError) as e:
             raise GrantError("Goal must be a FLOP number.") from e
-        if goal <= 0:
+        if not math.isfinite(goal) or goal <= 0:
             raise GrantError("Goal must be greater than zero.")
+        if goal > MAX_GOAL_FLOPS:
+            raise GrantError("Goal is too large.")
         grant = Grant(
             id=secrets.token_hex(6), author_id=author.id, title=title, body=body,
             goal_flops=goal, status="pending",
@@ -68,6 +74,12 @@ class Grants:
     def donate(self, donor: User, grant_id: str, flops: float, *, from_pot: bool = False) -> Grant:
         if donor.banned:
             raise GrantError("Banned accounts cannot donate.", 403)
+        try:
+            flops = float(flops)
+        except (TypeError, ValueError) as e:
+            raise GrantError("Donation must be a FLOP number.") from e
+        if not math.isfinite(flops) or flops <= 0:
+            raise GrantError("Donation must be greater than zero.")
         g = self.get(grant_id)
         if g.status != "approved":
             raise GrantError("Only approved grants can receive FLOPs.")
@@ -79,7 +91,7 @@ class Grants:
             self.credits.allocate_pot(g.author_id, g.id, flops)
         else:
             self.credits.donate(donor.id, g.author_id, g.id, flops)
-        g.received_flops += float(flops)
+        g.received_flops += flops
         self.db.save(g)
         return g
 
