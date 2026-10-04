@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+import httpx
+
 from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.throttle import make_pace
 from slashcompute.common.protocol import StageAssignment, StageFinished, StageReady, StepMetrics
@@ -23,6 +25,8 @@ from slashcompute.pipeline.schedule import StageResult, StageRunner, StepStats
 from slashcompute.transport import Link, LinkServer, connect
 
 log = logging.getLogger(__name__)
+
+UPLOAD_RETRY_DELAYS_S = (2.0, 4.0, 8.0, 16.0)
 
 OnMessage = Callable[[object], Awaitable[None]]
 
@@ -99,6 +103,22 @@ def _load_dataset(path: Path, spec) -> list:
         raise DatasetError(f"bad dataset: {e}") from e
 
 
+async def upload_checkpoint(http: CoordHTTP, url: str, path: Path, params: dict) -> None:
+    """Upload off the event loop, so peer links keep flowing, and retry connection
+    failures: a blip that briefly cuts the coordinator off must not fail the stage.
+    An HTTP error (a stale epoch's 409, say) is final."""
+    data = await asyncio.to_thread(path.read_bytes)
+    for delay in (*UPLOAD_RETRY_DELAYS_S, None):
+        try:
+            await asyncio.to_thread(http.put_bytes, url, data, params)
+            return
+        except httpx.TransportError as e:
+            if delay is None:
+                raise
+            log.warning("checkpoint upload failed (%s); retrying in %.0fs", e, delay)
+            await asyncio.sleep(delay)
+
+
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
@@ -136,11 +156,8 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
             ))
 
         async def on_checkpoint(step: int, path: Path) -> None:
-            ctx.http.put_bytes(
-                f"/jobs/{asg.job_id}/checkpoints/{step}",
-                path.read_bytes(),
-                params={"epoch": asg.epoch, "stage": asg.stage_idx},
-            )
+            await upload_checkpoint(ctx.http, f"/jobs/{asg.job_id}/checkpoints/{step}", path,
+                                    {"epoch": asg.epoch, "stage": asg.stage_idx})
 
         runner = StageRunner(
             compute=compute, total_steps=spec.steps, microbatches=spec.microbatches,

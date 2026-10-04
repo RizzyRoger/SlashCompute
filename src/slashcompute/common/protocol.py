@@ -1,6 +1,11 @@
 """Control-plane messages exchanged over the agent <-> coordinator WebSocket
 and the daemon <-> worker stdio pipe. Every message is a JSON object with a
-``type`` discriminator."""
+``type`` discriminator.
+
+Fields added later all have defaults and unknown fields are ignored, so agents
+and coordinators of different versions still understand each other. ``seq`` and
+``Ack`` are only used once both ends agree on a reliable session (see
+``common.reliable``)."""
 
 from __future__ import annotations
 
@@ -40,10 +45,24 @@ class PeerAddr(BaseModel):
     port: int
 
 
+class Msg(BaseModel):
+    """Base of every control message. ``seq`` numbers it within a reliable session."""
+
+    seq: Optional[int] = None
+
+
+class Ack(Msg):
+    """Both directions: every sequenced message up to and including ``upto`` arrived
+    and was handled, so the sender can stop keeping it for replay."""
+
+    type: Literal["ack"] = "ack"
+    upto: int
+
+
 # ---------------------------------------------------------------- agent -> coordinator
 
 
-class Register(BaseModel):
+class Register(Msg):
     type: Literal["register"] = "register"
     node_id: str
     name: str
@@ -52,9 +71,13 @@ class Register(BaseModel):
     data_port: int
     gpu_percent: int
     session_token: Optional[str] = None
+    # Reliable session: random per agent process (None from older agents), and the
+    # highest coordinator seq it has handled, so a reconnect can resume.
+    session_id: Optional[str] = None
+    last_seq: int = 0
 
 
-class Heartbeat(BaseModel):
+class Heartbeat(Msg):
     type: Literal["heartbeat"] = "heartbeat"
     node_id: str
     status: Literal["idle", "loading", "running", "draining"]
@@ -62,21 +85,21 @@ class Heartbeat(BaseModel):
     epoch: Optional[int] = None
 
 
-class DrainNotice(BaseModel):
+class DrainNotice(Msg):
     """Contributor asked to stop; the node leaves after its current step."""
 
     type: Literal["drain_notice"] = "drain_notice"
     node_id: str
 
 
-class StageReady(BaseModel):
+class StageReady(Msg):
     type: Literal["stage_ready"] = "stage_ready"
     job_id: str
     epoch: int
     stage_idx: int
 
 
-class StepMetrics(BaseModel):
+class StepMetrics(Msg):
     type: Literal["step_metrics"] = "step_metrics"
     job_id: str
     epoch: int
@@ -90,7 +113,7 @@ class StepMetrics(BaseModel):
     usage: UsageSample
 
 
-class CheckpointReady(BaseModel):
+class CheckpointReady(Msg):
     type: Literal["checkpoint_ready"] = "checkpoint_ready"
     job_id: str
     epoch: int
@@ -101,7 +124,7 @@ class CheckpointReady(BaseModel):
     path: str  # local to the worker; the daemon uploads it
 
 
-class StageFinished(BaseModel):
+class StageFinished(Msg):
     type: Literal["stage_finished"] = "stage_finished"
     job_id: str
     epoch: int
@@ -112,7 +135,7 @@ class StageFinished(BaseModel):
     fatal: bool = False  # deterministic error (e.g. bad dataset): fail the job, don't retry
 
 
-class VerifyBundleReady(BaseModel):
+class VerifyBundleReady(Msg):
     type: Literal["verify_bundle_ready"] = "verify_bundle_ready"
     verify_id: str
     job_id: str
@@ -122,7 +145,7 @@ class VerifyBundleReady(BaseModel):
     error: Optional[str] = None
 
 
-class VerifyResult(BaseModel):
+class VerifyResult(Msg):
     type: Literal["verify_result"] = "verify_result"
     verify_id: str
     kind: Literal["replay", "canary"]
@@ -134,13 +157,17 @@ class VerifyResult(BaseModel):
 # ---------------------------------------------------------------- coordinator -> agent
 
 
-class Welcome(BaseModel):
+class Welcome(Msg):
     type: Literal["welcome"] = "welcome"
     node_id: str
     heartbeat_interval_s: float
+    session: bool = False             # reliable session on (seq / Ack / replay)
+    resumed: bool = False             # the agent's previous connection was picked up again
+    last_seq: int = 0                 # highest agent seq the coordinator has handled
+    reconnect_grace_s: float = 0.0    # how long the coordinator holds a dropped agent's place
 
 
-class StageAssignment(BaseModel):
+class StageAssignment(Msg):
     type: Literal["stage_assignment"] = "stage_assignment"
     job_id: str
     epoch: int
@@ -160,7 +187,7 @@ class StageAssignment(BaseModel):
     peer_timeout_s: float = 600.0  # defaulted so assignments from older coordinators parse
 
 
-class Drain(BaseModel):
+class Drain(Msg):
     """Sent to stage 0: finish the current step, checkpoint, propagate STOP."""
 
     type: Literal["drain"] = "drain"
@@ -168,13 +195,13 @@ class Drain(BaseModel):
     epoch: int
 
 
-class CancelStage(BaseModel):
+class CancelStage(Msg):
     type: Literal["cancel_stage"] = "cancel_stage"
     job_id: str
     epoch: int
 
 
-class VerifyFetch(BaseModel):
+class VerifyFetch(Msg):
     """Ask a stage to upload the input/output/adapters it used at ``step``."""
 
     type: Literal["verify_fetch"] = "verify_fetch"
@@ -185,7 +212,7 @@ class VerifyFetch(BaseModel):
     step: int
 
 
-class VerifyRequest(BaseModel):
+class VerifyRequest(Msg):
     type: Literal["verify_request"] = "verify_request"
     verify_id: str
     kind: Literal["replay", "canary"]
@@ -206,13 +233,13 @@ class VerifyRequest(BaseModel):
 AgentMessage = Annotated[
     Union[
         Register, Heartbeat, DrainNotice, StageReady, StepMetrics, CheckpointReady,
-        StageFinished, VerifyBundleReady, VerifyResult,
+        StageFinished, VerifyBundleReady, VerifyResult, Ack,
     ],
     Field(discriminator="type"),
 ]
 
 CoordinatorMessage = Annotated[
-    Union[Welcome, StageAssignment, Drain, CancelStage, VerifyFetch, VerifyRequest],
+    Union[Welcome, StageAssignment, Drain, CancelStage, VerifyFetch, VerifyRequest, Ack],
     Field(discriminator="type"),
 ]
 

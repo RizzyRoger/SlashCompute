@@ -5,6 +5,11 @@ stage and its stdout pump, signal-driven shutdown), so the stage it runs is one
 ``_Stage`` handle: lifecycle changes happen under ``_stage_lock`` and act on the
 handle they captured, and a stage's own callbacks only reset state that still
 belongs to it.
+
+With a coordinator that supports it, the session is reliable (``common.reliable``):
+messages are numbered and kept until acknowledged, a dropped connection is not the
+end of the running stage, and after reconnecting within the coordinator's grace
+window both sides replay what the other missed.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ import os
 import signal
 import socket
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Coroutine, Optional
@@ -34,10 +41,11 @@ from slashcompute.agent.worker import StageSession, WorkerContext, run_stage
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.discovery import discover
 from slashcompute.common.protocol import (
-    CancelStage, Drain, DrainNotice, Heartbeat, Register, StageAssignment, StageFinished,
+    Ack, CancelStage, Drain, DrainNotice, Heartbeat, Register, StageAssignment, StageFinished,
     StageReady, VerifyBundleReady, VerifyFetch, VerifyRequest, VerifyResult, Welcome, dump,
     parse_agent_message, parse_coordinator_message,
 )
+from slashcompute.common.reliable import Inbox, Outbox, is_sequenced
 from slashcompute.pipeline.model_profile import resolve_model_path
 
 log = logging.getLogger(__name__)
@@ -141,7 +149,8 @@ class Daemon:
         self.status = "idle"
         self.job_id: Optional[str] = None
         self.epoch: Optional[int] = None
-        self._ws = None
+        self._ws = None                             # the connection sends go to (after Welcome)
+        self._conn = None                           # the open connection, from its first moment
         self._send_lock = asyncio.Lock()
         self._stage: Optional[_Stage] = None
         self._stage_lock = asyncio.Lock()
@@ -150,6 +159,13 @@ class Daemon:
         self._stopping = False                      # shutdown started; no new stages
         self._draining = False
         self._welcomed = False
+        # Reliable session state; it outlives a connection so a reconnect can resume.
+        self._session_id = uuid.uuid4().hex
+        self._outbox = Outbox()
+        self._inbox = Inbox()
+        self._reliable = False                      # the coordinator agreed to a session
+        self._grace = 0.0                           # how long it holds our place when we drop
+        self._disconnected_at: Optional[float] = None
 
     # Read-only views of the running stage.
     @property
@@ -189,6 +205,8 @@ class Daemon:
         )
 
     async def send(self, msg: BaseModel) -> None:
+        if self._reliable and is_sequenced(msg):
+            msg = self._outbox.stamp(msg)  # kept until acknowledged, replayed after a reconnect
         async with self._send_lock:
             ws = self._ws  # read under the lock: a reconnect may have replaced or cleared it
             if ws is None:
@@ -222,8 +240,9 @@ class Daemon:
             while not self._stop.is_set():
                 log.info("connecting to %s as %s (%s)", ws_url, opt.node_id[:8], opt.name)
                 self._welcomed = False
-                self.status = "connecting"       # shown in the app; never heartbeated (not welcomed yet)
-                self._write_status()
+                if self._stage is None:          # a stage kept across a reconnect keeps its status
+                    self.status = "connecting"   # shown in the app; never heartbeated (not welcomed yet)
+                    self._write_status()
                 try:
                     await self._connect_once(ws_url, device)
                 except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException,
@@ -236,9 +255,8 @@ class Daemon:
                     delay = 1.0                  # we were registered: a fresh outage starts a fresh backoff
                 if self._stop.is_set():
                     break
-                if self._stage is not None:
-                    log.info("lost the coordinator mid-stage; releasing it (the job will be rescheduled)")
-                    await self._cancel_stage()
+                if self._stage is not None and not self._may_keep_stage():
+                    await self._release_orphaned_stage()
                 log.info("reconnecting in %.0fs", delay)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._stop.wait(), delay)
@@ -248,25 +266,43 @@ class Daemon:
             self.status = "stopped"
             self._write_status()
 
+    def _may_keep_stage(self) -> bool:
+        """While disconnected: the coordinator still holds our place, so keep the stage."""
+        return (self._reliable and self._disconnected_at is not None
+                and time.monotonic() - self._disconnected_at < self._grace)
+
+    async def _release_orphaned_stage(self) -> None:
+        """Stop a stage the coordinator no longer counts on (it restarted, or we were away
+        longer than its grace window), and say so in case it is still listening."""
+        stage = self._stage
+        if stage is None:
+            return
+        log.info("lost the coordinator mid-stage; releasing it (the job will be rescheduled)")
+        await self._cancel_stage()
+        asg = stage.asg
+        await self.send(StageFinished(
+            job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="cancelled",
+            last_step=asg.resume_step, detail="lost the coordinator"))
+
     async def _connect_once(self, ws_url: str, device) -> None:
         """One coordinator connection: register, then handle messages until it closes."""
         opt = self.opt
         async with websockets.connect(ws_url, max_size=64 * 1024 * 1024, ping_interval=20,
                                       open_timeout=10) as ws:
-            self._ws = ws
+            self._conn = ws
             hb = None
             try:
-                await self.send(Register(
+                await ws.send(dump(Register(
                     node_id=opt.node_id, name=opt.name, device=device,
                     data_host=opt.data_host, data_port=opt.data_port, gpu_percent=opt.gpu_percent,
-                    session_token=opt.session_token,
-                ))
+                    session_token=opt.session_token, session_id=self._session_id,
+                    last_seq=self._inbox.last,
+                )))
                 welcome = parse_coordinator_message(await ws.recv())
                 if not isinstance(welcome, Welcome):
                     raise SystemExit(f"expected welcome, got {type(welcome).__name__}")
                 self._welcomed = True
-                self.status = "idle"
-                self._write_status()
+                await self._on_welcome(ws, welcome)
                 hb = asyncio.create_task(self._heartbeats(welcome.heartbeat_interval_s))
                 async for raw in ws:
                     if self._stop.is_set():
@@ -276,14 +312,52 @@ class Daemon:
                     except ValidationError as e:
                         log.warning("bad coordinator message: %s", e)
                         continue
-                    try:
-                        await self._handle(msg)
-                    except Exception:  # one bad message must not take the agent down
-                        log.exception("handling %s failed", type(msg).__name__)
+                    await self._receive(msg)
             finally:
                 if hb is not None:
                     hb.cancel()
-                self._ws = None
+                self._conn = None
+                async with self._send_lock:
+                    if self._ws is ws:
+                        self._ws = None
+                        self._disconnected_at = time.monotonic()
+
+    async def _on_welcome(self, ws, welcome: Welcome) -> None:
+        if not welcome.resumed:
+            # A fresh session: the coordinator knows nothing of a stage we kept running
+            # or of messages we were holding for it.
+            if self._stage is not None:
+                await self._release_orphaned_stage()
+            self._outbox, self._inbox = Outbox(), Inbox()
+        self._reliable, self._grace = welcome.session, welcome.reconnect_grace_s
+        async with self._send_lock:
+            # Replay before anything new can be sent, so the coordinator sees our
+            # messages in order.
+            if welcome.resumed:
+                self._outbox.ack(welcome.last_seq)
+                pending = self._outbox.pending()
+                for m in pending:
+                    await ws.send(dump(m))
+                log.info("resumed the coordinator session (%d message(s) replayed)", len(pending))
+            self._ws = ws
+            self._disconnected_at = None
+        if self._stage is None:
+            self._set_status("idle", None, None)
+
+    async def _receive(self, msg) -> None:
+        if isinstance(msg, Ack):
+            self._outbox.ack(msg.upto)
+            return
+        seq = msg.seq if self._reliable else None
+        if seq is not None and not self._inbox.accept(seq):
+            await self.send(Ack(upto=self._inbox.last))  # a replay we already handled
+            return
+        try:
+            await self._handle(msg)
+        except Exception:  # one bad message must not take the agent down
+            log.exception("handling %s failed", type(msg).__name__)
+        if seq is not None:
+            await self.send(Ack(upto=seq))
 
     async def _heartbeats(self, interval: float) -> None:
         try:
@@ -557,9 +631,10 @@ class Daemon:
             if self._stage is stage:
                 await self._cancel_stage()
         self._stop.set()
-        if self._ws is not None:
+        conn = self._conn or self._ws  # close it even mid-handshake, or run() never returns
+        if conn is not None:
             try:
-                await self._ws.close()
+                await conn.close()
             except Exception:
                 pass
 

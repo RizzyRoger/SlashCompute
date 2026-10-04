@@ -40,6 +40,7 @@ class EpochState:
     last_progress: float = field(default_factory=time.monotonic)  # last StageReady / StepMetrics
     ready: set[int] = field(default_factory=set)
     finished: dict[int, str] = field(default_factory=dict)
+    steps_seen: set[tuple[int, int]] = field(default_factory=set)  # (stage_idx, step) billed
     drain_requested: bool = False
     closed: bool = False
 

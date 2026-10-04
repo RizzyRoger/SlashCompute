@@ -28,6 +28,55 @@ from slashcompute.jobs import parse_spec
 log = logging.getLogger(__name__)
 
 
+class AgentConnection:
+    """One agent WebSocket. Sends go into a queue that a writer task drains, so the
+    coordinator's loops never wait on a slow socket. A socket that stalls or backs up
+    is closed instead; an agent with a reliable session reconnects and gets the
+    messages it missed replayed."""
+
+    SEND_TIMEOUT_S = 30.0
+    MAX_QUEUED = 10_000
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+        self._writer = asyncio.create_task(self._write())
+
+    async def send(self, msg) -> None:
+        if self._closed:
+            return
+        if self._queue.qsize() >= self.MAX_QUEUED:
+            log.warning("agent socket has %d unsent messages; closing it", self._queue.qsize())
+            await self.close()
+            return
+        self._queue.put_nowait(msg)
+
+    async def _write(self) -> None:
+        try:
+            while True:
+                msg = await self._queue.get()
+                await asyncio.wait_for(self.ws.send_text(dump(msg)), self.SEND_TIMEOUT_S)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("agent socket send failed (%r); closing it", e)
+            await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.ws.close()
+        except Exception:
+            pass  # already closed
+
+    def stop(self) -> None:
+        self._closed = True
+        self._writer.cancel()
+
+
 def create_app(cfg: EngineConfig, advertise: bool = False,
                inference: Optional[InferenceSettings] = None) -> FastAPI:
     core = Coordinator(cfg)
@@ -108,11 +157,8 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
     @app.websocket("/ws/agent")
     async def agent_ws(ws: WebSocket):
         await ws.accept()
-        send_lock = asyncio.Lock()
-
-        async def send(msg):
-            async with send_lock:
-                await ws.send_text(dump(msg))
+        conn = AgentConnection(ws)
+        send = conn.send  # one object: the stale-session check below compares by identity
 
         node_id: Optional[str] = None
         try:
@@ -122,7 +168,7 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
                 return
             node_id = first.node_id
             try:
-                await core.on_register(first, send)
+                await core.on_register(first, send, close=conn.close)
             except PermissionError as e:
                 await ws.close(code=4003, reason=str(e)[:123] or "banned")
                 return
@@ -139,6 +185,7 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
         except Exception:
             log.exception("agent session error")
         finally:
+            conn.stop()
             node = core.registry.get(node_id) if node_id else None
             if node is not None and node.send is send:
                 await core.on_disconnect(node_id)

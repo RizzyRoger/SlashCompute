@@ -4,13 +4,24 @@ agent reconnects and loop isolation."""
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlmodel import select
+from starlette.websockets import WebSocketDisconnect
 
+from slashcompute.common import protocol as P
+from slashcompute.common.canary import run_canary_mlx
 from slashcompute.common.config import EngineConfig
+from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
+from slashcompute.coordinator.db import UsageRecord
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
+
+GB = 1024**3
 
 
 @pytest.fixture
@@ -39,3 +50,165 @@ def test_stalled_running_epoch_is_aborted(core):
     assert job.current.closed
     assert job.row.status == "recovering"
     assert "no progress" in job.row.error
+
+
+# ------------------------------------------------------------ reliable agent sessions
+
+
+class Agent:
+    """A fake agent on the real /ws/agent socket. With ``session`` it speaks the reliable
+    protocol: it numbers what it sends and acknowledges only when told to."""
+
+    def __init__(self, client, node_id, session=None, last_seq=0):
+        self.node_id, self.session = node_id, session
+        self.ws = client.websocket_connect("/ws/agent").__enter__()
+        mem = 8 * GB
+        self.ws.send_text(P.dump(P.Register(
+            node_id=node_id, name=node_id, data_host="127.0.0.1", data_port=9000, gpu_percent=100,
+            session_id=session, last_seq=last_seq,
+            device=P.DeviceProfile(chip="test", memory_total_bytes=mem, memory_available_bytes=mem,
+                                   working_set_bytes=mem, memory_contrib_bytes=mem,
+                                   matmul_tflops=1.0, mem_bandwidth_gbps=100.0))))
+        self.welcome = self.recv()
+        assert isinstance(self.welcome, P.Welcome)
+
+    def recv(self):
+        msg = P.parse_coordinator_message(self.ws.receive_text())
+        while isinstance(msg, P.Ack):
+            msg = P.parse_coordinator_message(self.ws.receive_text())
+        return msg
+
+    def send(self, msg, seq=None):
+        self.ws.send_text(P.dump(msg.model_copy(update={"seq": seq})))
+
+    def ack(self, msg):
+        self.send(P.Ack(upto=msg.seq))
+
+    def pass_canary(self, seq=None):
+        req = self.recv()
+        assert isinstance(req, P.VerifyRequest) and req.kind == "canary"
+        self.send(P.VerifyResult(verify_id=req.verify_id, kind="canary",
+                                 stats=run_canary_mlx(req.seed, req.size)), seq)
+        return req
+
+    def close(self):
+        self.ws.__exit__(None, None, None)
+
+
+def _wait(cond, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition not met")
+
+
+@pytest.fixture
+def live(tmp_path, tiny_model, tiny_dataset):
+    cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.02, verify_rate=0.0,
+                       canary_size=64, stage_overhead_bytes=0, heartbeat_timeout_s=60,
+                       reconnect_grace_s=30)
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        yield client, app.state.core, tiny_model, tiny_dataset
+
+
+def _submit(client, tiny_model, tiny_dataset):
+    spec = LoraFinetuneSpec(model=str(tiny_model), dataset_path=str(tiny_dataset), steps=4,
+                            batch_size=2, microbatches=1, lora_rank=4, min_stages=1, max_stages=1)
+    return client.post("/jobs", json=json.loads(spec.model_dump_json())).json()["id"]
+
+
+def _usage():
+    return P.UsageSample(flops=1e9, tokens=10, peak_mem_bytes=1, resident_mem_bytes=1,
+                         mem_byte_seconds=1.0, wall_s=1.0, busy_s=0.5)
+
+
+def test_reconnect_within_grace_keeps_the_stage_and_replays(live):
+    client, core, tiny_model, tiny_dataset = live
+    a = Agent(client, "n1", session="s1")
+    assert a.welcome.session and not a.welcome.resumed and a.welcome.reconnect_grace_s == 30
+    canary = a.pass_canary(seq=1)
+    a.ack(canary)
+    job_id = _submit(client, tiny_model, tiny_dataset)
+    asg = a.recv()
+    assert isinstance(asg, P.StageAssignment) and asg.seq == canary.seq + 1
+    a.close()  # the Wi-Fi drops before the agent acknowledges its assignment
+
+    _wait(lambda: not core.registry.get("n1").connected)
+    job = core.jobs[job_id]
+    assert job.row.recoveries == 0 and not job.current.closed and job.row.status == "starting"
+
+    b = Agent(client, "n1", session="s1", last_seq=canary.seq)
+    assert b.welcome.resumed and b.welcome.last_seq == 1  # it had our canary result
+    replayed = b.recv()
+    assert replayed == asg  # same assignment, same seq: nothing lost, nothing renumbered
+    b.ack(replayed)
+    b.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=0), seq=2)
+    _wait(lambda: job.row.status == "running")
+    assert job.row.recoveries == 0 and core.registry.get("n1").connected
+    b.close()
+
+
+def test_replayed_step_metrics_are_billed_once(live):
+    client, core, tiny_model, tiny_dataset = live
+    a = Agent(client, "n1", session="s1")
+    a.ack(a.pass_canary(seq=1))
+    job_id = _submit(client, tiny_model, tiny_dataset)
+    a.ack(a.recv())
+    a.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=0), seq=2)
+    step = P.StepMetrics(job_id=job_id, epoch=1, stage_idx=0, step=1, loss=1.0, in_digest="a",
+                         out_digest="b", usage=_usage())
+    a.send(step, seq=3)
+    a.send(step, seq=3)  # replayed after a reconnect the coordinator didn't notice
+    a.send(step, seq=4)  # or resent under a new number
+    _wait(lambda: core.registry.get("n1").inbox.last == 4)
+    with core.db.session() as s:
+        rows = s.exec(select(UsageRecord).where(UsageRecord.job_id == job_id)).all()
+    assert len(rows) == 1
+    a.close()
+
+
+def test_agent_that_stays_away_loses_its_place(live):
+    client, core, tiny_model, tiny_dataset = live
+    core.cfg.reconnect_grace_s = 0.3
+    a = Agent(client, "n1", session="s1")
+    a.ack(a.pass_canary(seq=1))
+    job_id = _submit(client, tiny_model, tiny_dataset)
+    a.recv()
+    a.close()
+    job = core.jobs[job_id]
+    _wait(lambda: job.current.closed)
+    assert core.registry.get("n1") is None
+    assert job.row.recoveries == 1 and job.row.status == "recovering"
+
+    b = Agent(client, "n1", session="s1", last_seq=2)
+    assert not b.welcome.resumed  # too late: a fresh session
+    b.close()
+
+
+def test_agents_without_sessions_are_torn_down_at_once(live):
+    client, core, tiny_model, tiny_dataset = live
+    a = Agent(client, "n1")
+    assert not a.welcome.session
+    req = a.pass_canary()
+    assert req.seq is None  # nothing is numbered for an older agent
+    _submit(client, tiny_model, tiny_dataset)
+    assert a.recv().seq is None
+    a.close()
+    _wait(lambda: core.registry.get("n1") is None)
+
+
+def test_node_evicted_for_missed_heartbeats_is_disconnected(live):
+    client, core, *_ = live
+    core.cfg.heartbeat_timeout_s = 0.3
+    a = Agent(client, "n1")
+    a.pass_canary()
+    _wait(lambda: core.registry.get("n1") is None)
+    try:
+        with pytest.raises(WebSocketDisconnect):  # before, the socket stayed open and ignored
+            for _ in range(10):
+                a.recv()
+    finally:
+        a.close()

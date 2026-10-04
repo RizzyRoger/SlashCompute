@@ -35,6 +35,9 @@ class Recovery:
         for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
             log.warning("node %s missed heartbeats", node.node_id[:8])
             await self.on_node_lost(node.node_id, "heartbeat timeout")
+        for node in core.registry.away(core.cfg.reconnect_grace_s):
+            await self.on_node_lost(node.node_id,
+                                    f"did not reconnect within {core.cfg.reconnect_grace_s:.0f}s")
         for node in list(core.registry.nodes.values()):
             if (node.draining and node.assignment is not None and node.drain_deadline
                     and time.monotonic() > node.drain_deadline):
@@ -78,6 +81,10 @@ class Recovery:
         node = core.registry.remove(node_id)
         if node is None:
             return
+        if node.connected and node.close is not None:
+            # Close its socket too: an agent evicted for missed heartbeats otherwise stays
+            # connected, ignored, and never re-registers.
+            await node.close()
         row = core.db.get(Node, node_id)
         if row is not None:
             row.online = False

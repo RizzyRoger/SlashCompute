@@ -62,6 +62,9 @@ class EngineConfig:
     peer_timeout_s: float = 600.0
     # The coordinator aborts a running epoch that has reported no step for this long.
     stall_timeout_s: float = 1800.0
+    # A dropped agent that reconnects within this window keeps its stage, and the messages
+    # either side sent meanwhile are replayed. Longer than the agent's reconnect backoff.
+    reconnect_grace_s: float = 60.0
     canary_size: int = 512
     canary_interval_s: float = 1800.0
 
