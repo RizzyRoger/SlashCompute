@@ -35,5 +35,18 @@
        (subpath "/tmp")
        (subpath "/private/tmp")
        (subpath "/private/var/folders"))
+;; Cache writers (Metal's shader/module caches among them) also chmod, touch and
+;; tag what they write; allow every write op, but only in the per-user cache and
+;; temp dirs ($DARWIN_USER_CACHE_DIR, $TMPDIR, ~/Library/Caches).
+(allow file-write*
+       (subpath "/private/var/folders")
+       (regex #"^/Users/[^/]+/Library/Caches(/|$)"))
+;; Metal compiles kernels in MTLCompilerService, which writes the clang module
+;; cache (monolithic_metal.pcm) under $DARWIN_USER_CACHE_DIR through a
+;; read-write extension the worker must be able to issue.
+(allow file-issue-extension
+       (require-all
+         (subpath "/private/var/folders")
+         (extension-class "com.apple.app-sandbox.read-write")))
 (allow network*)
 (allow system-socket)

@@ -53,6 +53,7 @@ def test_agent_options_localhost_host(tmp_path):
 
 # ------------------------------------------------------------ coordinator outages
 
+
 def _fake_profile(_max_bytes=None):
     from slashcompute.common.protocol import DeviceProfile
 
@@ -159,6 +160,7 @@ async def test_agent_reconnects_when_handling_a_message_raises_an_http_error(tmp
 
 
 # ------------------------------------------------------------ verification
+
 
 class _HeldBundle:
     def save_bundle(self, step, dest):
@@ -319,11 +321,14 @@ async def test_bad_dataset_reports_a_fatal_stage_error(tmp_path, tiny_model):
 
 
 # A sandboxed worker whose stage runs until drained: the real stdio CLI around a fake stage.
+
+
 _DRAINABLE_WORKER = """
 import asyncio, sys
 from types import SimpleNamespace
 from slashcompute.agent import worker
 from slashcompute.common.protocol import StageFinished, StageReady
+
 
 async def run_stage(ctx, emit):
     asg = ctx.assignment
@@ -388,3 +393,65 @@ async def test_stop_drains_a_sandboxed_worker_before_disconnecting(tmp_path, mon
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+def _run_sandboxed(code, tmp_path):
+    import shutil
+    import subprocess
+    import sys
+
+    from slashcompute.agent import sandbox
+
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not available")
+    cmd = sandbox.wrap_command([sys.executable, "-c", code], tmp_path / "job", tmp_path)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+
+def test_sandboxed_worker_can_chmod_and_touch_in_user_cache_but_not_write_elsewhere(tmp_path):
+    outside = Path(__file__).resolve().parent / f"sbx-probe-{tmp_path.name}.txt"
+    code = f"""
+import os, subprocess, tempfile
+
+
+cache = subprocess.check_output(["getconf", "DARWIN_USER_CACHE_DIR"], text=True).strip()
+with tempfile.TemporaryDirectory(prefix="slashcompute-sbx-", dir=cache) as d:
+    p = os.path.join(d, "monolithic_metal.pcm")
+    with open(p + ".tmp", "w") as f:
+        f.write("x")
+    os.chmod(p + ".tmp", 0o644)
+    os.utime(p + ".tmp", None)
+    os.rename(p + ".tmp", p)
+try:
+    open({str(outside)!r}, "w").close()
+except PermissionError:
+    print("outside denied")
+"""
+    try:
+        proc = _run_sandboxed(code, tmp_path)
+    finally:
+        outside.unlink(missing_ok=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "outside denied" in proc.stdout
+
+
+def test_sandboxed_worker_can_build_a_metal_kernel_from_source(tmp_path):
+    mx = pytest.importorskip("mlx.core")
+    if not mx.metal.is_available():
+        pytest.skip("Metal not available")
+    # A never-seen kernel source forces a runtime compile through MTLCompilerService.
+    code = f"""
+import mlx.core as mx
+
+
+k = mx.fast.metal_kernel(name="sbx_probe", input_names=["inp"], output_names=["out"],
+                         source="out[thread_position_in_grid.x] = inp[thread_position_in_grid.x] + 1.0f; // {tmp_path.name}")
+
+
+a = mx.zeros(4)
+(o,) = k(inputs=[a], grid=(4, 1, 1), threadgroup=(4, 1, 1), output_shapes=[a.shape], output_dtypes=[a.dtype])
+print(o.tolist())
+"""
+    proc = _run_sandboxed(code, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "[1.0, 1.0, 1.0, 1.0]" in proc.stdout
