@@ -167,7 +167,9 @@ class PipelineManager:
         while isinstance(p, NoPlan):
             draining = [r for r in self.live() if r.state == "draining"]
             forming = [r for r in self.live() if r.state in ("planned", "starting", "loading")]
-            idle = sorted((r for r in self.live() if r.state == "active" and not r.inflight and r.model_id != model_id),
+            # an idle pipeline of the same model is fair game too when its ctx is too small for this request
+            idle = sorted((r for r in self.live() if r.state == "active" and not r.inflight
+                           and (r.model_id != model_id or r.ctx < ctx)),
                           key=lambda r: r.last_used)
             if (draining or forming) and time.time() < deadline:
                 # memory is held by pipelines that are about to stop (drain) or that may still fail to
@@ -184,7 +186,8 @@ class PipelineManager:
                         w.cancel()
             elif idle:
                 log.info("evicting idle pipeline %s (%s) to make room for %s", idle[0].id, idle[0].model_id, model_id)
-                await self.stop_pipeline(idle[0].id, "evicted for another model")
+                await self.stop_pipeline(idle[0].id, "evicted for another model" if idle[0].model_id != model_id
+                                         else f"evicted for a larger ctx ({ctx})")
             else:
                 raise NoCapacity(p.reason)
             p = self.plan_for(model_id, ctx, exclude)

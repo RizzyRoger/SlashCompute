@@ -182,6 +182,24 @@ async def test_unknown_model_is_404(two_node):
     assert r.status_code == 404
 
 
+async def test_idle_pipeline_of_the_same_model_is_evicted_for_a_larger_ctx(two_node):
+    h = two_node
+    small = await chat(h, QWEN, max_tokens=16)
+    assert small.status_code == 200, small.text
+    (first,) = pipelines(h)
+    assert first["ctx"] == 4096
+    # needs ctx 8192, which only fits once the idle ctx-4096 pipeline gives its memory back
+    big = await chat(h, QWEN, content="long answer", max_tokens=5000)
+    assert big.status_code == 200, big.text
+    states = {p["id"]: (p["state"], p["ctx"]) for p in pipelines(h)}
+    assert states[first["id"]] == ("stopped", 4096)
+    assert big.json()["network"]["pipeline_id"] != first["id"]
+    assert states[big.json()["network"]["pipeline_id"]] == ("active", 8192)
+    # a smaller request reuses the bigger pipeline instead of evicting it
+    again = await chat(h, QWEN, content="short again", max_tokens=16)
+    assert again.json()["network"]["pipeline_id"] == big.json()["network"]["pipeline_id"]
+
+
 async def test_requests_during_a_drain_wait_instead_of_failing():
     h = await start_harness(fast_settings(), time_scale=1.0)
     try:
