@@ -10,8 +10,12 @@ import pytest
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
+from fastapi import HTTPException
+
 from slashcompute.inference.coordinator.layers import synthetic_layout
+from slashcompute.inference.coordinator.service import ctx_for
 from slashcompute.inference.node.agent import training_busy
+from slashcompute.inference.node.engine import EngineError
 from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
@@ -261,6 +265,72 @@ async def test_engine_is_capped_at_the_budget_the_chatter_paid_for(pool, limit, 
     credits = core(h).credits
     assert credits.lifetime_earned(host.id) == pytest.approx(flops)
     assert credits.balance(chatter.id) == pytest.approx(1e16 - flops)   # charged for every token generated
+
+
+class DenseEngine(FakeEngine):
+    """Counts prompt tokens like llama.cpp does for dense text (one per digit, plus the chat template),
+    rejects prompts that don't fit the pipeline's context, and generates slowly (weight above the default)."""
+
+    async def complete(self, pipeline_id, body):
+        ctx = self.heads[pipeline_id]["ctx"]
+        prompt_n = sum(len(m["content"].encode()) + 5 for m in body["messages"]) + 5
+        if prompt_n + body["max_tokens"] > ctx:
+            raise EngineError(f"request ({prompt_n} tokens) exceeds the available context size ({ctx} tokens)",
+                              pipeline_broken=False, status=400)
+        async for ev in super().complete(pipeline_id, body):
+            if ev["type"] == "final":
+                n = ev["timings"]["predicted_n"]
+                ev["timings"] = {"cache_n": 0, "prompt_n": prompt_n, "prompt_per_second": 1000.0,
+                                 "predicted_n": n, "predicted_per_second": 1e6 if n == 1 else 10.0}
+            yield ev
+
+
+async def test_reservation_covers_the_real_charge_of_dense_prompts_and_slow_replies(pool):
+    h = pool
+    svc = h.app.state.inference
+    host, host_token = account(h, "host@lan.test")
+    chatter, chat_token = account(h, "chatter@lan.test", balance=1e16)
+    await two_nodes(h, session_token=host_token, engine_cls=DenseEngine)
+    credits = core(h).credits
+    headers = {"Authorization": f"Bearer {chat_token}"}
+    paid = 0.0
+    # 2010 real prompt tokens (~510 by len(json)/4); then a slow reply after a 1-token one "ran" at 1e6 tok/s
+    for content, max_tokens, live_tok_s in (("1" * 2000, 1, None), ("Write an essay about rivers.", 200, 10.0)):
+        r = await chat(h, QWEN, content=content, max_tokens=max_tokens, headers=headers)
+        assert r.status_code == 200, r.text
+        paid += r.json()["network"]["flops"]
+        assert credits.balance(chatter.id) == pytest.approx(1e16 - paid)    # charged in full, never capped
+        assert credits.lifetime_earned(host.id) == pytest.approx(paid)      # so the hosts are paid in full
+        assert credits.reserved_in_flight(chatter.id) == 0                  # and the rest of the hold refunded
+        assert svc.conn.execute("SELECT live_tok_s FROM pipelines").fetchone()["live_tok_s"] == live_tok_s
+    assert r.json()["network"]["gen_weight"] == svc.s.GEN_WEIGHT_MAX
+
+
+async def test_pipeline_context_is_sized_from_the_prompt_byte_bound(pool):
+    await two_nodes(pool, engine_cls=DenseEngine)
+    r = await chat(pool, QWEN, content="1" * 6000, max_tokens=5)        # 6010 tokens: needs 8192, not 4096
+    assert r.status_code == 200, r.text
+    assert [rt.ctx for rt in pool.app.state.inference.mgr.runtimes.values()] == [8192]
+
+
+def test_ctx_is_capped_at_the_model_context_length():
+    s = fast_settings()
+    body = {"messages": [{"role": "user", "content": "1" * 6000}], "max_tokens": 3000}
+    assert ctx_for(body, s, 32768) == 16384
+    assert ctx_for(body, s, 8192) == 8192             # the engine rejects the prompt if it really doesn't fit
+    with pytest.raises(HTTPException) as e:
+        ctx_for({**body, "max_tokens": 8192}, s, 8192)
+    assert e.value.status_code == 400
+
+
+@pytest.mark.parametrize("model, max_tokens", [(QWEN, 1e30), (QWEN, 131072), ("Small.gguf", 8192)])
+async def test_max_tokens_beyond_the_model_context_is_a_400(pool, model, max_tokens):
+    pool.add_model(replace(synthetic_layout("Small.gguf", n_layers=8, total_bytes=GB, head_bytes=GB // 8),
+                           max_ctx=8192))   # context_length from its GGUF; QWEN has none (MAX_CTX)
+    await two_nodes(pool)
+    r = await chat(pool, model, max_tokens=max_tokens)
+    assert r.status_code == 400 and "context length" in r.text, r.text
+    assert not pool.app.state.inference.mgr.runtimes                       # nothing planned for it
 
 
 async def test_training_on_a_mac_drains_its_inference_pipelines(pool):

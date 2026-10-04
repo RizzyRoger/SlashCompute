@@ -36,7 +36,7 @@ from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
 from slashcompute.inference.coordinator.db import connect, tx
 from slashcompute.inference.coordinator.layers import build_layout
-from slashcompute.inference.coordinator.pipelines import PipelineManager, estimate_prompt_tokens, serve
+from slashcompute.inference.coordinator.pipelines import PipelineManager, prompt_token_bound, serve
 from slashcompute.inference.coordinator.planner import NoPlan, build_matches
 from slashcompute.inference.coordinator.relay import Relay
 from slashcompute.inference.gguf import read_header_file
@@ -61,12 +61,22 @@ def completion_limit(body: dict) -> int:
     return n
 
 
-def ctx_for(body: dict, s: InferenceSettings) -> int:
-    need = estimate_prompt_tokens(body) + completion_limit(body) + 64
+def max_ctx_for(row, s: InferenceSettings) -> int:
+    """The longest context a pipeline for this model gets: its trained length (GGUF), else MAX_CTX."""
+    return registry.model_layout(row).max_ctx or s.MAX_CTX
+
+
+def ctx_for(body: dict, s: InferenceSettings, max_ctx: int) -> int:
+    """Context to plan for: room for an upper bound on the prompt plus the whole completion budget, capped at
+    the model's context length (a prompt that really doesn't fit is then rejected by the engine)."""
+    limit = completion_limit(body)
+    if limit >= max_ctx:
+        raise HTTPException(400, f"max_tokens ({limit}) must be below the model's context length ({max_ctx} tokens).")
+    need = prompt_token_bound(body) + limit + 64
     ctx = s.DEFAULT_CTX
-    while ctx < need:
+    while ctx < min(need, max_ctx):
         ctx *= 2
-    return ctx
+    return min(ctx, max_ctx)
 
 
 def hash_token(token: str) -> str:
@@ -539,7 +549,7 @@ def make_router(svc: InferenceService) -> APIRouter:
     async def plan_view(model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
         row = svc.model_or_404(model)
         body = {"model": model, "max_tokens": max_tokens}
-        ctx = ctx_for(body, s)
+        ctx = ctx_for(body, s, max_ctx_for(row, s))
         active = next((rt for rt in mgr.live(row["id"]) if rt.state == "active" and rt.ctx >= ctx), None)
         if active:
             view = {"source": "active pipeline", "pipeline_id": active.id,
@@ -591,6 +601,7 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) for m in messages):
             raise HTTPException(400, "messages must be a non-empty list of message objects.")
         stream = body_bool(body, "stream")
+        ctx = ctx_for(body, s, max_ctx_for(row, s))
         # the engine gets exactly the budget we reserved for (llama-server alone would run to the end of the ctx)
         engine_body = {k: v for k, v in body.items()
                        if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
@@ -598,8 +609,8 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
-            est = fl.estimate_flops(registry.model_flops(row), estimate_prompt_tokens(body),
-                                    max_tokens, mgr.gen_weight_for(row["id"]))
+            # a true upper bound (the charge is capped at it); settle() refunds the rest
+            est = fl.estimate_flops(registry.model_flops(row), prompt_token_bound(body), max_tokens, s.GEN_WEIGHT_MAX)
             try:
                 svc.accounting.reserve(user_id, account_id, est)
             except AccountingError as e:
@@ -613,7 +624,7 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                 except Exception:  # noqa: BLE001
                     log.exception("settling %s failed", account_id)
 
-        events = serve(mgr, row["id"], engine_body, ctx_for(body, s), user_id or "anonymous", stream, account_id)
+        events = serve(mgr, row["id"], engine_body, ctx, user_id or "anonymous", stream, account_id)
 
         if not stream:
             try:
