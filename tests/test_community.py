@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from slashcompute.common import protocol as P
-from slashcompute.common.config import EngineConfig
+from slashcompute.common.config import WELCOME_FLOPS, EngineConfig
 from slashcompute.community.auth import AuthError, google_client_id
 from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
@@ -302,7 +302,7 @@ def test_http_register_login_cookie_and_me(env):
     login = client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
     token = login.json()["token"]
     me = client.get("/auth/me", headers=_hdr(token))
-    assert me.json()["credits"]["balance"] == 0.0
+    assert me.json()["credits"]["balance"] == WELCOME_FLOPS
     patched = client.patch("/auth/me", json={"grant_split": 33}, headers=_hdr(token))
     assert patched.json()["user"]["grant_split"] == 33
     assert client.get("/auth/providers").json()["google"] is False
@@ -327,7 +327,7 @@ def test_http_terms_required_to_take_and_failed_reserve_drops_job(env):
         "email": "ada@lan.test", "password": "password1", "name": "Ada",
     }).json()["token"]
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
-    spec["max_flops"] = 1e12
+    spec["max_flops"] = 2 * WELCOME_FLOPS
     r = client.post("/jobs", json=spec, headers=_hdr(token))
     assert r.status_code == 403
     assert "terms" in r.json()["detail"].lower()
@@ -354,7 +354,7 @@ def test_http_authenticated_take_reserves(env):
     body = r.json()
     assert body["reserved_flops"] == 2e11
     assert body["user_id"] == user.id
-    assert core.credits.balance(user.id) == pytest.approx(8e11)
+    assert core.credits.balance(user.id) == pytest.approx(WELCOME_FLOPS + 8e11)
 
 
 def test_anonymous_submit_still_works(env):
@@ -422,6 +422,99 @@ def test_http_ban_blocks_take(env):
     r = client.post("/jobs", json=spec, headers=_hdr(member_tok))
     assert r.status_code == 403, r.text
     assert core.jobs == {}
+
+
+# --------------------------------------------------------------------------- welcome credit
+
+
+def _welcome_rows(client, token):
+    items = client.get("/credits/transactions", headers=_hdr(token)).json()["items"]
+    return [row for row in items if row["kind"] == "welcome"]
+
+
+def test_welcome_credit_on_register_is_spendable_once(env):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    me = client.get("/credits/me", headers=_hdr(token)).json()
+    assert me["balance"] == WELCOME_FLOPS == 1e15
+    assert me["lifetime_earned"] == 0.0
+    rows = _welcome_rows(client, token)
+    assert len(rows) == 1 and rows[0]["note"] == "Welcome credit"
+    for _ in range(2):
+        client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+    assert core.credits.balance(core.auth.user_from_token(token).id) == WELCOME_FLOPS
+
+    client.post("/auth/accept-terms", headers=_hdr(token))
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = WELCOME_FLOPS
+    r = client.post("/jobs", json=spec, headers=_hdr(token))
+    assert r.status_code == 200, r.text
+    assert core.credits.balance(r.json()["user_id"]) == 0.0
+
+
+def test_welcome_credit_backfilled_on_login(env):
+    client, core, *_ = env
+    user = core.auth.register("old@lan.test", "password1", "Old")  # pre-feature account
+    assert core.credits.balance(user.id) == 0.0
+    token = client.post("/auth/login", json={
+        "email": "old@lan.test", "password": "password1",
+    }).json()["token"]
+    client.post("/auth/login", json={"email": "old@lan.test", "password": "password1"})
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+    assert len(_welcome_rows(client, token)) == 1
+
+
+def test_welcome_credit_on_google_sign_in(env, monkeypatch):
+    client, core, *_ = env
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "g@lan.test", "name": "Gia", "sub": "sub-9",
+    }
+    token = client.post("/auth/google", json={"id_token": "jwt"}).json()["token"]
+    client.post("/auth/google", json={"id_token": "jwt"})
+    user = core.auth.user_from_token(token)
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+
+
+def test_welcome_credit_granted_once_under_concurrency(core):
+    import threading
+
+    user = core.auth.register("ada@lan.test", "password1", "Ada")
+    start = threading.Barrier(16)
+    granted = []
+
+    def sign_in():
+        start.wait()
+        granted.append(core.credits.grant_welcome(user.id))
+
+    threads = [threading.Thread(target=sign_in) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(granted) == [0.0] * 15 + [WELCOME_FLOPS]
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+
+
+def test_welcome_credit_skips_banned_and_disabled(env, tmp_path, monkeypatch):
+    client, core, *_ = env
+    user = core.auth.register("ban@lan.test", "password1", "Ban")
+    core.auth.set_banned(user, True)
+    r = client.post("/auth/login", json={"email": "ban@lan.test", "password": "password1"})
+    assert r.status_code == 403
+    assert core.credits.grant_welcome(user.id) == 0.0
+    assert core.credits.balance(user.id) == 0.0
+
+    monkeypatch.setenv("SLASHCOMPUTE_WELCOME_FLOPS", "0")
+    cfg = EngineConfig.from_env(home=tmp_path / "off", verify_rate=0.0)
+    assert cfg.welcome_flops == 0.0
+    with TestClient(create_app(cfg)) as off:
+        token = off.post("/auth/register", json={
+            "email": "ada@lan.test", "password": "password1", "name": "Ada",
+        }).json()["token"]
+        assert off.get("/credits/me", headers=_hdr(token)).json()["balance"] == 0.0
 
 
 # --------------------------------------------------------------------------- engine hooks
@@ -634,7 +727,7 @@ def test_http_community_lists_live_and_admin(env):
     core.credits.bind_node("n-mac", member.id)
 
     me = client.get("/credits/me", headers=_hdr(donor_tok)).json()
-    assert me["balance"] == 100.0
+    assert me["balance"] == WELCOME_FLOPS + 100.0
     assert me["reserved_in_flight"] == 0.0
     assert me["pot"] == 100.0
 

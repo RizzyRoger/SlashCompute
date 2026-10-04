@@ -214,6 +214,11 @@ class Database:
                     conn.exec_driver_sql("ALTER TABLE grants ADD COLUMN reviewed_by VARCHAR")
                 if "review_note" not in grant_cols:
                     conn.exec_driver_sql("ALTER TABLE grants ADD COLUMN review_note VARCHAR")
+            # At most one welcome credit per user, even under concurrent sign-ins.
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_txns_welcome "
+                "ON credit_txns (user_id) WHERE kind = 'welcome'"
+            )
             conn.commit()
 
     def session(self) -> Session:

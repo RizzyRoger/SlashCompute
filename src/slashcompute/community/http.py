@@ -65,6 +65,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login(user.email, body.get("password", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         resp = {"user": core.auth.public_view(user), "token": token}
         # cookie is set by the wrapper below via a side channel — return token for the app
         request.state.session_token = token
@@ -76,6 +77,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login(body.get("email", ""), body.get("password", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         request.state.session_token = token
         return {"user": core.auth.public_view(user), "token": token}
 
@@ -85,6 +87,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login_google(body.get("id_token", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         request.state.session_token = token
         return {"user": core.auth.public_view(user), "token": token}
 

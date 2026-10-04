@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import math
 import threading
+
+
 from typing import Optional
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
+from slashcompute.common.config import WELCOME_FLOPS
 from slashcompute.coordinator.db import CreditTxn, Database, JobAccount, NodeOwner, User, now
 
 POT_ID = "__pot__"
-BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate")
+BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate",
+                 "welcome")
 
 
 class CreditError(Exception):
@@ -154,6 +159,19 @@ class Credits:
         if pot:
             self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
                       note=f"tithe from {user_id}")
+
+    def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
+        """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""
+        if not math.isfinite(flops) or flops <= 0:
+            return 0.0
+        user = self.db.get(User, user_id)
+        if user is None or user.banned:
+            return 0.0
+        try:
+            self.post(user_id, "welcome", flops, note="Welcome credit")
+        except IntegrityError:  # uq_credit_txns_welcome: someone else got there first
+            return 0.0
+        return float(flops)
 
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
         if not math.isfinite(flops) or flops <= 0:

@@ -30,6 +30,10 @@ _FALSE = ("0", "false", "no", "off")
 _MIN = {"checkpoint_every": 1}
 
 
+# One-time credit for every account on first sign-in: 1 PFLOP (credits are 1:1 FLOPs).
+WELCOME_FLOPS = 1e15
+
+
 def allowed_model(model: str) -> bool:
     """Catalog HF ids, or a local directory the coordinator already has."""
     name = (model or "").strip()
@@ -71,6 +75,9 @@ class EngineConfig:
     # Set on a hosted coordinator. Local LAN host leaves these alone.
     public_pool: bool = False
     public_url: str = ""
+
+    # SLASHCOMPUTE_WELCOME_FLOPS=0 disables the sign-in credit.
+    welcome_flops: float = WELCOME_FLOPS
 
     @classmethod
     def from_env(cls, **overrides) -> "EngineConfig":
