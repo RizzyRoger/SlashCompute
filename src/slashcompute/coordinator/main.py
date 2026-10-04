@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Optional
@@ -14,9 +15,30 @@ from slashcompute.common.logging import setup_logging
 
 app = typer.Typer(no_args_is_help=True, help="/compute coordinator")
 
+SHUTDOWN_GRACE_S = 2.0  # in-flight requests (chat streams, uploads) get this long after SIGTERM
+
 
 def _url(url: Optional[str]) -> str:
     return url or f"http://127.0.0.1:{EngineConfig.from_env().coordinator_port}"
+
+
+SessionToken = typer.Option(None, "--session-token", envvar="SLASHCOMPUTE_SESSION",
+                            help="Account session (needed on a public pool)")
+
+
+def _call(method: str, path: str, url: Optional[str], token: Optional[str] = None,
+          timeout: float = 30, **kw) -> None:
+    base = _url(url)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = httpx.request(method, f"{base}{path}", headers=headers, timeout=timeout, **kw)
+    except httpx.HTTPError as e:
+        typer.echo(f"cannot reach coordinator at {base}: {e}", err=True)
+        raise typer.Exit(1)
+    if r.status_code >= 400:
+        typer.echo(r.text, err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(r.json(), indent=2))
 
 
 @app.command()
@@ -46,29 +68,38 @@ def serve(
         if inference_transport not in TRANSPORTS:
             raise typer.BadParameter(f"--inference-transport must be one of {', '.join(TRANSPORTS)}")
         inference = inference.replace(TRANSPORT=inference_transport)
-    uvicorn.run(create_app(cfg, advertise=bool(mdns) and not cfg.public_pool, inference=inference),
-                host=cfg.coordinator_host, port=cfg.coordinator_port, log_level="warning",
-                ws_ping_interval=20, ws_max_size=64 * 1024 * 1024)
+    api = create_app(cfg, advertise=bool(mdns) and not cfg.public_pool, inference=inference)
+
+    class Server(uvicorn.Server):
+        # On SIGTERM uvicorn waits for every in-flight request before the lifespan shutdown, and
+        # inference nodes hold 25 s `/agent/commands` long-polls open (even after they've gone):
+        # release those first, and cap the wait for anything else.
+        async def shutdown(self, sockets=None):
+            api.state.inference.bus.close()
+            await super().shutdown(sockets)
+
+    server = Server(uvicorn.Config(api, host=cfg.coordinator_host, port=cfg.coordinator_port,
+                                   log_level="warning", ws_ping_interval=20, ws_max_size=64 * 1024 * 1024,
+                                   timeout_graceful_shutdown=SHUTDOWN_GRACE_S))
+    with contextlib.suppress(KeyboardInterrupt):
+        server.run()
+    if not server.started:
+        raise typer.Exit(3)  # couldn't bind, like uvicorn.run
 
 
 @app.command()
-def submit(spec: Path = typer.Argument(..., help="JSON job spec"), url: Optional[str] = None):
+def submit(spec: Path = typer.Argument(..., help="JSON job spec"), url: Optional[str] = None,
+           session_token: Optional[str] = SessionToken):
     """Submit a job spec (JSON file)."""
     body = json.loads(spec.read_text())
     if "dataset_path" in body:
         body["dataset_path"] = str((spec.parent / body["dataset_path"]).resolve()) \
             if not Path(body["dataset_path"]).is_absolute() else body["dataset_path"]
-    r = httpx.post(f"{_url(url)}/jobs", json=body, timeout=60)
-    if r.status_code >= 400:
-        typer.echo(r.text, err=True)
-        raise typer.Exit(1)
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("POST", "/jobs", url, session_token, timeout=60, json=body)
 
 
 def _get(path: str, url: Optional[str]):
-    r = httpx.get(f"{_url(url)}{path}", timeout=30)
-    r.raise_for_status()
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("GET", path, url)
 
 
 @app.command()
@@ -96,11 +127,10 @@ def verifications(url: Optional[str] = None):
 
 
 @app.command()
-def cancel(job_id: str, url: Optional[str] = None):
+def cancel(job_id: str, url: Optional[str] = None,
+           session_token: Optional[str] = SessionToken):
     """Cancel a job."""
-    r = httpx.post(f"{_url(url)}/jobs/{job_id}/cancel", timeout=30)
-    r.raise_for_status()
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("POST", f"/jobs/{job_id}/cancel", url, session_token)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,13 @@ Base: RizzyRoger/SlashCompute main at a9758ba (PR #14). Branch: claude/slashcomp
 - [x] Full suite + real end-to-end inference check
 - [x] Working models: Qwen3.5-0.8B-Q4_K_M and Qwen3-8B-Q4_K_M GGUF in ~/models (8B: ~17 tok/s on one M1 Pro)
 - [x] PR to RizzyRoger/SlashCompute (critical fixes)
-- [ ] Minor follow-ups: CLI 404 traceback + session token, rejected jobs reappearing after restart, stale job error,
-      reasoning_content in non-streaming replies/UI, coordinator slow to stop on SIGTERM
+- [x] Minor follow-ups (second PR): CLI 404 traceback + session token, rejected jobs reappearing after restart,
+      stale job error, reasoning_content in non-streaming replies/UI, coordinator slow to stop on SIGTERM
+
+## Results (minor pass)
+
+Full suite: 421 passed, 0 failed. Real run with Qwen3.5-0.8B: a non-streaming reply that ran out of tokens while
+thinking now returns its reasoning_content (was an empty reply); the coordinator exits 0.16 s after SIGTERM (was >6 s).
 
 ## Results (critical pass)
 

@@ -816,13 +816,43 @@ function chatFooter(net) {
   return `≈ ${withUnit(net.flops)} · w=${(net.gen_weight || 1).toFixed(1)}${tok} · ${who}`;
 }
 
+// Fold one SSE event from /api/chat into the reply being streamed.
+function applyChatEvent(reply, ev) {
+  if (ev.error) reply.error = ev.error.message;
+  if (ev.network) reply.meta = chatFooter(ev.network);
+  const choice = ev.choices && ev.choices[0];
+  if (!choice) return;
+  const delta = choice.delta || {};
+  // thinking models (Qwen3 etc.) stream their reasoning separately, before the answer
+  if (delta.reasoning_content) reply.reasoning = (reply.reasoning || "") + delta.reasoning_content;
+  if (delta.content) reply.content += delta.content;
+  if (choice.finish_reason) reply.finish = choice.finish_reason;
+}
+
+// A thinking model's reasoning: open while it streams in, folded away once the answer starts
+// (unless the user opened or closed it themselves).
+function thinkBlock(m, i) {
+  if (!m.reasoning) return "";
+  const thinking = m.live && !m.content;
+  const open = m.thinkOpen ?? thinking;
+  return `<details class="think" data-think="${i}"${open ? ` open=""` : ""}>
+      <summary>${thinking ? "Thinking…" : "Thoughts"}</summary><p>${esc(m.reasoning)}</p></details>`;
+}
+
+function replyText(m) {
+  if (m.error) return `<p><span class="hot">${esc(m.error)}</span></p>`;
+  if (m.content || m.role === "user") return `<p>${esc(m.content)}</p>`;
+  if (!m.reasoning) return `<p>…</p>`;
+  return !m.live && m.finish === "length" ? `<p class="empty">Ran out of tokens while thinking, before answering.</p>` : "";
+}
+
 function renderChat() {
   const log = $("#l-log");
   const msgs = state.llm.messages;
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 32;
-  const html = msgs.length ? msgs.map((m) => `<div class="say ${m.role === "user" ? "you" : "bot"}">
+  const html = msgs.length ? msgs.map((m, i) => `<div class="say ${m.role === "user" ? "you" : "bot"}">
       <label>${m.role === "user" ? "You" : "Pool"}</label>
-      <p>${m.error ? `<span class="hot">${esc(m.error)}</span>` : esc(m.content || (m.role === "assistant" ? "…" : ""))}</p>
+      ${thinkBlock(m, i)}${replyText(m)}
       ${m.meta ? `<small>${esc(m.meta)}</small>` : ""}</div>`).join("")
     : `<p class="empty">Replies stream in here, token by token.</p>`;
   if (log.innerHTML !== html) log.innerHTML = html;
@@ -837,7 +867,7 @@ async function sendChat() {
   if (!l.model) return setMsg("#l-msg", "No model to talk to yet. Upload a GGUF first.", "bad");
   setMsg("#l-msg", "", "");
   l.messages.push({ role: "user", content: text });
-  const reply = { role: "assistant", content: "" };
+  const reply = { role: "assistant", content: "", live: true };
   l.messages.push(reply);
   draft.value = "";
   l.streaming = true;
@@ -870,11 +900,7 @@ async function sendChat() {
         for (const ln of event.split("\n")) {
           const payload = ln.startsWith("data:") ? ln.slice(5).trim() : "";
           if (!payload || payload === "[DONE]") continue;
-          const ev = JSON.parse(payload);
-          if (ev.error) reply.error = ev.error.message;
-          if (ev.network) reply.meta = chatFooter(ev.network);
-          const delta = ev.choices && ev.choices[0] && ev.choices[0].delta;
-          if (delta && delta.content) reply.content += delta.content;
+          applyChatEvent(reply, JSON.parse(payload));
         }
         renderChat();
       }
@@ -883,6 +909,7 @@ async function sendChat() {
     if (e.name === "AbortError") reply.meta = "Stopped.";
     else reply.error = e.message;
   } finally {
+    reply.live = false;
     l.streaming = false;
     l.abort = null;
     await loadLlm();
@@ -1286,6 +1313,11 @@ $("#l-draft").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
 });
 $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); sendChat(); });
+// Remember a Thinking block the user opened or closed, so the next streamed token doesn't undo it.
+$("#l-log").addEventListener("click", (e) => {
+  const block = e.target.closest("summary") && e.target.closest("[data-think]");
+  if (block) state.llm.messages[block.dataset.think].thinkOpen = !block.open;
+});
 
 poll();
 window.setInterval(poll, 2000);

@@ -17,6 +17,7 @@ class CommandBus:
     def __init__(self):
         self.queues: dict[str, asyncio.Queue] = {}
         self.pending: dict[str, tuple[str, asyncio.Future]] = {}
+        self.closing = asyncio.Event()
 
     def queue(self, node_id: str) -> asyncio.Queue:
         return self.queues.setdefault(node_id, asyncio.Queue())
@@ -40,12 +41,19 @@ class CommandBus:
             self.pending.pop(cid, None)
 
     async def poll(self, node_id: str, wait: float) -> list[dict]:
+        """Wait up to `wait`s for commands; returns empty at once when the coordinator shuts down."""
         q = self.queue(node_id)
+        get, closing = asyncio.ensure_future(q.get()), asyncio.ensure_future(self.closing.wait())
         try:
-            first = await asyncio.wait_for(q.get(), wait)
-        except asyncio.TimeoutError:
+            await asyncio.wait((get, closing), timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            closing.cancel()
+            got = get.done()
+            if not got:
+                get.cancel()  # a dangling get() would swallow the node's next command
+        if not got:
             return []
-        out = [first]
+        out = [get.result()]
         while not q.empty():
             out.append(q.get_nowait())
         return out
@@ -65,6 +73,10 @@ class CommandBus:
             if nid == node_id and not fut.done():
                 fut.set_exception(CommandFailed(reason))
         self.queues.pop(node_id, None)
+
+    def close(self) -> None:
+        """Coordinator shutting down: release every agent's long-poll so the server can exit."""
+        self.closing.set()
 
 
 class JobStreams:
