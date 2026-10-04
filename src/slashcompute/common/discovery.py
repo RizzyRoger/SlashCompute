@@ -22,21 +22,45 @@ def lan_ip() -> str:
 
 
 class Advertiser:
+    """Advertises the coordinator on the LAN from inside its running event loop.
+
+    zeroconf's blocking API raises ``EventLoopBlocked`` when called from the loop it runs on,
+    so registration goes through ``AsyncZeroconf``.
+    """
+
     def __init__(self, port: int, host_ip: Optional[str] = None) -> None:
-        from zeroconf import ServiceInfo, Zeroconf
+        from zeroconf import ServiceInfo
 
         ip = host_ip or lan_ip()
         name = f"slashcompute-{socket.gethostname().split('.')[0]}"
-        self._zc = Zeroconf()
         self._info = ServiceInfo(
             MDNS_SERVICE_TYPE, f"{name}.{MDNS_SERVICE_TYPE}",
             addresses=[socket.inet_aton(ip)], port=port, properties={"path": "/ws/agent"},
         )
-        self._zc.register_service(self._info)
+        self._azc = None
 
-    def close(self) -> None:
-        self._zc.unregister_service(self._info)
-        self._zc.close()
+    @property
+    def name(self) -> str:
+        return self._info.name
+
+    async def start(self) -> None:
+        from zeroconf.asyncio import AsyncZeroconf
+
+        self._azc = AsyncZeroconf()
+        try:
+            # Another coordinator on the LAN may use this Mac's name: take "name (2)" instead.
+            await (await self._azc.async_register_service(self._info, allow_name_change=True))
+        except BaseException:
+            await self._azc.async_close()
+            self._azc = None
+            raise
+
+    async def close(self) -> None:
+        if self._azc is None:
+            return
+        await self._azc.async_unregister_service(self._info)
+        await self._azc.async_close()
+        self._azc = None
 
 
 def discover(timeout: float = 5.0) -> Optional[str]:

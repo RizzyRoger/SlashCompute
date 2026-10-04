@@ -45,11 +45,15 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
                 from slashcompute.common.discovery import Advertiser
 
                 adv = Advertiser(cfg.coordinator_port)
+                await adv.start()
+                log.info("advertising on the LAN as %s", adv.name)
             except Exception as e:
-                log.warning("mDNS advertising unavailable: %s", e)
+                adv = None
+                log.warning("mDNS advertising unavailable: %r", e)
+        app.state.advertiser = adv
         yield
         if adv:
-            adv.close()
+            await adv.close()
         await svc.stop()
         await core.stop()
 
