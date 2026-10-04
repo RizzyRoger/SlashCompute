@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import socket
@@ -16,7 +17,9 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 from slashcompute.common import protocol as P
+from slashcompute.coordinator.db import Database, Job
 from slashcompute.inference.coordinator.bus import CommandBus
+from slashcompute.jobs import LoraFinetuneSpec
 
 
 def _free_port() -> int:
@@ -102,3 +105,29 @@ def test_sigterm_exits_promptly_with_nodes_connected(tmp_path):
             p.wait(timeout=10)
         for fh in logs:
             fh.close()
+
+
+@pytest.mark.integration
+def test_port_taken_exits_3_without_touching_state(tmp_path, tiny_model, tiny_dataset):
+    spec = LoraFinetuneSpec(model=str(tiny_model), dataset_path=str(tiny_dataset), steps=10,
+                            batch_size=2, microbatches=1, lora_rank=4, min_stages=1)
+    db_path = tmp_path / "home" / "coordinator" / "coordinator.db"
+    db_path.parent.mkdir(parents=True)
+    db = Database(db_path)
+    db.save(Job(id="j1", kind=spec.kind, spec_json=json.dumps(spec.model_dump(mode="json")),
+                status="running"))
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        out = subprocess.run(
+            [sys.executable, "-m", "slashcompute.coordinator.main", "serve", "--host", "127.0.0.1",
+             "--port", str(port), "--home", str(tmp_path / "home")],
+            env={**os.environ, "SLASHCOMPUTE_LOG": "INFO"}, capture_output=True, text=True, timeout=60)
+
+    assert out.returncode == 3
+    assert "address already in use" in out.stderr.lower()
+    assert "advertising" not in out.stdout + out.stderr
+    with db.session() as s:
+        assert s.get(Job, "j1").status == "running"
