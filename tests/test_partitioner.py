@@ -52,6 +52,23 @@ def test_greedy_fallback_and_three_way():
     assert len(plans) == 3
 
 
+def test_larger_nodes_take_end_stages_when_smallest_cannot_hold_head():
+    # Tied embeddings: the first and last stage both hold the 2 GB embedding,
+    # so the 1.2 GB node only fits in the middle.
+    tied = ModelProfile(model="t", num_layers=3, hidden_size=8, vocab_size=10,
+                        tie_word_embeddings=True, layer_bytes=(GB,) * 3, embed_bytes=2 * GB,
+                        head_bytes=2 * GB, layer_params=1, head_params=1)
+    nodes = [NodeCapacity("a", 3 * GB), NodeCapacity("b", 3 * GB), NodeCapacity("c", int(1.2 * GB))]
+    plans = partition(tied, nodes, overhead=NO_OH)
+    _check(plans, 3)
+    assert [p.node_id for p in plans] == ["a", "c", "b"]
+    # Untied with a large head: the big node must take the last stage.
+    plans = partition(_profile(n=3, embed=0, head=2 * GB),
+                      [NodeCapacity("big", int(4.25 * GB)), NodeCapacity("small", GB)], overhead=NO_OH)
+    _check(plans, 3)
+    assert [p.node_id for p in plans] == ["small", "big"]
+
+
 def test_does_not_fit_raises():
     with pytest.raises(PartitionError, match="pool"):
         partition(_profile(), [NodeCapacity("a", 3 * GB), NodeCapacity("b", 3 * GB)])

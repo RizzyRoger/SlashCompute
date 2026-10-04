@@ -33,13 +33,23 @@ class Batch:
 
 def load_examples(path: str | Path, model_path: Optional[str | Path], max_seq_len: int) -> list[Example]:
     tokenizer = None
+    vocab_size = None
     examples = []
-    for line in Path(path).read_text().splitlines():
+    for lineno, line in enumerate(Path(path).read_text().splitlines(), 1):
         if not line.strip():
             continue
         row = json.loads(line)
         if "tokens" in row:
             toks, start = list(row["tokens"]), int(row.get("loss_start", 0))
+            if vocab_size is None:
+                from slashcompute.pipeline.model_profile import profile_model
+
+                vocab_size = profile_model(str(model_path)).vocab_size
+            # an out-of-range id would silently index past the embedding table
+            bad = [t for t in toks if type(t) is not int or not 0 <= t < vocab_size]
+            if bad:
+                raise ValueError(f"dataset line {lineno}: token id {bad[0]!r} is outside the "
+                                 f"model vocabulary [0, {vocab_size})")
         else:
             if tokenizer is None:
                 from mlx_lm.utils import load_tokenizer
@@ -49,10 +59,11 @@ def load_examples(path: str | Path, model_path: Optional[str | Path], max_seq_le
                 tokenizer = load_tokenizer(resolve_model_path(str(model_path)))
             toks, start = _tokenize(tokenizer, row)
         toks = toks[: max_seq_len + 1]
-        if len(toks) >= 2:
-            examples.append(Example(toks, min(start, len(toks) - 1)))
+        # drop rows whose completion was truncated away, else prompt tokens get trained on
+        if len(toks) >= 2 and start < len(toks):
+            examples.append(Example(toks, start))
     if not examples:
-        raise ValueError(f"no usable examples in {path}")
+        raise ValueError(f"no usable examples in {path} (need a completion token within max_seq_len={max_seq_len})")
     return examples
 
 

@@ -122,7 +122,7 @@ class VerificationManager:
 
     async def on_bundle_ready(self, node_id: str, msg: VerifyBundleReady) -> None:
         v = self._get(msg.verify_id)
-        if v is None or v.status != "fetching":
+        if v is None or v.status != "fetching" or v.target_node_id != node_id:
             return
         if msg.error or not self.bundle_path(v.id).exists():
             self._finish(v, "error", msg.error or "bundle missing")

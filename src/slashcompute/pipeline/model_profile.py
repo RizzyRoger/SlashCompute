@@ -17,6 +17,11 @@ from pathlib import Path
 _DTYPE_BYTES = {"F32": 4, "F16": 2, "BF16": 2, "I32": 4, "U32": 4, "I64": 8, "U64": 8,
                 "I8": 1, "U8": 1, "BOOL": 1, "I16": 2, "U16": 2}
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# Multimodal checkpoints (Gemma3, Llava, ...) ship vision/audio towers next to the
+# language model; the text pipeline never loads them, so they are not counted.
+_NON_TEXT_RE = re.compile(
+    r"(?:^|\.)(?:vision_tower|vision_model|audio_tower|audio_model|multi_modal_projector"
+    r"|embed_vision|embed_audio)\.")
 
 
 @dataclass(frozen=True)
@@ -96,11 +101,13 @@ def _logical_layer_params(cfg: dict) -> int:
 
 
 def profile_from(model: str, config: dict, headers: dict[str, dict]) -> ModelProfile:
-    cfg = config.get("text_config", config) | {k: v for k, v in config.items() if k != "text_config"}
+    cfg = {k: v for k, v in config.items() if k != "text_config"} | config.get("text_config", {})
     n = cfg["num_hidden_layers"]
     layer_bytes = [0] * n
     embed = head = 0
     for name, info in headers.items():
+        if _NON_TEXT_RE.search(name):
+            continue
         size = info["data_offsets"][1] - info["data_offsets"][0]
         m = _LAYER_RE.search(name)
         if m:

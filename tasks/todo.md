@@ -1,3 +1,29 @@
+# Test every feature and fix bugs (one agent per bug)
+
+Base: RizzyRoger/SlashCompute main at a9758ba (PR #14). Branch: claude/slashcompute-testing-bugs-e28013.
+
+- [x] Baseline suite (the cluster test "failure" was a hidden .pth, see lessons)
+- [x] QA agents in parallel: training coordinator/agent, community, web shell + launcher, LLM inference (real llama.cpp b11160), core libs/packaging
+- [x] One fixer agent per confirmed bug, each with a regression test; merged here
+- [x] Feature: one-time 1 PFLOP welcome credit on sign-in (SLASHCOMPUTE_WELCOME_FLOPS, 0 disables)
+- [x] Full suite + real end-to-end inference check
+- [x] Working models: Qwen3.5-0.8B-Q4_K_M and Qwen3-8B-Q4_K_M GGUF in ~/models (8B: ~17 tok/s on one M1 Pro)
+- [x] PR to RizzyRoger/SlashCompute (critical fixes)
+- [ ] Minor follow-ups: CLI 404 traceback + session token, rejected jobs reappearing after restart, stale job error,
+      reasoning_content in non-streaming replies/UI, coordinator slow to stop on SIGTERM
+
+## Results (critical pass)
+
+Full suite: 410 passed, 0 failed (base: 277 passed, 1 failed). Real run with Qwen3.5-0.8B split across two
+nodes: correct answer, malformed request -> 400 with the pipeline intact, a request right after a mid-stream
+disconnect returned in 0 s (was 48 s).
+
+Highest-impact fixes: public-pool nodes could bill/abort/finish other users' jobs and take over node ids; the
+local shell's HTTP client reused the last user's session cookie for any caller and had no Origin/Host check;
+credit double-spend and settle races; NaN budgets queued free jobs; concurrent signups all became admin; bad
+chat requests broke and re-formed the LLM pipeline twice; disconnected streams kept generating; requests
+without max_tokens were billed for 256 tokens but generated to the end of the context.
+
 # Clear inference errors, memory controls, and agent/test robustness
 
 Base: GitHub main at 6034d56. Branch: fix/inference-errors-and-memory.

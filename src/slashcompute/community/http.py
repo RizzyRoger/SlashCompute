@@ -11,6 +11,7 @@ from slashcompute.community.auth import AuthError, google_client_id
 from slashcompute.community.credits import CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.community.terms import TERMS
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import User
 
@@ -64,6 +65,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login(user.email, body.get("password", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         resp = {"user": core.auth.public_view(user), "token": token}
         # cookie is set by the wrapper below via a side channel — return token for the app
         request.state.session_token = token
@@ -75,6 +77,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login(body.get("email", ""), body.get("password", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         request.state.session_token = token
         return {"user": core.auth.public_view(user), "token": token}
 
@@ -84,6 +87,7 @@ def mount_community(app, core: Coordinator) -> None:
             user, token = core.auth.login_google(body.get("id_token", ""))
         except AuthError as e:
             _raise(e)
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         request.state.session_token = token
         return {"user": core.auth.public_view(user), "token": token}
 
@@ -170,7 +174,7 @@ def mount_community(app, core: Coordinator) -> None:
         except GrantError as e:
             _raise(e)
         user = core.auth.session_user(_token(request, authorization))
-        if g.status != "approved" and not (user and (user.admin or user.id == g.author_id)):
+        if not core.grants.visible(g, user):
             raise HTTPException(404, "Grant not found.")
         comments = []
         nm = names()
@@ -197,7 +201,7 @@ def mount_community(app, core: Coordinator) -> None:
         user = require_terms(request, authorization)
         try:
             g = core.grants.donate(user, grant_id, float(body.get("flops", 0)),
-                                   from_pot=bool(body.get("from_pot")))
+                                   from_pot=body_bool(body, "from_pot"))
         except (GrantError, CreditError, TypeError, ValueError) as e:
             _raise(e if isinstance(e, (GrantError, CreditError)) else CreditError(str(e)))
         return core.grants.view(g, names())
@@ -217,7 +221,7 @@ def mount_community(app, core: Coordinator) -> None:
                authorization: Optional[str] = Header(default=None)):
         admin = require(request, authorization)
         try:
-            g = core.grants.review(admin, grant_id, bool(body.get("approve")),
+            g = core.grants.review(admin, grant_id, body_bool(body, "approve"),
                                   note=body.get("note"))
         except GrantError as e:
             _raise(e)
@@ -232,7 +236,15 @@ def mount_community(app, core: Coordinator) -> None:
         user = core.auth.get(user_id)
         if user is None:
             raise HTTPException(404, "No such user.")
-        return {"user": core.auth.public_view(core.auth.set_banned(user, bool(body.get("banned", True))))}
+        # Never lock the instance out of its own admin surface.
+        if user.id == admin.id:
+            raise HTTPException(400, "You cannot ban yourself.")
+        if user.admin and not user.banned:
+            with core.db.session() as s:
+                admins = s.exec(select(User).where(User.admin == True, User.banned == False)).all()  # noqa: E712
+            if len(admins) <= 1:
+                raise HTTPException(400, "Cannot ban the last admin.")
+        return {"user": core.auth.public_view(core.auth.set_banned(user, body_bool(body, "banned", True)))}
 
     @r.post("/admin/users/{user_id}/flag")
     def flag(user_id: str, body: dict, request: Request,

@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -82,30 +85,44 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     return prev, nxt, server
 
 
+class DatasetError(ValueError):
+    """The job's dataset is malformed, so every retry would fail the same way."""
+
+
+def _load_dataset(path: Path, spec) -> list:
+    try:
+        return load_examples(path, spec.model, spec.max_seq_len)
+    except (ValueError, TypeError, KeyError) as e:
+        raise DatasetError(f"bad dataset: {e}") from e
+
+
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
-    ckdir = ctx.job_dir / "checkpoints"
-    ckdir.mkdir(parents=True, exist_ok=True)
-
-    dataset_path = None
-    if asg.dataset_url:
-        dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
-    resume_from = None
-    if asg.resume_step > 0 and asg.checkpoint_url:
-        resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
-
-    compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
-                            ring_size=asg.verify_ring_size)
-    if resume_from is not None:
-        compute.load_checkpoint(resume_from)
-
-    profile = profile_model(spec.model)
-    recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
-    examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
-
-    prev, nxt, server = await _peer_links(ctx)
+    prev = nxt = server = None
+    # Setup is inside the try so a failure still reports StageFinished(error)
+    # rather than leaving the coordinator waiting on a stage that never starts.
     try:
+        ckdir = ctx.job_dir / "checkpoints"
+        ckdir.mkdir(parents=True, exist_ok=True)
+
+        dataset_path = None
+        if asg.dataset_url:
+            dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
+        resume_from = None
+        if asg.resume_step > 0 and asg.checkpoint_url:
+            resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
+
+        compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
+                                ring_size=asg.verify_ring_size)
+        if resume_from is not None:
+            compute.load_checkpoint(resume_from)
+
+        profile = profile_model(spec.model)
+        recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
+        examples = _load_dataset(dataset_path, spec) if dataset_path else None
+
+        prev, nxt, server = await _peer_links(ctx)
         await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
 
         async def on_step(s: StepStats) -> None:
@@ -151,6 +168,7 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
         await emit(StageFinished(
             job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
             reason="error", last_step=asg.resume_step, detail=str(e),
+            fatal=isinstance(e, DatasetError),
         ))
         raise
     finally:
@@ -165,6 +183,25 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
 
 
 # --------------------------------------------------------------------------- subprocess CLI
+
+
+async def _drain_on_stdin(session: StageSession, reader: asyncio.StreamReader) -> None:
+    """The daemon asks a sandboxed worker to drain with a ``{"type":"drain"}`` line on stdin."""
+    while line := await reader.readline():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(msg, dict) and msg.get("type") == "drain":
+            session.request_drain()
+
+
+def _stdin_is_pipe() -> bool:
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
 
 
 def _stdio_app() -> None:
@@ -187,14 +224,26 @@ def _stdio_app() -> None:
         assignment=asg, http=CoordHTTP(blob["coordinator_url"], session_token=blob.get("session_token")),
         job_dir=Path(blob["job_dir"]), data_bind=blob["data_bind"],
         data_port=int(blob["data_port"]), gpu_percent=int(blob["gpu_percent"]),
-        node_id=blob["node_id"],
+        node_id=blob["node_id"], session=StageSession(),
     )
 
     async def emit(msg) -> None:
         print(dump(msg), flush=True)
 
     async def main() -> None:
-        await run_stage(ctx, emit)
+        drains = None
+        if _stdin_is_pipe():
+            reader = asyncio.StreamReader()
+            await asyncio.get_running_loop().connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+            drains = asyncio.create_task(_drain_on_stdin(ctx.session, reader))
+        else:
+            log.warning("stdin is not a pipe; this worker cannot be drained")
+        try:
+            await run_stage(ctx, emit)
+        finally:
+            if drains is not None:
+                drains.cancel()
 
     asyncio.run(main())
 

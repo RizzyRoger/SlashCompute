@@ -13,6 +13,8 @@ from typing import AsyncIterator
 
 import httpx
 
+from slashcompute.inference.node.engine import EngineError
+
 _VERSION = re.compile(r'build[ :]*(\d+)[^)]*?commit[ :]*([0-9a-f]+)', re.I)
 _OLD_VERSION = re.compile(r'version:\s*(\d+)\s*\(([0-9a-f]+)\)')
 
@@ -81,6 +83,27 @@ async def wait_health(port: int, proc: asyncio.subprocess.Process, timeout: floa
     raise TimeoutError('llama-server did not become healthy in time')
 
 
+def request_error_status(status: int, text: str) -> int | None:
+    """The status for the client when llama-server rejected the request itself, else None (server trouble).
+
+    llama-server answers 4xx for malformed requests and prompts larger than the context, and 500 when the
+    model's chat template raises (e.g. no user message)."""
+    if 400 <= status < 500:
+        return status
+    if status == 500 and ('Jinja' in text or 'template' in text):
+        return 400
+    return None
+
+
+def error_message(text: str) -> str:
+    """llama-server's error message; for a template error, just its last line ('Error: Jinja Exception: ...')."""
+    try:
+        msg = str(json.loads(text)['error']['message']).strip()
+    except (ValueError, KeyError, TypeError):
+        return text[:300]
+    return (msg.splitlines() or [''])[-1][:300]
+
+
 async def stream_chat(port: int, body: dict) -> AsyncIterator[dict]:
     """Relay an OpenAI chat completion from the local llama-server as engine events."""
     req = {**body, 'stream': True, 'stream_options': {'include_usage': True}}
@@ -89,6 +112,9 @@ async def stream_chat(port: int, body: dict) -> AsyncIterator[dict]:
         async with client.stream('POST', f'http://127.0.0.1:{port}/v1/chat/completions', json=req) as r:
             if r.status_code != 200:
                 text = (await r.aread()).decode(errors='replace')
+                status = request_error_status(r.status_code, text)
+                if status is not None:
+                    raise EngineError(f'invalid request: {error_message(text)}', pipeline_broken=False, status=status)
                 raise RuntimeError(f'llama-server HTTP {r.status_code}: {text[:300]}')
             async for line in r.aiter_lines():
                 if not line.startswith('data:'):

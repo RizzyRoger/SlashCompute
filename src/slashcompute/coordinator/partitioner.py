@@ -3,7 +3,8 @@ node's contributable memory.
 
 Prefers the fewest stages that fit (fewer network hops), then a split
 proportional to memory, falling back to a greedy fill when the proportional
-split leaves some stage over budget.
+split leaves some stage over budget. Nodes go largest-first; if that fails, the
+two largest are tried on the end stages, which carry the embedding / LM head.
 """
 
 from __future__ import annotations
@@ -83,6 +84,27 @@ def _fits(profile: ModelProfile, caps: Sequence[NodeCapacity], oh: Overhead, bou
     )
 
 
+def _orderings(caps: Sequence[NodeCapacity]) -> list[list[NodeCapacity]]:
+    """Stage orders to try for nodes sorted largest-first: as-is, then the two
+    largest on the first and last stages (either way round), the rest between."""
+    if len(caps) < 2:
+        return [list(caps)]
+    first, second, middle = caps[0], caps[1], list(caps[2:])
+    out: list[list[NodeCapacity]] = []
+    for order in ([*caps], [first, *middle, second], [second, *middle, first]):
+        if order not in out:
+            out.append(order)
+    return out
+
+
+def _place(profile: ModelProfile, caps: Sequence[NodeCapacity], oh: Overhead) -> Optional[list[int]]:
+    bounds = _proportional(profile, caps)
+    if _fits(profile, caps, oh, bounds):
+        return bounds
+    bounds = _greedy(profile, caps, oh)
+    return bounds if bounds is not None and _fits(profile, caps, oh, bounds) else None
+
+
 def partition(profile: ModelProfile, nodes: Sequence[NodeCapacity], *, min_stages: int = 1,
               max_stages: Optional[int] = None, overhead: Overhead = Overhead()) -> list[StagePlan]:
     if not nodes:
@@ -93,17 +115,15 @@ def partition(profile: ModelProfile, nodes: Sequence[NodeCapacity], *, min_stage
         raise PartitionError(f"need at least {min_stages} stages but only {upper} possible "
                              f"({len(ranked)} nodes, {profile.num_layers} layers)")
     for k in range(min_stages, upper + 1):
-        caps = ranked[:k]
-        bounds = _proportional(profile, caps)
-        if not _fits(profile, caps, overhead, bounds):
-            bounds = _greedy(profile, caps, overhead)
-            if bounds is None or not _fits(profile, caps, overhead, bounds):
+        for caps in _orderings(ranked[:k]):
+            bounds = _place(profile, caps, overhead)
+            if bounds is None:
                 continue
-        return [
-            StagePlan(i, c.node_id, bounds[i], bounds[i + 1],
-                      _need(profile, overhead, bounds[i], bounds[i + 1]))
-            for i, c in enumerate(caps)
-        ]
+            return [
+                StagePlan(i, c.node_id, bounds[i], bounds[i + 1],
+                          _need(profile, overhead, bounds[i], bounds[i + 1]))
+                for i, c in enumerate(caps)
+            ]
     pool = sum(c.memory_bytes for c in ranked[:upper])
     raise PartitionError(
         f"model needs ~{overhead.need(profile.total_weight_bytes) / 1e9:.1f} GB "

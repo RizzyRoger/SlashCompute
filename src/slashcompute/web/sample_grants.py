@@ -8,6 +8,7 @@ returns a new ``GrantBook``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, replace
 from typing import Optional
 
@@ -108,7 +109,7 @@ def fund(book: GrantBook, grant_id: str, amount: float, balance: float) -> Grant
         raise GrantError("That grant no longer exists.")
     if g.status != "approved":
         raise GrantError("Only approved grants can be funded.")
-    if amount <= 0:
+    if not math.isfinite(amount) or amount <= 0:
         raise GrantError("Enter an amount above zero.")
     if g.remaining <= 0:
         raise GrantError("This grant is already fully funded.")
@@ -128,7 +129,7 @@ def request(book: GrantBook, title: str, summary: str, goal: float,
         raise GrantError("Give your grant a title.")
     if not summary:
         raise GrantError("Describe what the compute is for.")
-    if goal <= 0:
+    if not math.isfinite(goal) or goal <= 0:
         raise GrantError("Set a goal above zero.")
     new = Grant(id=f"g{len(book.grants) + 1}", title=title, author=author, summary=summary,
                 goal=float(goal), tag="New", status="pending")

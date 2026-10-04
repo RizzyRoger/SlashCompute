@@ -5,16 +5,22 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
+import threading
 import time
 from typing import Callable, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
+from slashcompute.community.fields import text
 from slashcompute.coordinator.db import Database, SessionRow, User, now
 
 ITERATIONS = 210_000
 SESSION_TTL_S = 30 * 24 * 3600
+# Something before the @, a dotted domain after it, no whitespace anywhere.
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
 class AuthError(Exception):
@@ -45,7 +51,7 @@ def _token_hash(token: str) -> str:
 
 
 def normalize_email(email: str) -> str:
-    return email.strip().lower()
+    return text(email, "email", AuthError).strip().lower()
 
 
 def google_client_id() -> str:
@@ -80,34 +86,51 @@ class Auth:
                  verify_google: Callable[[str, str], dict] = verify_google_id_token) -> None:
         self.db = db
         self.verify_google = verify_google
+        # Serializes "is this the first account?" with the insert, so concurrent
+        # sign-ups on a fresh coordinator can't all see an empty table and become admin.
+        self._create_lock = threading.Lock()
 
     def user_count(self) -> int:
         with self.db.session() as s:
             return len(s.exec(select(User)).all())
 
+    def _create(self, user: User) -> Optional[User]:
+        """Insert a new account, making it admin if it is the first. None if the email is taken."""
+        with self._create_lock:
+            if self.get_by_email(user.email) is not None:
+                return None
+            user.admin = user.admin or self.user_count() == 0
+            try:
+                self.db.add(user)
+            except IntegrityError:
+                return None
+        return user
+
     def register(self, email: str, password: str, name: str) -> User:
         email = normalize_email(email)
-        if "@" not in email or "." not in email.split("@")[-1]:
+        if not EMAIL_RE.fullmatch(email):
             raise AuthError("Enter a real email address.")
+        password = text(password, "password", AuthError)
         if len(password) < 8:
             raise AuthError("Password must be at least 8 characters.")
-        name = (name or email.split("@")[0]).strip()[:80] or "member"
+        name = (text(name, "name", AuthError) or email.split("@")[0]).strip()[:80] or "member"
         if self.get_by_email(email) is not None:
             raise AuthError("That email is already registered.")
         admin_env = (os.environ.get("SLASHCOMPUTE_ADMIN_EMAIL") or "").strip().lower()
-        first = self.user_count() == 0
-        user = User(
+        user = self._create(User(
             id=secrets.token_hex(8),
             email=email,
             password_hash=_hash_password(password),
             name=name,
-            admin=first or (admin_env == email),
-        )
-        self.db.add(user)
+            admin=admin_env == email,
+        ))
+        if user is None:
+            raise AuthError("That email is already registered.")
         return user
 
     def login(self, email: str, password: str) -> tuple[User, str]:
         user = self.get_by_email(normalize_email(email))
+        password = text(password, "password", AuthError)
         if user is None or user.password_hash.startswith("google$") or not _verify_password(password, user.password_hash):
             raise AuthError("Email or password is wrong.", 401)
         return self._issue(user)
@@ -127,23 +150,25 @@ class Auth:
         client_id = google_client_id()
         if not client_id:
             raise AuthError("Google sign-in is not configured.", 501)
-        if not (id_token or "").strip():
+        id_token = text(id_token, "id_token", AuthError).strip()
+        if not id_token:
             raise AuthError("Google sign-in failed.", 401)
-        info = self.verify_google(id_token.strip(), client_id)
+        info = self.verify_google(id_token, client_id)
         user = self.get_by_google_sub(info["sub"]) or self.get_by_email(info["email"])
         if user is None:
             admin_env = (os.environ.get("SLASHCOMPUTE_ADMIN_EMAIL") or "").strip().lower()
-            first = self.user_count() == 0
-            user = User(
+            # A concurrent sign-in may create this account first; then just use theirs.
+            user = self._create(User(
                 id=secrets.token_hex(8),
                 email=info["email"],
                 password_hash="google$" + secrets.token_hex(16),
                 name=(info["name"] or info["email"].split("@")[0])[:80] or "member",
-                admin=first or (admin_env == info["email"]),
+                admin=admin_env == info["email"],
                 google_sub=info["sub"],
-            )
-            self.db.add(user)
-        elif user.google_sub != info["sub"]:
+            )) or self.get_by_email(info["email"])
+        if user is None:
+            raise AuthError("Google sign-in failed.", 401)
+        if user.google_sub != info["sub"]:
             user.google_sub = info["sub"]
             self.db.save(user)
         return self._issue(user)
@@ -191,7 +216,7 @@ class Auth:
                        grant_split: Optional[int] = None,
                        bio: Optional[str] = None) -> User:
         if name is not None:
-            name = name.strip()[:80]
+            name = text(name, "name", AuthError).strip()[:80]
             if not name:
                 raise AuthError("Name cannot be empty.")
             user.name = name
@@ -204,7 +229,7 @@ class Auth:
                 raise AuthError("grant_split must be 0–100.")
             user.grant_split = split
         if bio is not None:
-            user.bio = bio.strip()[:280] or None
+            user.bio = text(bio, "bio", AuthError).strip()[:280] or None
         self.db.save(user)
         return user
 

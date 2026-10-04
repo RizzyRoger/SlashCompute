@@ -1,7 +1,8 @@
 """FIFO job scheduling and per-job runtime state.
 
 Strict FIFO: only the oldest waiting job is considered. If the pool can't fit
-it yet, later jobs wait too (no starvation of large jobs).
+it yet, later jobs wait too (no starvation of large jobs). A job no pool could
+ever fit fails instead of waiting, so it can't hold up the queue.
 
 Each (re)start of a job is an *epoch*. Messages carry the epoch so anything
 from a torn-down epoch is ignored.
@@ -95,6 +96,10 @@ class Scheduler:
             except Exception as e:
                 await core.fail_job(job, f"could not read model {job.spec.model!r}: {e}")
                 return False
+        if job.spec.min_stages > job.profile.num_layers:
+            await core.fail_job(job, f"min_stages={job.spec.min_stages} exceeds the model's "
+                                     f"{job.profile.num_layers} layers")
+            return False
         nodes = core.registry.schedulable()
         caps = [NodeCapacity(n.node_id, n.device.memory_contrib_bytes) for n in nodes]
         try:

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.common import protocol as P
-from slashcompute.common.canary import run_canary_mlx
+from slashcompute.common.canary import compare_stats, expected_stats, run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.jobs import LoraFinetuneSpec
@@ -159,6 +159,14 @@ def test_failed_canary_excludes_node(env):
     a.close()
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_canary_rejects_non_finite_stats(bad):
+    exp = expected_stats(1, 64)
+    assert compare_stats(dict(exp), exp, 0.5) == (True, 0.0)
+    assert compare_stats({k: bad for k in exp}, exp, 0.5) == (False, float("inf"))
+    assert compare_stats({**exp, "trace": bad}, exp, 0.5) == (False, float("inf"))
+
+
 def test_node_loss_triggers_recovery_and_reschedule(env):
     client, core, tiny_model, tiny_dataset, tmp_path = env
     agents = [FakeAgent(client, f"node-{x}", port=9000 + i) for i, x in enumerate("abc")]
@@ -244,3 +252,62 @@ def test_job_upload_accepts_dataset_file(env):
     body = r.json()
     assert body["kind"] == "lora_finetune"
     assert body["id"] in core.jobs
+
+
+def test_fatal_stage_error_fails_the_job_without_retrying(env):
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        spec = _spec(tiny_model, tiny_dataset)
+        job_id = client.post("/jobs", json=json.loads(spec.model_dump_json())).json()["id"]
+        ag = {m.stage_idx: x for x in agents for m in [x.recv()]}
+        ag[0].send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0,
+                                   detail="bad dataset: unrecognised dataset row keys", fatal=True))
+        assert isinstance(ag[1].recv(), P.CancelStage)
+        _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "failed", timeout=3)
+        job = client.get(f"/jobs/{job_id}").json()
+        assert job["recoveries"] == 0 and "unrecognised dataset row keys" in job["error"]
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+def test_unsatisfiable_job_fails_instead_of_blocking_queue(env):
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+
+        stuck = json.loads(_spec(tiny_model, tiny_dataset, min_stages=500).model_dump_json())
+        stuck_id = client.post("/jobs", json=stuck).json()["id"]
+        ok = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+        ok_id = client.post("/jobs", json=ok).json()["id"]
+
+        _wait(lambda: client.get(f"/jobs/{stuck_id}").json()["status"] == "failed")
+        assert "6 layers" in client.get(f"/jobs/{stuck_id}").json()["error"]
+        _wait(lambda: client.get(f"/jobs/{ok_id}").json()["status"] == "starting")
+        for x in agents:
+            msg = x.recv()
+            assert isinstance(msg, P.StageAssignment) and msg.job_id == ok_id
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+@pytest.mark.parametrize("kind", [["x"], {}, 3])
+def test_submit_rejects_non_string_kind(env, kind):
+    client, _, tiny_model, tiny_dataset, _ = env
+    body = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json()) | {"kind": kind}
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 400, r.text

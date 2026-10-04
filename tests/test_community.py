@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from slashcompute.common import protocol as P
-from slashcompute.common.config import EngineConfig
+from slashcompute.common.config import WELCOME_FLOPS, EngineConfig
 from slashcompute.community.auth import AuthError, google_client_id
 from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
@@ -300,7 +302,7 @@ def test_http_register_login_cookie_and_me(env):
     login = client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
     token = login.json()["token"]
     me = client.get("/auth/me", headers=_hdr(token))
-    assert me.json()["credits"]["balance"] == 0.0
+    assert me.json()["credits"]["balance"] == WELCOME_FLOPS
     patched = client.patch("/auth/me", json={"grant_split": 33}, headers=_hdr(token))
     assert patched.json()["user"]["grant_split"] == 33
     assert client.get("/auth/providers").json()["google"] is False
@@ -325,7 +327,7 @@ def test_http_terms_required_to_take_and_failed_reserve_drops_job(env):
         "email": "ada@lan.test", "password": "password1", "name": "Ada",
     }).json()["token"]
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
-    spec["max_flops"] = 1e12
+    spec["max_flops"] = 2 * WELCOME_FLOPS
     r = client.post("/jobs", json=spec, headers=_hdr(token))
     assert r.status_code == 403
     assert "terms" in r.json()["detail"].lower()
@@ -352,7 +354,7 @@ def test_http_authenticated_take_reserves(env):
     body = r.json()
     assert body["reserved_flops"] == 2e11
     assert body["user_id"] == user.id
-    assert core.credits.balance(user.id) == pytest.approx(8e11)
+    assert core.credits.balance(user.id) == pytest.approx(WELCOME_FLOPS + 8e11)
 
 
 def test_anonymous_submit_still_works(env):
@@ -420,6 +422,99 @@ def test_http_ban_blocks_take(env):
     r = client.post("/jobs", json=spec, headers=_hdr(member_tok))
     assert r.status_code == 403, r.text
     assert core.jobs == {}
+
+
+# --------------------------------------------------------------------------- welcome credit
+
+
+def _welcome_rows(client, token):
+    items = client.get("/credits/transactions", headers=_hdr(token)).json()["items"]
+    return [row for row in items if row["kind"] == "welcome"]
+
+
+def test_welcome_credit_on_register_is_spendable_once(env):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    me = client.get("/credits/me", headers=_hdr(token)).json()
+    assert me["balance"] == WELCOME_FLOPS == 1e15
+    assert me["lifetime_earned"] == 0.0
+    rows = _welcome_rows(client, token)
+    assert len(rows) == 1 and rows[0]["note"] == "Welcome credit"
+    for _ in range(2):
+        client.post("/auth/login", json={"email": "ada@lan.test", "password": "password1"})
+    assert core.credits.balance(core.auth.user_from_token(token).id) == WELCOME_FLOPS
+
+    client.post("/auth/accept-terms", headers=_hdr(token))
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = WELCOME_FLOPS
+    r = client.post("/jobs", json=spec, headers=_hdr(token))
+    assert r.status_code == 200, r.text
+    assert core.credits.balance(r.json()["user_id"]) == 0.0
+
+
+def test_welcome_credit_backfilled_on_login(env):
+    client, core, *_ = env
+    user = core.auth.register("old@lan.test", "password1", "Old")  # pre-feature account
+    assert core.credits.balance(user.id) == 0.0
+    token = client.post("/auth/login", json={
+        "email": "old@lan.test", "password": "password1",
+    }).json()["token"]
+    client.post("/auth/login", json={"email": "old@lan.test", "password": "password1"})
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+    assert len(_welcome_rows(client, token)) == 1
+
+
+def test_welcome_credit_on_google_sign_in(env, monkeypatch):
+    client, core, *_ = env
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "g@lan.test", "name": "Gia", "sub": "sub-9",
+    }
+    token = client.post("/auth/google", json={"id_token": "jwt"}).json()["token"]
+    client.post("/auth/google", json={"id_token": "jwt"})
+    user = core.auth.user_from_token(token)
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+
+
+def test_welcome_credit_granted_once_under_concurrency(core):
+    import threading
+
+    user = core.auth.register("ada@lan.test", "password1", "Ada")
+    start = threading.Barrier(16)
+    granted = []
+
+    def sign_in():
+        start.wait()
+        granted.append(core.credits.grant_welcome(user.id))
+
+    threads = [threading.Thread(target=sign_in) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(granted) == [0.0] * 15 + [WELCOME_FLOPS]
+    assert core.credits.balance(user.id) == WELCOME_FLOPS
+
+
+def test_welcome_credit_skips_banned_and_disabled(env, tmp_path, monkeypatch):
+    client, core, *_ = env
+    user = core.auth.register("ban@lan.test", "password1", "Ban")
+    core.auth.set_banned(user, True)
+    r = client.post("/auth/login", json={"email": "ban@lan.test", "password": "password1"})
+    assert r.status_code == 403
+    assert core.credits.grant_welcome(user.id) == 0.0
+    assert core.credits.balance(user.id) == 0.0
+
+    monkeypatch.setenv("SLASHCOMPUTE_WELCOME_FLOPS", "0")
+    cfg = EngineConfig.from_env(home=tmp_path / "off", verify_rate=0.0)
+    assert cfg.welcome_flops == 0.0
+    with TestClient(create_app(cfg)) as off:
+        token = off.post("/auth/register", json={
+            "email": "ada@lan.test", "password": "password1", "name": "Ada",
+        }).json()["token"]
+        assert off.get("/credits/me", headers=_hdr(token)).json()["balance"] == 0.0
 
 
 # --------------------------------------------------------------------------- engine hooks
@@ -632,7 +727,7 @@ def test_http_community_lists_live_and_admin(env):
     core.credits.bind_node("n-mac", member.id)
 
     me = client.get("/credits/me", headers=_hdr(donor_tok)).json()
-    assert me["balance"] == 100.0
+    assert me["balance"] == WELCOME_FLOPS + 100.0
     assert me["reserved_in_flight"] == 0.0
     assert me["pot"] == 100.0
 
@@ -723,3 +818,357 @@ def test_http_community_lists_live_and_admin(env):
     assert flags[0]["user_id"] == member.id
     assert flags[0]["reason"] == "spam"
     assert client.get("/admin/flags", headers=_hdr(member_tok)).status_code == 403
+
+
+def test_http_comment_only_on_grants_you_can_view(env):
+    client, core, *_ = env
+    tokens = {}
+    for who in ("admin", "author", "other"):
+        tokens[who] = client.post("/auth/register", json={
+            "email": f"{who}@lan.test", "password": "password1", "name": who,
+        }).json()["token"]
+        client.post("/auth/accept-terms", headers=_hdr(tokens[who]))
+    client.cookies.clear()
+    g = client.post("/grants", json={
+        "title": "Need compute", "body": "A short paragraph about the need.",
+        "goal_flops": 50,
+    }, headers=_hdr(tokens["author"])).json()
+    path = f"/grants/{g['id']}"
+    assert client.get(path, headers=_hdr(tokens["other"])).status_code == 404
+    denied = client.post(f"{path}/comments", json={"body": "sneaky"},
+                         headers=_hdr(tokens["other"]))
+    assert denied.status_code == 404
+    assert denied.json()["detail"] == "Grant not found."
+    for who in ("author", "admin"):
+        ok = client.post(f"{path}/comments", json={"body": "pending note"},
+                         headers=_hdr(tokens[who]))
+        assert ok.status_code == 200, ok.text
+    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
+                headers=_hdr(tokens["admin"]))
+    ok = client.post(f"{path}/comments", json={"body": "now public"},
+                     headers=_hdr(tokens["other"]))
+    assert ok.status_code == 200, ok.text
+    bodies = [c["body"] for c in client.get(path).json()["comments"]]
+    assert bodies == ["pending note", "pending note", "now public"]
+
+
+def test_http_grants_reject_non_finite_goal_and_donation(env):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    member_tok = client.post("/auth/register", json={
+        "email": "m@lan.test", "password": "password1", "name": "Member",
+    }).json()["token"]
+    donor_tok = client.post("/auth/register", json={
+        "email": "d@lan.test", "password": "password1", "name": "Donor",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(member_tok))
+    client.post("/auth/accept-terms", headers=_hdr(donor_tok))
+    core.credits.contribute(core.auth.user_from_token(donor_tok).id, 80.0, 0)
+    grant = {"title": "Need compute", "body": "A short paragraph about the need."}
+    for goal in ("1e309", "inf", "-inf", "nan", 1e31):
+        r = client.post("/grants", json={**grant, "goal_flops": goal},
+                        headers=_hdr(member_tok))
+        assert r.status_code == 400, (goal, r.text)
+    assert client.get("/grants", headers=_hdr(member_tok)).json() == []
+    g = client.post("/grants", json={**grant, "goal_flops": 50},
+                    headers=_hdr(member_tok)).json()
+    client.post(f"/admin/grants/{g['id']}/review", json={"approve": True},
+                headers=_hdr(admin_tok))
+    for flops in ("nan", "inf", "-inf", "1e309"):
+        r = client.post(f"/grants/{g['id']}/donate", json={"flops": flops},
+                        headers=_hdr(donor_tok))
+        assert r.status_code == 400, (flops, r.text)
+    for sort in ("top", "least", "trending"):
+        r = client.get("/grants", params={"sort": sort})
+        assert r.status_code == 200 and r.json()[0]["received_flops"] == 0
+
+
+def test_http_admin_cannot_ban_self_or_last_admin(env):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    admin = core.auth.user_from_token(admin_tok)
+    r = client.post(f"/admin/users/{admin.id}/ban", json={}, headers=_hdr(admin_tok))
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/users", headers=_hdr(admin_tok)).status_code == 200
+    # A second admin may ban the first, but not then the one admin left.
+    other_tok = client.post("/auth/register", json={
+        "email": "other@lan.test", "password": "password1", "name": "Other",
+    }).json()["token"]
+    other = core.auth.user_from_token(other_tok)
+    other.admin = True
+    core.db.save(other)
+    r = client.post(f"/admin/users/{admin.id}/ban", json={}, headers=_hdr(other_tok))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/admin/users/{other.id}/ban", json={}, headers=_hdr(other_tok))
+    assert r.status_code == 400, r.text
+    assert client.get("/admin/users", headers=_hdr(other_tok)).status_code == 200
+
+
+# --------------------------------------------------------------------------- engine hooks
+
+
+def _race(n, fn):
+    """Run fn(i) on n threads released together; return (results, errors)."""
+    barrier = threading.Barrier(n)
+    results, errors = [], []
+
+    def run(i):
+        barrier.wait()
+        try:
+            results.append(fn(i))
+        except Exception as e:  # noqa: BLE001 - the test inspects what was raised
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results, errors
+
+
+def _slow_count(auth, monkeypatch):
+    """Widen the check-then-insert window so a racy admin decision shows up every run."""
+    count = auth.user_count
+
+    def slow():
+        n = count()
+        time.sleep(0.05)
+        return n
+
+    monkeypatch.setattr(auth, "user_count", slow)
+
+
+def test_concurrent_registrations_make_exactly_one_admin(core, monkeypatch):
+    _slow_count(core.auth, monkeypatch)
+    users, errors = _race(8, lambda i: core.auth.register(f"u{i}@lan.test", "password1", f"U{i}"))
+    assert errors == []
+    assert sum(u.admin for u in users) == 1
+    assert sum(core.auth.get(u.id).admin for u in users) == 1
+
+
+def test_concurrent_google_signups_make_exactly_one_admin(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": f"{tok}@lan.test", "name": tok, "sub": f"sub-{tok}",
+    }
+    _slow_count(core.auth, monkeypatch)
+    results, errors = _race(8, lambda i: core.auth.login_google(f"g{i}"))
+    assert errors == []
+    assert sum(u.admin for u, _ in results) == 1
+
+
+def test_concurrent_same_email_registers_once(core):
+    users, errors = _race(8, lambda i: core.auth.register("dup@lan.test", "password1", "Dup"))
+    assert len(users) == 1
+    assert len(errors) == 7
+    assert all(isinstance(e, AuthError) and "already" in str(e) for e in errors)
+
+
+def test_concurrent_same_google_account_signs_in_once(core, monkeypatch):
+    monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
+    core.auth.verify_google = lambda tok, cid: {
+        "email": "g@lan.test", "name": "Gia", "sub": "sub-1",
+    }
+    results, errors = _race(8, lambda i: core.auth.login_google("id-token"))
+    assert errors == []
+    assert len({u.id for u, _ in results}) == 1
+
+
+@pytest.mark.parametrize("email", [
+    "@.", "a b@c d.e", "@lan.test", "a@lan", "a@.test", "a@lan.", "a@ lan.test",
+])
+def test_register_rejects_malformed_email(core, email):
+    with pytest.raises(AuthError, match="email") as e:
+        core.auth.register(email, "password1", "x")
+    assert e.value.status == 400
+    assert core.auth.user_count() == 0
+
+
+@pytest.mark.parametrize("method,path,payload", [
+    ("post", "/auth/register", {"email": 5, "password": "password1"}),
+    ("post", "/auth/register", {"email": None, "password": "password1"}),
+    ("post", "/auth/register", {"email": "x@lan.test", "password": 12345678}),
+    ("post", "/auth/register", {"email": "x@lan.test", "password": "password1", "name": ["x"]}),
+    ("post", "/auth/login", {"email": "admin@lan.test", "password": 12345678}),
+    ("post", "/auth/login", {"email": ["admin@lan.test"], "password": "password1"}),
+    ("patch", "/auth/me", {"name": 5}),
+    ("patch", "/auth/me", {"bio": 5}),
+    ("post", "/grants", {"title": 12345, "body": "A short paragraph about the need.",
+                         "goal_flops": 50}),
+    ("post", "/grants", {"title": "Need compute", "body": {"x": 1}, "goal_flops": 50}),
+    ("post", "/grants/{approved}/comments", {"body": 123}),
+    ("post", "/admin/grants/{pending}/review", {"approve": True, "note": 5}),
+    ("post", "/admin/users/{member}/flag", {"reason": 5}),
+])
+def test_http_wrongly_typed_fields_are_400(env, method, path, payload):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(admin_tok))
+    admin = core.auth.user_from_token(admin_tok)
+    member = core.auth.register("m@lan.test", "password1", "Member")
+    pending = core.grants.create(admin, "Pending one", "A short paragraph about the need.", 50)
+    approved = core.grants.create(admin, "Approved one", "A short paragraph about the need.", 50)
+    core.grants.review(admin, approved.id, True)
+    client.cookies.clear()
+    url = path.format(pending=pending.id, approved=approved.id, member=member.id)
+    r = client.request(method, url, json=payload, headers=_hdr(admin_tok))
+    assert r.status_code == 400, r.text
+    assert core.auth.user_count() == 2
+    assert core.grants.get(pending.id).status == "pending"
+
+
+def test_non_finite_amounts_are_rejected(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 100.0, 50)
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(CreditError):
+            core.credits.reserve_job(user.id, "job-nan", bad)
+        with pytest.raises(CreditError):
+            core.credits.allocate_pot(user.id, "g1", bad)
+    assert core.credits.job_account("job-nan") is None
+    assert core.credits.balance(user.id) == 50.0
+    assert core.credits.balance(POT_ID) == 50.0
+
+
+@pytest.mark.parametrize("max_flops", ["nan", "inf"])
+def test_http_non_finite_max_flops_abandons_job(env, max_flops):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(token))
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = max_flops
+    r = client.post("/jobs", json=spec, headers=_hdr(token))
+    assert r.status_code == 400
+    assert core.jobs == {}
+    r = client.post("/jobs/upload", headers=_hdr(token),
+                    files={"dataset": ("train.jsonl", tiny_dataset.read_bytes())},
+                    data={"model": str(tiny_model), "steps": 2, "batch_size": 2,
+                          "microbatches": 1, "min_stages": 1, "max_flops": max_flops})
+    assert r.status_code == 400
+    assert core.jobs == {}
+
+
+def test_http_unexpected_reserve_error_abandons_job(env, monkeypatch):
+    client, core, tiny_model, tiny_dataset = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    client.post("/auth/accept-terms", headers=_hdr(token))
+
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(core.credits, "reserve_job", boom)
+    spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+    spec["max_flops"] = 1e9
+    with pytest.raises(RuntimeError):
+        client.post("/jobs", json=spec, headers=_hdr(token))
+    assert core.jobs == {}
+
+
+def _race_count(n, fn):
+    """Run fn from n threads released together; return how many calls succeeded."""
+    gate = threading.Barrier(n)
+    ok = []
+
+    def run():
+        gate.wait()
+        try:
+            fn()
+            ok.append(1)
+        except (CreditError, GrantError):
+            pass
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return len(ok)
+
+
+def test_concurrent_spends_cannot_overdraw(core):
+    admin, _ = _account(core.auth, "admin@lan.test")
+    member, _ = _account(core.auth, "m@lan.test")
+    donor, _ = _account(core.auth, "d@lan.test")
+    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 1e3)
+    core.grants.review(admin, g.id, True)
+    for _ in range(3):
+        core.credits.contribute(donor.id, 10.0, 0)
+        assert _race_count(16, lambda: core.grants.donate(donor, g.id, 10.0)) == 1
+        assert core.credits.balance(donor.id) == 0.0
+    assert core.grants.get(g.id).received_flops == 30.0
+    assert core.credits.balance(member.id) == 30.0
+
+    core.credits.contribute(member.id, 10.0, 100)
+    assert _race_count(16, lambda: core.grants.donate(admin, g.id, 10.0, from_pot=True)) == 1
+    assert core.credits.balance(POT_ID) == 0.0
+    assert core.grants.get(g.id).received_flops == 40.0
+
+    jobs = iter(range(16))
+    assert _race_count(16, lambda: core.credits.reserve_job(member.id, f"job-{next(jobs)}", 40.0)) == 1
+    assert core.credits.balance(member.id) == 0.0
+
+
+def test_concurrent_consume_and_settle_keep_job_books_straight(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 100.0, 0)
+    core.credits.reserve_job(user.id, "job-r", 80.0)
+    # Every charge lands on the account: no lost updates to spent_flops.
+    assert _race_count(16, lambda: core.credits.consume_job("job-r", 1.0)) == 16
+    assert core.credits.job_account("job-r").spent_flops == 16.0
+    assert core.credits.lifetime_spent(user.id) == 16.0
+    # The leftover is released exactly once however many settles race.
+    _race_count(16, lambda: core.credits.settle_job("job-r"))
+    assert core.credits.balance(user.id) == 84.0
+    assert core.credits.reserved_in_flight(user.id) == 0.0
+    assert core.credits.consume_job("job-r", 1.0) == 0.0
+
+
+def test_http_admin_flags_reject_string_booleans(env):
+    client, core, *_ = env
+    admin_tok = client.post("/auth/register", json={
+        "email": "admin@lan.test", "password": "password1", "name": "Admin",
+    }).json()["token"]
+    member_tok = client.post("/auth/register", json={
+        "email": "m@lan.test", "password": "password1", "name": "Member",
+    }).json()["token"]
+    member = core.auth.user_from_token(member_tok)
+    client.post("/auth/accept-terms", headers=_hdr(member_tok))
+    g = client.post("/grants", json={
+        "title": "Need compute", "body": "A short paragraph about the need.",
+        "goal_flops": 50,
+    }, headers=_hdr(member_tok)).json()
+    # bool("false") is True: these used to approve and ban.
+    for bad in ("yes", 0, 1, [], "False"):
+        r = client.post(f"/admin/grants/{g['id']}/review", json={"approve": bad},
+                        headers=_hdr(admin_tok))
+        assert r.status_code == 400, (bad, r.text)
+        r = client.post(f"/admin/users/{member.id}/ban", json={"banned": bad},
+                        headers=_hdr(admin_tok))
+        assert r.status_code == 400, (bad, r.text)
+        r = client.post(f"/grants/{g['id']}/donate", json={"flops": 1, "from_pot": bad},
+                        headers=_hdr(member_tok))
+        assert r.status_code == 400, (bad, r.text)
+    assert core.auth.get(member.id).banned is False
+    declined = client.post(f"/admin/grants/{g['id']}/review", json={"approve": "false"},
+                           headers=_hdr(admin_tok))
+    assert declined.status_code == 200, declined.text
+    assert declined.json()["status"] == "declined"
+    r = client.post(f"/admin/users/{member.id}/ban", json={"banned": "false"},
+                    headers=_hdr(admin_tok))
+    assert r.status_code == 200, r.text
+    assert core.auth.get(member.id).banned is False
+    client.post(f"/admin/users/{member.id}/ban", json={}, headers=_hdr(admin_tok))
+    assert core.auth.get(member.id).banned is True
+
+
+# --------------------------------------------------------------------------- engine hooks

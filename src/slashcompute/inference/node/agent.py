@@ -120,6 +120,7 @@ class Agent:
         self.probe_port = cfg.probe_port
         self.busy_fn = busy_fn or (lambda: training_busy(cfg.agent_status_file))
         self.downloads: dict[str, float] = {}             # filename -> fraction done
+        self.jobs: dict[str, asyncio.Task] = {}           # job id -> run_job task (head)
         self.last_available: Optional[bool] = None
         self.last_reason = ""
         self.last_error = ""
@@ -371,8 +372,15 @@ class Agent:
             self._spawn(bridge_stream(self.cfg.coordinator_url, self.token, p["stream_id"], local))
             return {}
         if kind == "run_job":
-            self._spawn(self.run_job(p))
+            job_id = p["job_id"]
+            self.jobs[job_id] = self._spawn(self.run_job(p))
+            self.jobs[job_id].add_done_callback(lambda _: self.jobs.pop(job_id, None))
             return {"accepted": True}
+        if kind == "cancel_job":  # the requester went away
+            task = self.jobs.get(p["job_id"])
+            if task is not None:
+                task.cancel()
+            return {"cancelled": task is not None}
         if kind == "measure_latency":
             if p.get("mode") == "relay":
                 return {"coordinator_rtt_ms": await self.measure_rtt()}
@@ -399,21 +407,25 @@ class Agent:
         """Run a request on the local head and relay engine events over one streamed POST."""
         async def events():
             try:
-                async for ev in self.engine.complete(p["pipeline_id"], p["body"]):
-                    yield (json.dumps(ev) + "\n").encode()
+                async with contextlib.aclosing(self.engine.complete(p["pipeline_id"], p["body"])) as evs:
+                    async for ev in evs:
+                        yield (json.dumps(ev) + "\n").encode()
             except EngineError as e:
-                yield (json.dumps({"type": "error", "error": str(e), "retryable": True,
-                                   "pipeline_broken": e.pipeline_broken}) + "\n").encode()
+                yield (json.dumps({"type": "error", "error": str(e), "retryable": e.status is None,
+                                   "pipeline_broken": e.pipeline_broken, "status": e.status}) + "\n").encode()
             except Exception as e:  # noqa: BLE001
                 yield (json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}", "retryable": True,
                                    "pipeline_broken": False}) + "\n").encode()
 
+        body = events()
         try:
-            r = await self.client.post(f"/agent/jobs/{p['job_id']}/stream", content=events(), headers=self.headers,
+            r = await self.client.post(f"/agent/jobs/{p['job_id']}/stream", content=body, headers=self.headers,
                                        timeout=httpx.Timeout(None, connect=10))
             r.raise_for_status()
         except httpx.HTTPError as e:
             log.warning("stream for %s failed: %s", p["job_id"], e)
+        finally:
+            await body.aclose()  # cancel_job: stop the engine (llama-server) generating for nobody
 
     def _existing(self, filename: str, size: Optional[int], sha256: Optional[str]) -> Optional[Path]:
         for d in self.cfg.model_dirs:

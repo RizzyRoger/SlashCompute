@@ -27,6 +27,7 @@ from typing import Optional
 from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.inference import PREFIX
 from slashcompute.inference import flops as fl
 from slashcompute.inference.accounting import Accounting, AccountingError, NullAccounting
@@ -35,7 +36,7 @@ from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
 from slashcompute.inference.coordinator.db import connect, tx
 from slashcompute.inference.coordinator.layers import build_layout
-from slashcompute.inference.coordinator.pipelines import PipelineManager, serve
+from slashcompute.inference.coordinator.pipelines import PipelineManager, estimate_prompt_tokens, serve
 from slashcompute.inference.coordinator.planner import NoPlan, build_matches
 from slashcompute.inference.coordinator.relay import Relay
 from slashcompute.inference.gguf import read_header_file
@@ -44,14 +45,24 @@ log = logging.getLogger(__name__)
 TOKEN_HEADER = "x-inference-token"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.gguf$")
 DOWNLOAD_TIMEOUT_S = 6 * 3600
+DEFAULT_MAX_TOKENS = 256
 
 
-def estimate_prompt_tokens(body: dict) -> int:
-    return max(8, len(json.dumps(body.get("messages", ""))) // 4)
+def completion_limit(body: dict) -> int:
+    """The one completion budget a request gets: sizes the context, the credit reservation and the engine's cap."""
+    raw = next((body[k] for k in ("max_tokens", "max_completion_tokens", "n_predict") if body.get(k) is not None),
+               DEFAULT_MAX_TOKENS)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        n = 0
+    if n <= 0 or isinstance(raw, bool):
+        raise HTTPException(400, "max_tokens must be a positive integer.")
+    return n
 
 
 def ctx_for(body: dict, s: InferenceSettings) -> int:
-    need = estimate_prompt_tokens(body) + int(body.get("max_tokens") or 256) + 64
+    need = estimate_prompt_tokens(body) + completion_limit(body) + 64
     ctx = s.DEFAULT_CTX
     while ctx < need:
         ctx *= 2
@@ -507,7 +518,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         return {"ok": True}
 
     @r.get("/plan")
-    async def plan_view(model: str, max_tokens: int = 256):
+    async def plan_view(model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
         row = svc.model_or_404(model)
         body = {"model": model, "max_tokens": max_tokens}
         ctx = ctx_for(body, s)
@@ -557,13 +568,20 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         except AccountingError as e:
             raise HTTPException(e.status, str(e)) from e
         row = svc.model_or_404(body.get("model", ""))
-        stream = bool(body.get("stream"))
-        engine_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "model")}
+        max_tokens = completion_limit(body)
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) for m in messages):
+            raise HTTPException(400, "messages must be a non-empty list of message objects.")
+        stream = body_bool(body, "stream")
+        # the engine gets exactly the budget we reserved for (llama-server alone would run to the end of the ctx)
+        engine_body = {k: v for k, v in body.items()
+                       if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
+        engine_body["max_tokens"] = max_tokens
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
             est = fl.estimate_flops(registry.model_flops(row), estimate_prompt_tokens(body),
-                                    int(body.get("max_tokens") or 256), mgr.gen_weight_for(row["id"]))
+                                    max_tokens, mgr.gen_weight_for(row["id"]))
             try:
                 svc.accounting.reserve(user_id, account_id, est)
             except AccountingError as e:
@@ -639,6 +657,9 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                         break
                 yield "data: [DONE]\n\n"
             finally:
+                # a disconnect closes us here: close serve() too, so it cancels the job on the head and
+                # records the tokens generated so far *before* settle() releases the reservation
+                await events.aclose()
                 settle()
 
         return StreamingResponse(sse(), media_type="text/event-stream")

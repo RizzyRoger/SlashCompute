@@ -96,7 +96,8 @@ class Recovery:
                  msg.stage_idx, msg.reason, msg.last_step, f" {msg.detail}" if msg.detail else "")
 
         if msg.reason in ("error", "cancelled"):
-            await self.abort_epoch(job, f"stage {msg.stage_idx} {msg.reason}: {msg.detail or ''}")
+            await self.abort_epoch(job, f"stage {msg.stage_idx} {msg.reason}: {msg.detail or ''}",
+                                   fatal=msg.fatal)
             return
         if len(cur.finished) < len(cur.plans):
             return
@@ -110,7 +111,8 @@ class Recovery:
             log.info("job %s drained at step %d; will resume on remaining nodes",
                      job.id, job.row.last_checkpoint_step)
 
-    async def abort_epoch(self, job: JobRuntime, reason: str, count: bool = True) -> None:
+    async def abort_epoch(self, job: JobRuntime, reason: str, count: bool = True,
+                          fatal: bool = False) -> None:
         core = self.core
         cur = job.current
         if cur is None or cur.closed:
@@ -127,6 +129,9 @@ class Recovery:
                 await core.send(p.node_id, CancelStage(job_id=job.id, epoch=cur.epoch))
             self._close_stage_run(job.id, cur.epoch, p.stage_idx, "aborted")
         row = job.row
+        if fatal:
+            await core.fail_job(job, reason)
+            return
         if count:
             row.recoveries += 1
         if row.recoveries > core.cfg.max_recoveries:

@@ -207,7 +207,14 @@ class Coordinator:
                 raise PermissionError("banned")
             if public_user.accepted_terms_at is None:
                 raise PermissionError("accept terms")
+        # Node ids are public (GET /nodes): only the account that owns one may re-register it,
+        # so a stranger cannot evict a live node or rebind its earnings.
+        claimant = public_user or (self.auth.session_user(msg.session_token)
+                                   if msg.session_token else None)
         old = self.registry.get(msg.node_id)
+        owner = self.credits.owner_of(msg.node_id) or (old.user_id if old else None)
+        if claimant is not None and owner is not None and owner != claimant.id:
+            raise PermissionError("node id belongs to another account")
         if old is not None:
             await self.recovery.on_node_lost(msg.node_id, "re-registered")
         state = self.registry.register(msg, send)
@@ -248,10 +255,14 @@ class Coordinator:
             self.registry.heartbeat(node_id, msg.status)
         elif isinstance(msg, DrainNotice):
             await self.recovery.on_drain(node_id)
+        elif isinstance(msg, (StageReady, StepMetrics, StageFinished)) \
+                and not self._holds_stage(node_id, msg.job_id, msg.epoch, msg.stage_idx):
+            # Only the node planned for a stage may report on it; otherwise any
+            # node could bill a stranger's budget or end their job.
+            log.warning("dropping %s from %s: not assigned to job %s epoch %d stage %d",
+                        type(msg).__name__, node_id[:8], msg.job_id, msg.epoch, msg.stage_idx)
         elif isinstance(msg, StageReady):
-            job = self.jobs.get(msg.job_id)
-            if job:
-                await self.scheduler.on_stage_ready(job, msg.epoch, msg.stage_idx)
+            await self.scheduler.on_stage_ready(self.jobs[msg.job_id], msg.epoch, msg.stage_idx)
         elif isinstance(msg, StepMetrics):
             await self._on_step(node_id, msg)
         elif isinstance(msg, StageFinished):
@@ -262,6 +273,12 @@ class Coordinator:
             await self.verification.on_result(node_id, msg)
         else:
             log.warning("unexpected message from %s: %s", node_id[:8], type(msg).__name__)
+
+    def _holds_stage(self, node_id: str, job_id: str, epoch: int, stage_idx: int) -> bool:
+        job = self.jobs.get(job_id)
+        cur = job.current if job else None
+        return cur is not None and cur.epoch == epoch and any(
+            p.stage_idx == stage_idx and p.node_id == node_id for p in cur.plans)
 
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
         job = self.jobs.get(msg.job_id)

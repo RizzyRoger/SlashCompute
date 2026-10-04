@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -28,8 +29,18 @@ class LauncherError(Exception):
 
 FINISHES = ("carbon", "poster", "signal", "thermal", "void")
 TRANSPORTS = ("direct", "relay")
+# Errors that only say the coordinator could not be reached: stale once it answers.
+UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answering ")
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
+
+
+def stateless_http(**kw: Any) -> httpx.Client:
+    """Client for the shared shell: it proxies many browsers, so it must never keep a cookie (a
+    stored Set-Cookie would sign every cookie-less request in as the last user). Each request
+    carries only the caller's own Cookie/Authorization headers."""
+    jar = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+    return httpx.Client(follow_redirects=False, cookies=jar, **kw)
 
 
 def supports_inference(health: Optional[dict]) -> Optional[bool]:
@@ -61,19 +72,19 @@ class LauncherSettings:
         transport = self.transport if self.transport in TRANSPORTS else "direct"
         try:
             gpu = max(1, min(100, int(self.gpu_percent)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             gpu = 50
         try:
             split = max(0, min(100, int(self.grant_split)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             split = 0
         try:
             mem = max(0, min(1024, int(self.inference_memory_gb)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             mem = 0
         try:
             train_mem = max(0, min(1024, int(self.memory_gb)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             train_mem = 0
         return LauncherSettings(
             mode=mode, url=str(self.url or ""), gpu_percent=gpu,
@@ -157,7 +168,7 @@ class Launcher:
         self.home.mkdir(parents=True, exist_ok=True)
         self.python = python or sys.executable
         self._popen = popen
-        self._http = http or httpx.Client(follow_redirects=False)
+        self._http = http or stateless_http()
         self._discover = discover_fn
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn
@@ -415,11 +426,7 @@ class Launcher:
         else:
             self._stop_inference()
 
-        snap = self.snapshot(s)
-        if snap.coordinator_up and "not answering" in (self.last_error or ""):
-            self.last_error = ""
-            snap.last_error = ""
-        return snap
+        return self.snapshot(s)
 
     def stop(self) -> StatusSnapshot:
         self.last_error = ""
@@ -467,6 +474,8 @@ class Launcher:
         health = self.poll_health(url) or {}
         if not health and s.mode == "host":
             health = self.poll_health(self.proxy_url(s)) or {}
+        if health and self.last_error.startswith(UNREACHABLE_ERRORS):
+            self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
         agent = self.paths.read_status()
         agent_pid = self.paths.read_pid()
         agent_running = bool(agent_pid and process_alive(agent_pid))

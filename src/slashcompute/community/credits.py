@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import math
+import threading
+
+
 from typing import Optional
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
+from slashcompute.common.config import WELCOME_FLOPS
 from slashcompute.coordinator.db import CreditTxn, Database, JobAccount, NodeOwner, User, now
 
 POT_ID = "__pot__"
-BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate")
+BALANCE_KINDS = ("earn", "reserve", "release", "donate", "receive", "allocate",
+                 "welcome")
 
 
 class CreditError(Exception):
@@ -22,6 +29,8 @@ class CreditError(Exception):
 class Credits:
     def __init__(self, db: Database) -> None:
         self.db = db
+        # Serialises check-balance-then-debit so concurrent spends cannot overdraw.
+        self._spend_lock = threading.Lock()
 
     def post(self, user_id: str, kind: str, amount: float, *, job_id: Optional[str] = None,
              grant_id: Optional[str] = None, node_id: Optional[str] = None,
@@ -131,6 +140,10 @@ class Credits:
             return list(s.exec(select(NodeOwner).where(NodeOwner.user_id == user_id)).all())
 
     def bind_node(self, node_id: str, user_id: str) -> None:
+        # Node ids are public: never hand one user's node (and its earnings) to another.
+        owner = self.owner_of(node_id)
+        if owner is not None and owner != user_id:
+            raise PermissionError("node id belongs to another account")
         self.db.save(NodeOwner(node_id=node_id, user_id=user_id))
 
     def owner_of(self, node_id: str) -> Optional[str]:
@@ -151,16 +164,30 @@ class Credits:
             self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
                       note=f"tithe from {user_id}")
 
+    def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
+        """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""
+        if not math.isfinite(flops) or flops <= 0:
+            return 0.0
+        user = self.db.get(User, user_id)
+        if user is None or user.banned:
+            return 0.0
+        try:
+            self.post(user_id, "welcome", flops, note="Welcome credit")
+        except IntegrityError:  # uq_credit_txns_welcome: someone else got there first
+            return 0.0
+        return float(flops)
+
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
-        if flops <= 0:
+        if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Set a FLOP budget greater than zero.")
-        if self.balance(user_id) < flops:
-            raise CreditError(
-                f"Need {flops:.3e} FLOPs; you have {self.balance(user_id):.3e}. Contribute first.",
-            )
-        self.post(user_id, "reserve", -flops, job_id=job_id)
-        acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
-        self.db.add(acct)
+        with self._spend_lock:
+            have = self.balance(user_id)
+            if have < flops:
+                raise CreditError(
+                    f"Need {flops:.3e} FLOPs; you have {have:.3e}. Contribute first.",
+                )
+            acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
+            self.db.add(CreditTxn(user_id=user_id, kind="reserve", amount=-flops, job_id=job_id), acct)
         return acct
 
     def job_account(self, job_id: str) -> Optional[JobAccount]:
@@ -168,15 +195,19 @@ class Credits:
 
     def consume_job(self, job_id: str, flops: float) -> float:
         """Charge a job's reserve. Returns FLOPs actually charged."""
-        acct = self.job_account(job_id)
-        if acct is None or flops <= 0:
+        if flops <= 0:
             return 0.0
-        remaining = acct.reserved_flops - acct.spent_flops
-        take = min(flops, remaining)
-        if take:
-            acct.spent_flops += take
-            self.db.save(acct)
-            self.post(acct.user_id, "consumed", take, job_id=job_id)
+        with self._spend_lock, self.db.session() as s:
+            acct = s.get(JobAccount, job_id)
+            if acct is None:
+                return 0.0
+            remaining = acct.reserved_flops - acct.spent_flops
+            take = min(flops, remaining)
+            if take:
+                acct.spent_flops += take
+                s.add(acct)
+                s.add(CreditTxn(user_id=acct.user_id, kind="consumed", amount=take, job_id=job_id))
+                s.commit()
         return take
 
     def job_exhausted(self, job_id: str) -> bool:
@@ -186,30 +217,40 @@ class Credits:
         return acct.spent_flops >= acct.reserved_flops - 1e-9
 
     def settle_job(self, job_id: str) -> None:
-        acct = self.job_account(job_id)
-        if acct is None:
-            return
-        leftover = max(0.0, acct.reserved_flops - acct.spent_flops)
-        if leftover:
-            self.post(acct.user_id, "release", leftover, job_id=job_id)
-            acct.reserved_flops = acct.spent_flops
-            self.db.save(acct)
+        # Settling shrinks the reserve to what was spent, so a settled account
+        # has nothing left to release and repeat settles are no-ops.
+        with self._spend_lock, self.db.session() as s:
+            acct = s.get(JobAccount, job_id)
+            if acct is None:
+                return
+            leftover = max(0.0, acct.reserved_flops - acct.spent_flops)
+            if leftover:
+                acct.reserved_flops = acct.spent_flops
+                s.add(acct)
+                s.add(CreditTxn(user_id=acct.user_id, kind="release", amount=leftover, job_id=job_id))
+                s.commit()
 
     def donate(self, donor_id: str, recipient_id: str, grant_id: str, flops: float) -> None:
         if flops <= 0:
             raise CreditError("Donation must be positive.")
-        if self.balance(donor_id) < flops:
-            raise CreditError("Not enough personal credits to donate.")
-        self.post(donor_id, "donate", -flops, grant_id=grant_id)
-        self.post(recipient_id, "receive", flops, grant_id=grant_id)
+        self._transfer(donor_id, "donate", recipient_id, grant_id, flops,
+                       "Not enough personal credits to donate.")
 
     def allocate_pot(self, recipient_id: str, grant_id: str, flops: float) -> None:
-        if flops <= 0:
+        if not math.isfinite(flops) or flops <= 0:
             raise CreditError("Allocation must be positive.")
-        if self.balance(POT_ID) < flops:
-            raise CreditError("Community pot does not have that many FLOPs.")
-        self.post(POT_ID, "allocate", -flops, grant_id=grant_id)
-        self.post(recipient_id, "receive", flops, grant_id=grant_id)
+        self._transfer(POT_ID, "allocate", recipient_id, grant_id, flops,
+                       "Community pot does not have that many FLOPs.")
+
+    def _transfer(self, source_id: str, kind: str, recipient_id: str, grant_id: str,
+                  flops: float, short_msg: str) -> None:
+        with self._spend_lock:
+            if self.balance(source_id) < flops:
+                raise CreditError(short_msg)
+            self.db.add(
+                CreditTxn(user_id=source_id, kind=kind, amount=-flops, grant_id=grant_id),
+                CreditTxn(user_id=recipient_id, kind="receive", amount=flops, grant_id=grant_id),
+            )
 
     def leaderboard(self, limit: int = 20) -> list[dict]:
         with self.db.session() as s:

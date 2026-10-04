@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
     FINISHES, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings, supports_inference,
 )
@@ -28,6 +31,8 @@ SHELL_GENERATION = 6
 MODELS = [DEV_MODEL, *DEMO_MODEL_CANDIDATES]
 _PROXY_BLOCK = {"verify"}
 _SORTS = ("top", "trending", "least")
+_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # Forming an LLM pipeline (loading weights over RPC) can take minutes before the first token.
 STREAM_TIMEOUT = httpx.Timeout(None, connect=5.0)
 
@@ -43,14 +48,53 @@ def _proxy_blocked(path: str) -> bool:
     return not parts or parts[0].lower() in _PROXY_BLOCK
 
 
-def settings_from_body(body: dict) -> LauncherSettings:
+def _hostname(value: str) -> str:
+    try:
+        return (urlsplit(value).hostname or "").rstrip(".")
+    except ValueError:
+        return ""
+
+
+def local_hosts(bind: str) -> frozenset[str]:
+    """Names the shell answers to: loopback, plus the bind address when it is a specific LAN one."""
+    bind = bind.strip().strip("[]").lower()
+    return _LOOPBACK | {bind} if bind and bind not in ("0.0.0.0", "::") else _LOOPBACK
+
+
+def local_only(app, hosts: frozenset[str]):
+    """ASGI guard: a foreign Host is DNS rebinding, a foreign Origin on a write is CSRF. Both get 403."""
+    async def guard(scope, receive, send):
+        if scope["type"] != "http":
+            return await app(scope, receive, send)
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        origin = headers.get("origin")
+        if _hostname(f"//{headers.get('host', '')}") not in hosts:
+            detail = "Host not allowed."
+        elif (scope["method"] not in _SAFE_METHODS and origin is not None
+              and not (origin.lower().startswith(("http://", "https://")) and _hostname(origin) in hosts)):
+            detail = "Cross-origin request refused."
+        else:
+            return await app(scope, receive, send)
+        await JSONResponse({"detail": detail}, status_code=403)(scope, receive, send)
+    return guard
+
+
+def public_settings(s: LauncherSettings) -> dict:
+    """Settings as the UI sees them: whether a session is stored, never the token itself."""
+    out = asdict(s)
+    out["has_session"] = bool(out.pop("session_token"))
+    return out
+
+
+def settings_from_body(body: dict, session_token: str = "") -> LauncherSettings:
+    """A body without session_token keeps the stored one (the UI never sees it to send it back)."""
     return LauncherSettings(
         mode=body.get("mode", "host"),
         url=body.get("url", ""),
         gpu_percent=body.get("gpu_percent", 50),
         contribute=body.get("contribute", True),
         finish=body.get("finish", "carbon"),
-        session_token=body.get("session_token", ""),
+        session_token=body.get("session_token", session_token),
         grant_split=body.get("grant_split", 0),
         training=body.get("training", True),
         memory_gb=body.get("memory_gb", 0),
@@ -140,6 +184,7 @@ def create_shell(launcher: Optional[Launcher] = None,
                  stream_client: Optional[httpx.AsyncClient] = None) -> FastAPI:
     launch = launcher or Launcher()
     app = FastAPI(title="/compute")
+    app.add_middleware(local_only, hosts=local_hosts(SHELL_HOST))
     app.state.launcher = launch
     streams = stream_client or httpx.AsyncClient(timeout=STREAM_TIMEOUT)
 
@@ -170,7 +215,12 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.post("/api/chat")
     async def chat(request: Request):
         """Streaming chat with the pool's LLMs (OpenAI-style SSE from the coordinator)."""
-        body = await request.json()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "Send a JSON chat request.") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Send a JSON chat request.")
         body["stream"] = True
         req = streams.build_request("POST", f"{await inference_base()}/v1/chat/completions", json=body,
                                     headers=_forward_headers(request), timeout=STREAM_TIMEOUT)
@@ -201,29 +251,29 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     @app.get("/api/settings")
     def get_settings():
-        return asdict(launch.load_settings())
+        return public_settings(launch.load_settings())
 
     @app.post("/api/settings")
     def post_settings(body: dict):
-        s = settings_from_body(body)
+        s = settings_from_body(body, launch.load_settings().session_token)
         launch.save_settings(s)
-        return asdict(s)
+        return public_settings(s)
 
     @app.get("/api/status")
     def status():
         snap = launch.snapshot()
-        return {**asdict(snap), **asdict(launch.load_settings()),
+        return {**asdict(snap), **public_settings(launch.load_settings()),
                 "coordinator_url": launch.coordinator_url(launch.load_settings()),
                 "finishes": list(FINISHES)}
 
     @app.post("/api/start")
     def start(body: dict):
-        s = settings_from_body(body)
+        s = settings_from_body(body, launch.load_settings().session_token)
         try:
             snap = launch.start(s)
         except LauncherError as e:
             raise HTTPException(400, str(e)) from e
-        return {**asdict(snap), **asdict(launch.load_settings())}
+        return {**asdict(snap), **public_settings(launch.load_settings())}
 
     @app.post("/api/stop")
     def stop():
@@ -239,7 +289,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         s = launch.load_settings()
         snap = launch.snapshot(s)
         pool = launch.fetch_pool(launch.proxy_url(s)) if snap.coordinator_up else PoolData()
-        status = {**asdict(snap), **asdict(s), "coordinator_url": launch.coordinator_url(s),
+        status = {**asdict(snap), **public_settings(s), "coordinator_url": launch.coordinator_url(s),
                   "models": MODELS, "public_url": launch.cfg.public_url or ""}
         return overview(status, pool, launch.my_node_id(), s.grant_split)
 
@@ -247,9 +297,13 @@ def create_shell(launcher: Optional[Launcher] = None,
 
     def amount(value) -> float:
         try:
-            return float(value)
+            v = float(value)
         except (TypeError, ValueError):
             raise HTTPException(400, "Enter a number.") from None
+        # float() takes "NaN"/"Infinity", which would reach the coordinator as non-standard JSON.
+        if not math.isfinite(v) or v <= 0:
+            raise HTTPException(400, "Enter a positive, finite number.")
+        return v
 
     def coord_call(request: Request, method: str, path: str, *,
                    params: Optional[dict] = None, payload: Optional[dict] = None,
@@ -353,7 +407,7 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.post("/api/grants/{grant_id}/review")
     def review_grant(grant_id: str, body: dict, request: Request):
         coord_call(request, "POST", f"/admin/grants/{grant_id}/review", payload={
-            "approve": bool(body.get("approve")),
+            "approve": body_bool(body, "approve"),
             "note": body.get("note"),
         })
         return grant_board(request, str(body.get("sort", "top")))

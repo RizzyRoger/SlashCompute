@@ -109,6 +109,7 @@ class StageFinished(BaseModel):
     reason: Literal["done", "drained", "cancelled", "error"]
     last_step: int
     detail: Optional[str] = None
+    fatal: bool = False  # deterministic error (e.g. bad dataset): fail the job, don't retry
 
 
 class VerifyBundleReady(BaseModel):

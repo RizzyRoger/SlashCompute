@@ -161,6 +161,32 @@ def test_start_host_without_contribute_skips_agent(tmp_path):
     assert kinds == ["slashcompute.coordinator.main"]
 
 
+def test_start_hosting_keeps_this_macs_agent_and_llm_node(tmp_path, monkeypatch):
+    # "Start hosting" re-posts the running contribution with mode=host: the coordinator comes up
+    # and the training agent and LLM node already lending to it keep running.
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "inference_transport": "direct"}))
+    settings = LauncherSettings(mode="host", contribute=True, training=True, inference=True)
+    local = launcher.proxy_url(settings)
+    launcher.paths.pid_file.write_text("77\n")
+    (tmp_path / "agent.args").write_text(json.dumps(launcher.agent_argv(local, 50, "", 0)))
+    launcher.inference_pid_path.parent.mkdir(parents=True, exist_ok=True)
+    launcher.inference_pid_path.write_text("88\n")
+    (tmp_path / "inference.args").write_text(json.dumps(launcher.inference_argv(local, settings)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
+                        lambda paths: pytest.fail("hosting should not stop the training agent"))
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill",
+                        lambda pid, sig: pytest.fail("hosting should not stop the LLM node"))
+
+    snap = launcher.start(settings)
+
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    assert snap.agent_running and snap.inference_running
+    saved = launcher.load_settings()
+    assert (saved.mode, saved.contribute, saved.training, saved.inference) == ("host", True, True, True)
+
+
 @pytest.mark.parametrize(("old_token", "new_url", "new_gpu", "new_token"), [
     ("tok", "http://10.0.0.2:8765", 50, "tok"),
     ("tok", "http://10.0.0.1:8765", 75, "tok"),
@@ -311,6 +337,28 @@ def test_start_join_without_health_fails(tmp_path):
     launcher = _launcher(tmp_path, http=FakeHTTP(None))
     with pytest.raises(LauncherError, match="No coordinator"):
         launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+
+
+def test_unreachable_error_clears_once_the_coordinator_answers(tmp_path):
+    http = FakeHTTP(None)
+    launcher = _launcher(tmp_path, http=http)
+    with pytest.raises(LauncherError, match="No coordinator"):
+        launcher.start(LauncherSettings(mode="join", url="http://127.0.0.1:9399"))
+    # Still down: the error stays.
+    assert launcher.snapshot().last_error == "No coordinator at http://127.0.0.1:9399."
+
+    # Connect saves a fixed address (no start); the next status poll must drop the stale banner.
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+    http.health = {"ok": True}
+    snap = launcher.snapshot()
+    assert snap.coordinator_up and snap.last_error == ""
+    assert launcher.last_error == ""
+
+
+def test_reachable_coordinator_keeps_other_errors(tmp_path):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
+    launcher.last_error = "Training agent is still stopping. Settings have not been applied."
+    assert launcher.snapshot().last_error == launcher.last_error != ""
 
 
 def test_start_public_requires_url_and_token(tmp_path):

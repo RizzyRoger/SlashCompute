@@ -6,10 +6,14 @@ import pytest
 
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.inference.coordinator.layers import synthetic_layout
-from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition
+from slashcompute.inference.coordinator.pipelines import TRANSITIONS, IllegalTransition, check_transition, serve
 from slashcompute.inference.node.config import Commitment
+from slashcompute.inference.node.engine import EngineError
+from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
+
+
 QWEN = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
 
 
@@ -27,6 +31,7 @@ def members(h, pid):
 
 # ------------------------------------------------------------ state machine
 
+
 def test_transition_table():
     check_transition("planned", "starting")
     check_transition("loading", "active")
@@ -38,6 +43,7 @@ def test_transition_table():
 
 
 # ------------------------------------------------------------ formation, reuse, teardown, failure
+
 
 @pytest.fixture
 async def two_node():
@@ -82,6 +88,75 @@ async def test_streaming_response(two_node):
     summary = json.loads(lines[-2][6:])
     assert summary["network"]["predicted_n"] == 16
     assert summary["network"]["gen_weight"] >= 1.0
+
+
+async def test_client_disconnect_mid_stream_cancels_the_head_and_credits_partial_work():
+    """The requester hangs up (curl -m, the UI's Stop button): the head stops generating, the job is
+    cancelled rather than left running, and the tokens produced so far are credited."""
+    h = await start_harness(fast_settings(), time_scale=1.0)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)])
+        assert (await chat(h, QWEN, max_tokens=2)).status_code == 200
+        records = len(h.svc.accounting.records)
+        head = h.agents["head"]
+
+        async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+            async with c.stream("POST", "/v1/chat/completions", json={
+                    "model": QWEN, "messages": [{"role": "user", "content": "go on forever"}],
+                    "max_tokens": 3000, "stream": True}) as r:
+                assert r.status_code == 200
+                seen = 0
+                async for line in r.aiter_lines():
+                    seen += line.startswith("data: ")
+                    if seen == 3:
+                        break
+                assert head.jobs  # the head is generating
+        job = None
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            job = h.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if job["state"] != "running" and not head.jobs:
+                break
+        assert job["state"] == "cancelled" and job["finished_at"]
+        assert not head.jobs  # cancel_job reached the head and closed its engine stream
+        assert 3 <= job["predicted_n"] < 3000
+        (rec,) = h.svc.accounting.records[records:]
+        assert set(rec["per_node"]) == {h.ids["head"], h.ids["worker"]}
+        assert all(f > 0 for f in rec["per_node"].values())
+        assert rec["tokens"] == job["prompt_n"] + job["predicted_n"]
+        # the pipeline is free for the next request
+        assert (await chat(h, QWEN, max_tokens=2, content="next")).status_code == 200
+    finally:
+        await h.stop()
+
+
+async def test_closing_serve_mid_stream_records_before_returning():
+    """sse() closes serve() when the requester goes away and then settles: the partial work must
+    already be recorded by the time aclose() returns, or settle() releases the reservation first."""
+    h = await start_harness(fast_settings(), time_scale=1.0)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)])
+        body = {"messages": [{"role": "user", "content": "long"}], "max_tokens": 3000}
+        events = serve(h.svc.mgr, QWEN, body, 4096, None, True, "inf-acct")
+        n = 0
+        async for ev in events:
+            n += ev["type"] == "chunk"
+            if n == 3:
+                break
+        await events.aclose()
+        job = h.conn.execute("SELECT * FROM jobs").fetchone()
+        assert job["state"] == "cancelled" and job["predicted_n"] == 3
+        (rec,) = [r for r in h.svc.accounting.records if r["account_id"] == "inf-acct"]
+        assert rec["tokens"] == job["prompt_n"] + 3
+        for _ in range(50):
+            if not h.agents["head"].jobs:
+                break
+            await asyncio.sleep(0.1)
+        assert not h.agents["head"].jobs
+    finally:
+        await h.stop()
 
 
 async def test_idle_pipeline_is_torn_down():
@@ -182,6 +257,24 @@ async def test_unknown_model_is_404(two_node):
     assert r.status_code == 404
 
 
+async def test_idle_pipeline_of_the_same_model_is_evicted_for_a_larger_ctx(two_node):
+    h = two_node
+    small = await chat(h, QWEN, max_tokens=16)
+    assert small.status_code == 200, small.text
+    (first,) = pipelines(h)
+    assert first["ctx"] == 4096
+    # needs ctx 8192, which only fits once the idle ctx-4096 pipeline gives its memory back
+    big = await chat(h, QWEN, content="long answer", max_tokens=5000)
+    assert big.status_code == 200, big.text
+    states = {p["id"]: (p["state"], p["ctx"]) for p in pipelines(h)}
+    assert states[first["id"]] == ("stopped", 4096)
+    assert big.json()["network"]["pipeline_id"] != first["id"]
+    assert states[big.json()["network"]["pipeline_id"]] == ("active", 8192)
+    # a smaller request reuses the bigger pipeline instead of evicting it
+    again = await chat(h, QWEN, content="short again", max_tokens=16)
+    assert again.json()["network"]["pipeline_id"] == big.json()["network"]["pipeline_id"]
+
+
 async def test_requests_during_a_drain_wait_instead_of_failing():
     h = await start_harness(fast_settings(), time_scale=1.0)
     try:
@@ -198,7 +291,6 @@ async def test_requests_during_a_drain_wait_instead_of_failing():
         assert {m["node"] for m in during.json()["network"]["members"]} == {"studio", "pc"}
     finally:
         await h.stop()
-
 
 
 def _late_agent(port):
@@ -290,3 +382,49 @@ async def test_node_reports_a_coordinator_without_inference_instead_of_stale_sta
         await agent.client.aclose()
         server.should_exit = True
         await serving
+
+
+async def test_malformed_messages_are_400_before_any_job(two_node):
+    h = two_node
+    async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+        for extra in ({"messages": []}, {}, {"messages": "hello"}, {"messages": [1]}):
+            r = await c.post("/v1/chat/completions", json={"model": QWEN, **extra})
+            assert r.status_code == 400, (extra, r.text)
+    assert h.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    assert pipelines(h) == []
+
+
+class RejectingEngine(FakeEngine):
+    """Rejects the request like llama-server does a prompt larger than its context."""
+
+    async def complete(self, pipeline_id, body):
+        if body["messages"][0]["content"] == "too long":
+            raise EngineError("invalid request: request (20010 tokens) exceeds the available context size "
+                              "(8192 tokens)", pipeline_broken=False, status=400)
+        async for ev in super().complete(pipeline_id, body):
+            yield ev
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_rejected_request_is_a_client_error_and_keeps_the_pipeline(stream):
+    h = await start_harness(fast_settings())
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)],
+                          engine_cls=RejectingEngine)
+        assert (await chat(h, QWEN)).status_code == 200
+        (p,) = pipelines(h)
+
+        r = await chat(h, QWEN, content="too long", stream=stream)
+        assert r.status_code == 400, r.text
+        err = r.json()["error"]
+        assert err["retryable"] is False and "exceeds the available context size" in err["message"]
+        # not retried, and the pipeline (and everyone else's requests on it) is untouched
+        failed = h.conn.execute("SELECT * FROM jobs WHERE state='failed'").fetchall()
+        assert len(failed) == 1 and failed[0]["retryable"] == 0
+        assert h.conn.execute("SELECT COUNT(*) FROM jobs WHERE retry_of IS NOT NULL").fetchone()[0] == 0
+        assert [(q["id"], q["state"]) for q in pipelines(h)] == [(p["id"], "active")]
+        r = await chat(h, QWEN, content="again")
+        assert r.status_code == 200 and r.json()["network"]["pipeline_id"] == p["id"]
+    finally:
+        await h.stop()

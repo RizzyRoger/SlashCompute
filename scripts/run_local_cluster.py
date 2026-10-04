@@ -39,7 +39,8 @@ def main() -> None:
     url = f"http://127.0.0.1:{args.port}"
     procs: list[subprocess.Popen] = []
 
-    def stop(*_):
+    def stop(code: int | str = 0):
+        # sys.exit with a message prints it to stderr and exits 1.
         for proc in procs:
             if proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
@@ -48,10 +49,10 @@ def main() -> None:
                 proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        sys.exit(0)
+        sys.exit(code)
 
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, lambda *_: stop())
+    signal.signal(signal.SIGTERM, lambda *_: stop())
 
     coord_home = home / "coordinator"
     env = os.environ.copy()
@@ -68,12 +69,12 @@ def main() -> None:
             if httpx.get(f"{url}/health", timeout=1).status_code == 200:
                 break
         except httpx.HTTPError:
-            time.sleep(0.2)
+            pass
         if procs[0].poll() is not None:
             raise SystemExit("coordinator exited before becoming healthy")
+        time.sleep(0.2)
     else:
-        stop()
-        raise SystemExit("coordinator did not start")
+        stop("coordinator did not start")
 
     print(f"coordinator {url}  (state {coord_home})")
     for i in range(args.agents):
@@ -98,8 +99,7 @@ def main() -> None:
     while True:
         for proc in procs:
             if proc.poll() is not None:
-                print(f"process exited with {proc.returncode}", file=sys.stderr)
-                stop()
+                stop(f"process exited with {proc.returncode}")
         time.sleep(0.5)
 
 

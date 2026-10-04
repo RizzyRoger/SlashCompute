@@ -3,6 +3,7 @@ variable named ``SLASHCOMPUTE_<FIELD>`` (upper-case)."""
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -20,6 +21,17 @@ DEMO_MODEL_CANDIDATES = [
 ALLOWED_MODELS = (DEV_MODEL, *DEMO_MODEL_CANDIDATES)
 
 MDNS_SERVICE_TYPE = "_slashcompute._tcp.local."
+
+log = logging.getLogger(__name__)
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+# Numeric fields default to a floor of 0; these need more.
+_MIN = {"checkpoint_every": 1}
+
+
+# One-time credit for every account on first sign-in: 1 PFLOP (credits are 1:1 FLOPs).
+WELCOME_FLOPS = 1e15
 
 
 def allowed_model(model: str) -> bool:
@@ -64,20 +76,21 @@ class EngineConfig:
     public_pool: bool = False
     public_url: str = ""
 
+    # SLASHCOMPUTE_WELCOME_FLOPS=0 disables the sign-in credit.
+    welcome_flops: float = WELCOME_FLOPS
+
     @classmethod
     def from_env(cls, **overrides) -> "EngineConfig":
         cfg = cls()
         for f in fields(cls):
-            env = os.environ.get(f"SLASHCOMPUTE_{f.name.upper()}")
+            name = f"SLASHCOMPUTE_{f.name.upper()}"
+            env = os.environ.get(name)
             if env is None:
                 continue
-            cur = getattr(cfg, f.name)
-            if isinstance(cur, bool):
-                val = env.lower() in ("1", "true", "yes", "on")
-            elif isinstance(cur, Path):
-                val = Path(env).expanduser()
-            else:
-                val = type(cur)(env)
+            val = _parse_env(env.strip(), getattr(cfg, f.name), _MIN.get(f.name, 0))
+            if val is None:
+                log.warning("ignoring %s=%r; using default %r", name, env, getattr(cfg, f.name))
+                continue
             setattr(cfg, f.name, val)
         for k, v in overrides.items():
             if v is not None:
@@ -91,3 +104,20 @@ class EngineConfig:
     @property
     def agent_dir(self) -> Path:
         return self.home / "agent"
+
+
+def _parse_env(env: str, cur, minimum):
+    """Parse ``env`` like ``cur``; None means unusable, keep the default."""
+    if isinstance(cur, bool):
+        low = env.lower()
+        return True if low in _TRUE else False if low in _FALSE else None
+    if isinstance(cur, Path):
+        return Path(env).expanduser() if env else None
+    if isinstance(cur, str):
+        return env
+    try:
+        # int(float()) so "5e8" and "25.0" work for byte counts and step counts.
+        val = int(float(env)) if isinstance(cur, int) else float(env)
+    except (ValueError, OverflowError):
+        return None
+    return val if val >= minimum else None
