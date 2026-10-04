@@ -208,12 +208,10 @@ def test_lan_anonymous_cannot_displace_live_owned_node(tmp_path):
             assert e.value.code == 4003
             assert core.registry.get("owned-mac") is state
             assert state.user_id == owner_id
-        # Offline, an owned node still needs a signed-in account; an unowned one reconnects freely.
-        with pytest.raises(WebSocketDisconnect) as e:
-            with client.websocket_connect("/ws/agent") as ws:
-                _register(ws, "owned-mac", None)
-        assert e.value.code == 4003
-        assert core.credits.owner_of("owned-mac") == owner_id
+        # Offline, a LAN Mac whose session lapsed reconnects anonymously and still pays its owner.
+        with client.websocket_connect("/ws/agent") as ws:
+            assert isinstance(_register(ws, "owned-mac", None), P.Welcome)
+            assert core.credits.owner_of("owned-mac") == owner_id
         for _ in range(2):
             with client.websocket_connect("/ws/agent") as ws:
                 assert isinstance(_register(ws, "lan-mac", None), P.Welcome)

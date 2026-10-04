@@ -247,6 +247,10 @@ class Coordinator:
         owner = (live.user_id if live else None) or self.credits.owner_of(node_id)
         if owner is None or owner == claimant:
             return
+        if claimant is None and live is None and not self.cfg.public_pool:
+            # LAN: a Mac whose session lapsed (or that carries another pool's token) keeps
+            # contributing; owner_of still pays its owner, so nothing is taken.
+            return
         if claimant is None:
             raise PermissionError("node id belongs to an account: sign in and accept the terms")
         if live is not None or self.db.get(Node, node_id) is None:
