@@ -1,3 +1,5 @@
+import json
+
 import mlx.core as mx
 import pytest
 from mlx_lm.utils import load_model
@@ -50,16 +52,26 @@ def test_batches_deterministic(tiny_model, tiny_dataset):
     assert b1.ntoks == int(b1.mask.sum().item()) > 0
 
 
-def test_examples_with_completion_truncated_away_are_dropped(tmp_path):
+def test_examples_with_completion_truncated_away_are_dropped(tiny_model, tmp_path):
     path = tmp_path / "d.jsonl"
     path.write_text('{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 15}\n'
                     '{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 5}\n')
-    ex = load_examples(path, None, 8)
+    ex = load_examples(path, tiny_model, 8)
     assert [e.loss_start for e in ex] == [5]
     assert make_batch(ex, 0, 1, 0).mask.tolist() == [[0, 0, 0, 0, 1, 1, 1, 1]]
     path.write_text('{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 15}\n')
     with pytest.raises(ValueError, match="no usable examples"):
-        load_examples(path, None, 8)
+        load_examples(path, tiny_model, 8)
+
+
+@pytest.mark.parametrize("bad", [256, 5000, -1, 1.5, None])
+def test_token_ids_outside_vocab_rejected(tiny_model, tmp_path, bad):
+    data = tmp_path / "bad.jsonl"
+    data.write_text('{"tokens": [1, 2, 3, 4]}\n' + json.dumps({"tokens": [1, 2, bad, 7, 8]}) + "\n")
+    with pytest.raises(ValueError, match=r"line 2: token id .* outside the model vocabulary \[0, 256\)"):
+        load_examples(data, tiny_model, 32)
+    data.write_text('{"tokens": [0, 1, 254, 255]}\n')
+    assert load_examples(data, tiny_model, 32)[0].tokens == [0, 1, 254, 255]
 
 
 async def test_pipeline_matches_single_stage_reference(tiny_model, tiny_dataset, tmp_path):
