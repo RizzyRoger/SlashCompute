@@ -75,6 +75,7 @@ class Coordinator:
         self.recovery = Recovery(self)
         self.verification = VerificationManager(self)
         self.jobs: dict[str, JobRuntime] = {}
+        self._checkpoint_locks: dict[str, asyncio.Lock] = {}
         self._task: Optional[asyncio.Task] = None
         self._load_jobs()
 
@@ -199,16 +200,28 @@ class Coordinator:
         self.credits.settle_job(job.id)
         log.info("job %s completed (%d steps, last loss %s)", job.id, row.progress_step, row.last_loss)
 
-    def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
-                             data: bytes) -> None:
+    def checkpoint_lock(self, job_id: str) -> asyncio.Lock:
+        """Serializes a job's checkpoint writes, merges and exports."""
+        return self._checkpoint_locks.setdefault(job_id, asyncio.Lock())
+
+    async def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
+                                   data: bytes) -> None:
         job = self.jobs.get(job_id)
-        if job is None or job.current is None or job.current.epoch != epoch:
+        cur = job.current if job else None
+        if cur is None or cur.epoch != epoch or cur.closed:
             raise ValueError("unknown or stale job epoch")
-        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages)
-        if merged is not None and step > job.row.last_checkpoint_step:
-            job.row.last_checkpoint_step = step
-            self.db.save(job.row)
-            self.db.add(Checkpoint(job_id=job_id, step=step, path=str(merged)))
+        if not 0 <= stage_idx < len(cur.plans):
+            raise ValueError(f"epoch {epoch} has no stage {stage_idx}")
+        async with self.checkpoint_lock(job_id):
+            # A recorded step is never merged again: it may be the file a resuming stage is
+            # downloading right now (every stage re-uploads it on a drain just after a resume).
+            fresh = step > job.row.last_checkpoint_step
+            merged = await asyncio.to_thread(self.checkpoints.store_stage, job_id, epoch, step,
+                                             stage_idx, data, len(cur.plans), fresh)
+            if merged is not None and step > job.row.last_checkpoint_step:
+                job.row.last_checkpoint_step = step
+                self.db.save(job.row)
+                self.db.add(Checkpoint(job_id=job_id, step=step, path=str(merged)))
 
     # ------------------------------------------------------------ agent sessions
 

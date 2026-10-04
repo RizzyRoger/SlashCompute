@@ -1,14 +1,20 @@
 """Checkpoint storage. Stages upload per-stage files; once every stage of an
 epoch has uploaded a step, they are merged into one file keyed per layer, so
-a resumed job can be re-partitioned freely."""
+a resumed job can be re-partitioned freely.
+
+Files appear atomically (written to a temp name, then renamed), so a stage
+downloading a resume checkpoint never reads half of one. Callers serialize
+uploads per job and never re-merge a step they have already recorded."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import mlx.core as mx
 
@@ -18,6 +24,16 @@ from slashcompute.pipeline.stage import merge_checkpoints
 log = logging.getLogger(__name__)
 
 _ADAPTER_KEY = re.compile(r"^adapter/layers\.L(\d+)\.(.+)$")
+
+
+def _write_atomic(path: Path, write: Callable[[Path], None]) -> None:
+    # The temp name keeps the extension: mx.save_safetensors appends one otherwise.
+    tmp = path.with_name(f".{uuid.uuid4().hex}.{path.name}")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class CheckpointStore:
@@ -38,15 +54,17 @@ class CheckpointStore:
         return self.job_dir(job_id) / "ckpt" / f"step_{step:06d}.safetensors"
 
     def store_stage(self, job_id: str, epoch: int, step: int, stage_idx: int, data: bytes,
-                    num_stages: int) -> Optional[Path]:
+                    num_stages: int, merge: bool = True) -> Optional[Path]:
         """Save one stage's upload. Returns the merged path once the step is
-        complete for this epoch, else None."""
-        self.stage_path(job_id, epoch, step, stage_idx).write_bytes(data)
+        complete for this epoch (and ``merge`` is set), else None."""
+        _write_atomic(self.stage_path(job_id, epoch, step, stage_idx), lambda tmp: tmp.write_bytes(data))
+        if not merge:
+            return None
         parts = [self.stage_path(job_id, epoch, step, i) for i in range(num_stages)]
         if not all(p.exists() and p.stat().st_size > 0 for p in parts):
             return None
         out = self.merged_path(job_id, step)
-        merge_checkpoints(parts, out)
+        _write_atomic(out, lambda tmp: merge_checkpoints(parts, tmp))
         log.info("checkpoint complete job=%s step=%d", job_id, step)
         return out
 

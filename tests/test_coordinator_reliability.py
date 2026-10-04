@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import select
@@ -17,7 +20,8 @@ from slashcompute.common.canary import run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
-from slashcompute.coordinator.db import Job, StageRun, UsageRecord
+from slashcompute.coordinator.db import Checkpoint, Job, StageRun, UsageRecord
+from slashcompute.coordinator.partitioner import StagePlan
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
 
@@ -300,3 +304,76 @@ def test_epoch_cancelled_while_assignments_go_out_sends_no_more(core):
     other = "n2" if told[0] == "n1" else "n1"
     assert [type(m).__name__ for m in sent[other]] == ["CancelStage"]  # never a zombie stage
     assert job.row.status == "cancelled"
+
+
+# ------------------------------------------------------------ checkpoint uploads
+
+
+def _stage_checkpoint(spec, start, end, step, path):
+    from slashcompute.pipeline.local import build_compute
+
+    build_compute(spec, start, end, 6).save_checkpoint(path, step)
+    return path.read_bytes()
+
+
+@pytest.fixture
+def two_stage_epoch(core, tmp_path, monkeypatch):
+    from slashcompute.coordinator import checkpoints
+
+    job = core.submit(_spec(core))
+    job.current = EpochState(epoch=1, plans=[StagePlan(0, "n0", 0, 3, 0), StagePlan(1, "n1", 3, 6, 0)])
+    parts = [_stage_checkpoint(job.spec, 0, 3, 5, tmp_path / "a.safetensors"),
+             _stage_checkpoint(job.spec, 3, 6, 5, tmp_path / "b.safetensors")]
+    merges = []
+    real = checkpoints.merge_checkpoints
+
+    def counting(paths, out):
+        merges.append(out)
+        real(paths, out)
+
+    monkeypatch.setattr(checkpoints, "merge_checkpoints", counting)
+    return job, parts, merges
+
+
+def test_concurrent_uploads_merge_a_step_once(core, two_stage_epoch):
+    job, parts, merges = two_stage_epoch
+
+    async def upload():
+        await core.on_checkpoint_upload(job.id, 1, 0, 5, parts[0])
+        # The last stage's upload arrives three times at once (its retries overlapped).
+        await asyncio.gather(*(core.on_checkpoint_upload(job.id, 1, 1, 5, parts[1]) for _ in range(3)))
+
+    asyncio.run(upload())
+    assert len(merges) == 1 and job.row.last_checkpoint_step == 5
+    merged = core.checkpoints.merged_path(job.id, 5)
+    layers = {int(m.group(1)) for k in mx.load(str(merged))
+              if (m := re.match(r"adapter/layers\.L(\d+)\.", k))}
+    assert layers == set(range(6))  # a whole, valid file with both stages in it
+    with core.db.session() as s:
+        assert len(s.exec(select(Checkpoint).where(Checkpoint.job_id == job.id)).all()) == 1
+    assert not list(merged.parent.rglob(".*"))  # no temp files left behind
+
+
+def test_recorded_checkpoint_is_never_rewritten(core, two_stage_epoch):
+    job, parts, merges = two_stage_epoch
+    asyncio.run(core.on_checkpoint_upload(job.id, 1, 0, 5, parts[0]))
+    asyncio.run(core.on_checkpoint_upload(job.id, 1, 1, 5, parts[1]))
+    merged = core.checkpoints.merged_path(job.id, 5)
+    before = os.stat(merged)
+    # A drain right after resuming from step 5: every stage uploads step 5 again while
+    # other stages may be downloading it as their resume checkpoint.
+    asyncio.run(core.on_checkpoint_upload(job.id, 1, 0, 5, parts[0]))
+    asyncio.run(core.on_checkpoint_upload(job.id, 1, 1, 5, parts[1]))
+    after = os.stat(merged)
+    assert len(merges) == 1
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_uploads_to_a_closed_epoch_or_unknown_stage_are_refused(core, two_stage_epoch):
+    job, parts, merges = two_stage_epoch
+    with pytest.raises(ValueError, match="no stage 2"):
+        asyncio.run(core.on_checkpoint_upload(job.id, 1, 2, 5, parts[0]))
+    job.current.closed = True  # aborted: a stage still running in it must not move the job on
+    with pytest.raises(ValueError, match="stale"):
+        asyncio.run(core.on_checkpoint_upload(job.id, 1, 0, 5, parts[0]))
+    assert job.row.last_checkpoint_step == 0 and not merges

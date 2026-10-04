@@ -364,7 +364,7 @@ def create_app(cfg: EngineConfig, advertise: bool = False,
                 raise HTTPException(403, "You are not assigned to this stage.")
         data = await request.body()
         try:
-            core.on_checkpoint_upload(job_id, epoch, stage, step, data)
+            await core.on_checkpoint_upload(job_id, epoch, stage, step, data)
         except ValueError as e:
             raise HTTPException(409, str(e))
         return {"ok": True}
