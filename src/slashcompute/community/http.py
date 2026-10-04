@@ -103,6 +103,8 @@ def mount_community(app, core: Coordinator) -> None:
         user = core.auth.session_user(_token(request, authorization))
         if user is None:
             return {"user": None}
+        # A session from before the welcome credit never passes through sign-in again: grant it here.
+        core.credits.grant_welcome(user.id, core.cfg.welcome_flops)
         return {"user": core.auth.public_view(user), "credits": core.credits.summary(user.id)}
 
     @r.post("/auth/accept-terms")
@@ -126,14 +128,16 @@ def mount_community(app, core: Coordinator) -> None:
     def my_nodes(request: Request, authorization: Optional[str] = Header(default=None)):
         user = require(request, authorization)
         live = {n.node_id: n for n in core.registry.nodes.values()}
+        inference = getattr(app.state, "inference", None)   # inference nodes are bound to owners too
         out = []
         for row in core.credits.nodes_for(user.id):
             n = live.get(row.node_id)
+            inf = inference.node_state(row.node_id) if n is None and inference is not None else None
             out.append({
                 "node_id": row.node_id,
                 "user_id": n.user_id if n is not None and n.user_id else row.user_id,
-                "online": n is not None,
-                "status": n.status if n is not None else None,
+                "online": n is not None or bool(inf and inf["online"]),
+                "status": n.status if n is not None else inf["status"] if inf else None,
                 "gpu_percent": n.gpu_percent if n is not None else None,
             })
         return out

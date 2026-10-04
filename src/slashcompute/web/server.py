@@ -56,13 +56,24 @@ def _hostname(value: str) -> str:
         return ""
 
 
+def _same_origin(origin: str, hosts: frozenset[str], port: int) -> bool:
+    """The shell's own pages: a local host on the shell's port. Any other port (a dev server, a page
+    from another local app) is a different origin even though the SameSite cookie still rides along."""
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and _hostname(origin) in hosts and origin_port == port
+
+
 def local_hosts(bind: str) -> frozenset[str]:
     """Names the shell answers to: loopback, plus the bind address when it is a specific LAN one."""
     bind = bind.strip().strip("[]").lower()
     return _LOOPBACK | {bind} if bind and bind not in ("0.0.0.0", "::") else _LOOPBACK
 
 
-def local_only(app, hosts: frozenset[str]):
+def local_only(app, hosts: frozenset[str], port: int):
     """ASGI guard: a foreign Host is DNS rebinding, a foreign Origin on a write is CSRF. Both get 403."""
     async def guard(scope, receive, send):
         if scope["type"] != "http":
@@ -71,8 +82,7 @@ def local_only(app, hosts: frozenset[str]):
         origin = headers.get("origin")
         if _hostname(f"//{headers.get('host', '')}") not in hosts:
             detail = "Host not allowed."
-        elif (scope["method"] not in _SAFE_METHODS and origin is not None
-              and not (origin.lower().startswith(("http://", "https://")) and _hostname(origin) in hosts)):
+        elif scope["method"] not in _SAFE_METHODS and origin is not None and not _same_origin(origin, hosts, port):
             detail = "Cross-origin request refused."
         else:
             return await app(scope, receive, send)
@@ -80,22 +90,25 @@ def local_only(app, hosts: frozenset[str]):
     return guard
 
 
-def public_settings(s: LauncherSettings) -> dict:
-    """Settings as the UI sees them: whether a session is stored, never the token itself."""
+def public_settings(s: LauncherSettings, session: str) -> dict:
+    """Settings as the UI sees them: whether this pool's session is stored, never the token itself."""
     out = asdict(s)
-    out["has_session"] = bool(out.pop("session_token"))
+    del out["session_token"], out["session_url"]
+    out["has_session"] = bool(session)
     return out
 
 
-def settings_from_body(body: dict, session_token: str = "") -> LauncherSettings:
-    """A body without session_token keeps the stored one (the UI never sees it to send it back)."""
+def settings_from_body(body: dict, stored: LauncherSettings) -> LauncherSettings:
+    """The session is always the stored one (the UI never sees it to send it back): a body's
+    session_token is a sign-in or sign-out, which the caller binds to the pool that issued it."""
     return LauncherSettings(
         mode=body.get("mode", "host"),
         url=body.get("url", ""),
         gpu_percent=body.get("gpu_percent", 50),
         contribute=body.get("contribute", True),
         finish=body.get("finish", "carbon"),
-        session_token=body.get("session_token", session_token),
+        session_token=stored.session_token,
+        session_url=stored.session_url,
         grant_split=body.get("grant_split", 0),
         training=body.get("training", True),
         memory_gb=body.get("memory_gb", 0),
@@ -190,7 +203,7 @@ def create_shell(launcher: Optional[Launcher] = None,
                  stream_client: Optional[httpx.AsyncClient] = None) -> FastAPI:
     launch = launcher or Launcher()
     app = FastAPI(title="/compute")
-    app.add_middleware(local_only, hosts=local_hosts(SHELL_HOST))
+    app.add_middleware(local_only, hosts=local_hosts(SHELL_HOST), port=SHELL_PORT)
     app.state.launcher = launch
     streams = stream_client or httpx.AsyncClient(timeout=STREAM_TIMEOUT)
 
@@ -255,31 +268,42 @@ def create_shell(launcher: Optional[Launcher] = None,
     def shell_info():
         return {"ok": True, "generation": SHELL_GENERATION, "proxy": "coord"}
 
+    def shown(s: LauncherSettings) -> dict:
+        return public_settings(s, launch.session_for(s))
+
+    def body_settings(body: dict) -> LauncherSettings:
+        s = settings_from_body(body, launch.load_settings())
+        if "session_token" in body:   # signed in or out: the session belongs to the pool that issued it
+            s = launch.with_session(s, str(body["session_token"] or ""))
+        return s
+
     @app.get("/api/settings")
     def get_settings():
-        return public_settings(launch.load_settings())
+        return shown(launch.load_settings())
 
     @app.post("/api/settings")
     def post_settings(body: dict):
-        s = settings_from_body(body, launch.load_settings().session_token)
+        s = body_settings(body)
         launch.save_settings(s)
-        return public_settings(s)
+        if "session_token" in body:
+            launch.rebind_session()   # what runs here now earns for the signed-in account
+        return shown(s)
 
     @app.get("/api/status")
     def status():
         snap = launch.snapshot()
-        return {**asdict(snap), **public_settings(launch.load_settings()),
+        return {**asdict(snap), **shown(launch.load_settings()),
                 "coordinator_url": launch.coordinator_url(launch.load_settings()),
                 "finishes": list(FINISHES)}
 
     @app.post("/api/start")
     def start(body: dict):
-        s = settings_from_body(body, launch.load_settings().session_token)
+        s = body_settings(body)
         try:
             snap = launch.start(s)
         except LauncherError as e:
             raise HTTPException(400, str(e)) from e
-        return {**asdict(snap), **public_settings(launch.load_settings())}
+        return {**asdict(snap), **shown(launch.load_settings())}
 
     @app.post("/api/stop")
     def stop():
@@ -295,7 +319,7 @@ def create_shell(launcher: Optional[Launcher] = None,
         s = launch.load_settings()
         snap = launch.snapshot(s)
         pool = launch.fetch_pool(launch.proxy_url(s)) if snap.coordinator_up else PoolData()
-        status = {**asdict(snap), **public_settings(s), "coordinator_url": launch.coordinator_url(s),
+        status = {**asdict(snap), **shown(s), "coordinator_url": launch.coordinator_url(s),
                   "models": MODELS, "public_url": launch.cfg.public_url or ""}
         return overview(status, pool, launch.my_node_id(), s.grant_split)
 

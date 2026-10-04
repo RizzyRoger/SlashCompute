@@ -17,6 +17,9 @@ class FakeProc:
         self.pid = pid
         self.argv = argv
 
+    def poll(self):
+        return None
+
 
 class FakeHTTP:
     def __init__(self, health=None) -> None:
@@ -47,7 +50,8 @@ def _launcher(tmp_path, health=None):
         return spawned[-1]
 
     launcher = Launcher(home=tmp_path, python="/opt/venv/bin/python", popen=popen, http=FakeHTTP(health),
-                        discover_fn=lambda timeout=5.0: None, lan_ip_fn=lambda: "192.168.1.20")
+                        discover_fn=lambda timeout=5.0: None, lan_ip_fn=lambda: "192.168.1.20",
+                        port_free_fn=lambda host, port: True)
     return launcher, spawned
 
 
@@ -182,11 +186,11 @@ def test_new_settings_round_trip_and_clamp(tmp_path):
 def test_inference_argv(tmp_path):
     launcher, _ = _launcher(tmp_path)
     argv = launcher.inference_argv("http://127.0.0.1:8765", LauncherSettings(
-        inference_memory_gb=12, inference_head=False, session_token="tok"))
+        inference_memory_gb=12, inference_head=False, session_token="tok", session_url="http://127.0.0.1:8765"))
     assert argv[:4] == ["/opt/venv/bin/python", "-m", "slashcompute.inference.node", "start"]
     assert argv[argv.index("--url") + 1] == "http://127.0.0.1:8765"
     assert argv[argv.index("--memory-gb") + 1] == "12"
-    assert "--no-head" in argv and argv[-2:] == ["--session-token", "tok"]
+    assert "--no-head" in argv and "--session-token" not in argv   # the session goes through the environment
     assert launcher.coordinator_argv("relay")[-2:] == ["--inference-transport", "relay"]
     assert "--inference-transport" not in launcher.coordinator_argv()
 

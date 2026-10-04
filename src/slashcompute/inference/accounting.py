@@ -18,6 +18,14 @@ class Accounting(Protocol):
         """The signed-in user making a chat request (None = anonymous LAN use, free)."""
         ...
 
+    def admit_node(self, session_token: Optional[str]) -> None:
+        """May a node join? Public pools take only signed-in, consenting, unbanned accounts (raises AccountingError)."""
+        ...
+
+    def require_admin(self, request: Request) -> None:
+        """Uploading/deleting models and stopping pipelines: admins only on public pools (raises AccountingError)."""
+        ...
+
     def bind_node(self, node_id: str, session_token: Optional[str]) -> None:
         """An inference node registered with its owner's session: its earnings go to that user."""
         ...
@@ -43,6 +51,12 @@ class NullAccounting:
         self.records: list[dict] = []
 
     def requester(self, request: Request) -> Optional[str]:
+        return None
+
+    def admit_node(self, session_token: Optional[str]) -> None:
+        return None
+
+    def require_admin(self, request: Request) -> None:
         return None
 
     def bind_node(self, node_id: str, session_token: Optional[str]) -> None:

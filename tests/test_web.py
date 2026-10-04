@@ -19,6 +19,9 @@ class FakeProc:
         self.pid = pid
         self.argv = argv
 
+    def poll(self):
+        return None
+
 
 class FakeHTTP:
     def __init__(self, health=None) -> None:
@@ -63,6 +66,7 @@ def _shell(tmp_path, **kw):
         http=kw.pop("http", FakeHTTP()),
         discover_fn=kw.pop("discover_fn", lambda timeout=5.0: "http://10.0.0.9:8765"),
         lan_ip_fn=lambda: "192.168.1.20",
+        port_free_fn=lambda host, port: True,
     )
     app = create_shell(launcher)
     return app, launcher, spawned
@@ -146,12 +150,17 @@ def test_shell_refuses_foreign_host_and_cross_origin_writes(tmp_path):
             assert r.status_code == 403, origin
         for path in ("/api/stop", "/api/discover", "/api/coord/auth/logout"):
             assert c.post(path, headers={"origin": "https://evil.example"}).status_code == 403
+        # Another local port is another origin (a dev server, a page from some other local app), even
+        # though it is same-site and so still gets the SameSite=Lax session cookie.
+        for origin in ("http://localhost:3000", "http://127.0.0.1:9810", "http://[::1]", "https://127.0.0.1"):
+            r = c.post("/api/stop-agent", headers={"origin": origin, "content-type": "text/plain"})
+            assert r.status_code == 403, origin
         assert not stopped
         assert launcher.load_settings().session_token == "secret-sess"
-        # The UI itself: loopback Host and Origin, any port, any loopback name.
+        # The UI itself: loopback Host with any port and loopback name; Origin on the shell's own port.
         for host in ("127.0.0.1:8766", "localhost:9810", "[::1]:8766", "localhost"):
             assert c.get("/api/shell", headers={"host": host}).status_code == 200, host
-        for origin in ("http://127.0.0.1:8766", "http://localhost:9810", "http://[::1]:8766"):
+        for origin in ("http://127.0.0.1:8766", "http://localhost:8766", "http://[::1]:8766"):
             r = c.post("/api/stop-agent", headers={"origin": origin})
             assert r.status_code == 200, origin
         assert c.post("/api/stop-agent").status_code == 200   # no Origin: not a browser
@@ -165,6 +174,7 @@ def test_shell_allows_configured_lan_bind_host(tmp_path, monkeypatch):
     with TestClient(app, base_url="http://192.168.1.20:8766") as c:
         assert c.get("/api/shell").status_code == 200
         assert c.post("/api/settings", json={}, headers={"origin": "http://192.168.1.20:8766"}).status_code == 200
+        assert c.post("/api/settings", json={}, headers={"origin": "http://192.168.1.20:3000"}).status_code == 403
         assert c.get("/api/shell", headers={"host": "evil.example"}).status_code == 403
 
 
@@ -180,6 +190,21 @@ def test_settings_never_expose_session_token(tmp_path):
         assert launcher.load_settings().session_token == "secret-sess"
         assert c.post("/api/settings", json={"session_token": ""}).json()["has_session"] is False
     assert launcher.load_settings().session_token == ""
+
+
+def test_sign_in_rebinds_running_processes_to_the_pool_that_issued_it(tmp_path):
+    app, launcher, _ = _shell(tmp_path)
+    rebinds = []
+    launcher.rebind_session = lambda: rebinds.append(launcher.session_for(launcher.load_settings()))
+    pool_a, pool_b = {"mode": "join", "url": "10.0.0.1"}, {"mode": "join", "url": "10.0.0.2"}
+    with TestClient(app, base_url=SHELL) as c:
+        assert c.post("/api/settings", json={**pool_a, "session_token": "sess"}).json()["has_session"] is True
+        assert rebinds == ["sess"]                    # the running agent and LLM node now earn for it
+        c.post("/api/settings", json={**pool_a, "gpu_percent": 30})
+        assert rebinds == ["sess"]
+        # Another pool never sees this session; coming back to the first one finds it again.
+        assert c.post("/api/settings", json=pool_b).json()["has_session"] is False
+        assert c.post("/api/settings", json=pool_a).json()["has_session"] is True
 
 
 def test_start_stop_and_discover(tmp_path, monkeypatch):
@@ -460,7 +485,11 @@ def test_live_grants_are_not_mixed_with_samples(tmp_path):
 
 # Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
 # test swaps in, so a poll can see the coordinator come and go.
+
+
 APP_JS = Path(__file__).resolve().parents[1] / "src/slashcompute/web/static/app.js"
+
+
 DOM_HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -483,10 +512,11 @@ let routes = {};
 const ctx = {
   document: { querySelector: element, querySelectorAll: () => [], addEventListener() {},
     createElement: element, body: stub(), activeElement: null },
-  window: { setInterval() {}, setTimeout() {}, clearTimeout() {} },
+  window: { setInterval() {}, setTimeout() {}, clearTimeout() {}, confirm: () => true },
   CSS: { escape: (s) => s }, navigator: stub(), XMLHttpRequest: function () {},
-  FormData: function () {}, console,
-  fetch: async (path) => {
+  FormData: function () {}, console, calls: [],
+  fetch: async (path, opts = {}) => {
+    ctx.calls.push({ path, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
     const body = routes[path.split("?")[0]];
     const ok = body !== undefined;
     return { ok, status: ok ? 200 : 404, statusText: "x",
@@ -587,6 +617,64 @@ def test_chat_shows_a_thinking_models_reasoning(tmp_path):
     assert "Ran out of tokens while thinking" in ran_out.split("Hmm")[1]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_start_hosting_stays_clickable_after_the_coordinator_fails(tmp_path):
+    """A coordinator that died (its port was taken) must not leave Start hosting disabled."""
+    def probe(st):
+        return (f'state.settings = {{ mode: "host" }}; state.ov = {{ status: {json.dumps(st)} }}; '
+                'renderPool(); [$("#p-start").disabled, $("#p-start").textContent]')
+    port = "Port 8765 is already in use — quit the other /compute or coordinator, then Start hosting."
+    cases = [
+        {"coordinator_pid": 4001, "coordinator_up": True, "last_error": ""},
+        {"coordinator_pid": None, "coordinator_up": False, "last_error": port},
+        # a status from before the launcher noticed the exit, or a pid it cannot vouch for
+        {"coordinator_pid": 4001, "coordinator_up": False, "last_error": port},
+    ]
+    phases = [{"routes": {}}] + [{"routes": {}, "run": "0", "probe": probe(st)} for st in cases]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    hosting, failed, stale = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert hosting == [True, "Hosting"]
+    assert failed == [False, "Start hosting"]
+    assert stale == [False, "Start hosting"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_contributing_pill_shows_the_running_share(tmp_path):
+    """Moving the slider while contributing saves the next share; the pills keep the live one."""
+    def probe(node):
+        ov = {"status": {"agent_running": True}, "me": {"flops": 0, **({"node": node} if node else {})}}
+        return (f'state.settings = {{ gpu_percent: 30 }}; state.ov = {json.dumps(ov)}; '
+                'renderContributions(); renderSidebar(); [$("#c-pill").textContent, $("#side-agent").textContent]')
+    phases = [{"routes": {}}] + [{"routes": {}, "run": "0", "probe": probe(n)}
+                                 for n in ({"gpu_percent": 50}, None)]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    live, unlisted = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert live == ["Contributing · 50%", "Contributing · 50%"]
+    # not in the pool's node list yet: fall back to the saved share
+    assert unlisted == ["Contributing · 30%", "Contributing · 30%"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_sign_out_after_registering_shows_sign_in(tmp_path):
+    routes = {"/api/coord/auth/logout": {}, "/api/settings": {"session_token": ""}}
+    phases = [
+        {"routes": {}},
+        {"routes": routes, "run": """
+            state.user = { id: "u1", email: "ada@example.com", accepted_terms: true };
+            actions["auth-mode"]();
+            actions.logout(null);""",
+         "probe": """[state.authMode, $("#auth-submit").textContent, $("[data-act='auth-mode']").textContent]"""},
+    ]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    assert json.loads(out.stdout.strip().splitlines()[-1])[1]["probe"] == ["login", "Sign in", "Create account"]
+
+
 def test_live_grants_flow(tmp_path):
     T = 1e12
     app, launcher, _ = _shell(tmp_path, http=GrantHTTP())
@@ -628,8 +716,6 @@ def test_live_grants_flow(tmp_path):
         assert all(g["id"] != "g3" for g in declined.json()["grants"])
 
 
-
-
 def test_grant_amounts_must_be_positive_and_finite(tmp_path):
     http = GrantHTTP()
     app, launcher, _ = _shell(tmp_path, http=http)
@@ -661,3 +747,38 @@ def test_non_finite_settings_are_clamped_not_500(tmp_path):
     body = r.json()
     assert (body["gpu_percent"], body["grant_split"], body["memory_gb"], body["inference_memory_gb"]) == \
         (50, 0, 0, 0)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_connect_moves_what_this_mac_lends_and_labels_follow_the_mode(tmp_path):
+    """Connect restarts the running agent and LLM node on the new pool (it used to only save the
+    address), and a coordinator still running here reads as Hosting only in host mode."""
+    up = {"agent_running": True, "inference_running": True, "coordinator_pid": 4001, "coordinator_up": True}
+    routes = {"/api/start": {"last_error": ""},
+              "/api/overview": {"status": {"coordinator_up": True, "coordinator_url": "http://10.0.0.8:8765"}}}
+
+    def labels(mode):
+        return (f'state.settings = {{ mode: "{mode}" }}; state.ov = {{ status: {json.dumps(up)} }}; '
+                'renderSidebar(); renderPool(); [$("#side-title").textContent, $("#p-status").innerHTML]')
+
+    def connect(confirmed):
+        return (f'calls.length = 0; window.confirm = () => {json.dumps(confirmed)}; '
+                f'state.settings = {{ mode: "join", url: "", gpu_percent: 50 }}; state.ov = {{ status: {json.dumps(up)} }}; '
+                '$("#url").value = "10.0.0.8"; actions.connect({})')
+
+    starts = 'calls.filter((c) => c.path === "/api/start").map((c) => c.body)'
+    phases = [{"routes": {}},
+              {"routes": {}, "run": "0", "probe": labels("host")},
+              {"routes": {}, "run": "0", "probe": labels("join")},
+              {"routes": routes, "run": connect(False), "probe": starts},
+              {"routes": routes, "run": connect(True), "probe": starts}]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    host, join, declined, started = [s["probe"] for s in json.loads(out.stdout.strip().splitlines()[-1])[1:]]
+    assert host[0] == "Hosting" and "hosting here" in host[1] and "Pool hosted here" not in host[1]
+    assert join[0] == "Joined" and "reachable" in join[1] and "Pool hosted here" in join[1]
+    assert declined == []   # keeping the pool hosted here: nothing changes
+    assert len(started) == 1
+    assert {k: started[0][k] for k in ("mode", "url", "training", "inference")} == {
+        "mode": "join", "url": "10.0.0.8", "training": True, "inference": True}

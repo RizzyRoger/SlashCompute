@@ -17,7 +17,8 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import AsyncIterator, Optional
 
 from slashcompute.inference import flops as fl
@@ -131,12 +132,19 @@ class PipelineManager:
 
     # ------------------------------------------------------------ planning
 
-    def plan_for(self, model_id: str, ctx: int, exclude=()) -> Plan | NoPlan:
+    def plan_for(self, model_id: str, ctx: int, exclude=(), freeing=()) -> Plan | NoPlan:
+        """Plan on the memory free now, or as if the `freeing` pipelines had already given theirs back."""
         row = registry.model_row(self.conn, model_id)
         if row is None or row["status"] != "ready":
             return NoPlan(f"model {model_id} is not ready (status {row['status'] if row else 'unknown'})")
         layout = registry.model_layout(row)
-        return plan(layout, nodes.candidates(self.conn, self.s, model_id), registry.est_out_s(layout, self.s),
+        freed = Counter()
+        for r in freeing:
+            for m in r.members:
+                freed[m.node_id] += m.full_bytes + m.kv_bytes
+        cands = [replace(c, reserved_bytes=max(0, c.reserved_bytes - freed[c.node_id]))
+                 for c in nodes.candidates(self.conn, self.s, model_id)]
+        return plan(layout, cands, registry.est_out_s(layout, self.s),
                     self.s, ctx=ctx, latency=nodes.latency_matrix(self.conn), model_key=model_id, exclude=exclude)
 
     def live(self, model_id: Optional[str] = None) -> list[Runtime]:
@@ -186,7 +194,9 @@ class PipelineManager:
                 finally:
                     for w in waits:
                         w.cancel()
-            elif idle:
+            elif idle and not isinstance(self.plan_for(model_id, ctx, exclude, freeing=idle + draining), NoPlan):
+                # evict only when the request fits once the idle pipelines are gone: one that can never
+                # fit (e.g. a huge max_tokens) must not tear down everyone else's warm pipelines first
                 log.info("evicting idle pipeline %s (%s) to make room for %s", idle[0].id, idle[0].model_id, model_id)
                 await self.stop_pipeline(idle[0].id, "evicted for another model" if idle[0].model_id != model_id
                                          else f"evicted for a larger ctx ({ctx})")
@@ -312,6 +322,33 @@ class PipelineManager:
             self._set_state(rt, "stopped", reason)
         self._stop_processes(rt)
 
+    def recover(self, reason: str = "coordinator restarted") -> None:
+        """At startup: pipelines a previous run left live have no runtime here and would hold their
+        members' memory forever. Mark them stopped and tell the members to stop their processes."""
+        live = ",".join("?" * len(nodes.LIVE_STATES))
+        rows = self.conn.execute(
+            f"SELECT m.pipeline_id, m.node_id, m.role FROM pipeline_members m JOIN pipelines p ON p.id = m.pipeline_id "
+            f"WHERE p.state IN ({live})", nodes.LIVE_STATES).fetchall()
+        with tx(self.conn):
+            n = self.conn.execute(f"UPDATE pipelines SET state='stopped', stopped_at=?, broken_reason=? "
+                                  f"WHERE state IN ({live})", (time.time(), reason, *nodes.LIVE_STATES)).rowcount
+        if n:
+            log.info("stopped %d pipeline(s) left live by a previous run (%s)", n, reason)
+        for r in rows:
+            self.bus.post(r["node_id"], f"stop_{r['role']}", {"pipeline_id": r["pipeline_id"]})
+
+    def reconcile(self, node_id: str, held: list[str]) -> None:
+        """A node reports the pipelines it holds: stop the ones not running here (left from before a
+        restart, or broken while the node was unreachable so its stop never arrived)."""
+        for pid in held:
+            rt = self.runtimes.get(pid)
+            if rt is not None and rt.state not in TERMINAL:
+                continue
+            row = self.conn.execute("SELECT role FROM pipeline_members WHERE pipeline_id=? AND node_id=?",
+                                    (pid, node_id)).fetchone()
+            for kind in [f"stop_{row['role']}"] if row else ["stop_head", "stop_worker"]:
+                self.bus.post(node_id, kind, {"pipeline_id": pid})
+
     async def on_node_offline(self, node_id: str, name: str = "") -> None:
         """A node missed its heartbeats: break its pipelines and lower its reliability if it dropped
         out of a pipeline (live, or broken moments ago by the head losing it)."""
@@ -396,7 +433,8 @@ class PipelineManager:
             self.streams.close(job_id)
 
     def gen_weight_for(self, model_id: str) -> float:
-        """The generation weight a request for this model would get now (used to size reservations)."""
+        """The generation weight a request for this model would get now (shown by /plan; reservations
+        use GEN_WEIGHT_MAX, the only bound on what a request can be charged)."""
         rt = next((r for r in self.live(model_id) if r.prompt_tps_ema), None)
         if rt is None:
             return self.s.GEN_WEIGHT_DEFAULT
@@ -429,7 +467,7 @@ class PipelineManager:
                 "UPDATE jobs SET state=?, prompt_n=?, cache_n=?, predicted_n=?, flops=?, gen_weight=?, tok_s=?, "
                 "output_head=?, finished_at=? WHERE id=?",
                 (state, prompt_n, cache_n, predicted_n, total, w, g_tps, json.dumps(output_head), time.time(), job_id))
-            if g_tps:
+            if g_tps and predicted_n >= s.GEN_WEIGHT_MIN_PREDICTED:  # a 1-token reply "runs" at ~1e6 tok/s
                 self.conn.execute("UPDATE pipelines SET live_tok_s=? WHERE id=?", (g_tps, rt.id))
         names = nodes.node_names(self.conn)
         return {
@@ -457,7 +495,22 @@ class PipelineManager:
 
 
 def estimate_prompt_tokens(body: dict) -> int:
+    """Typical prompt length (~4 bytes per token): what a disconnected requester is charged for its prompt."""
     return max(8, len(json.dumps(body.get("messages", ""))) // 4)
+
+
+TEMPLATE_TOKENS_PER_MESSAGE = 16   # role markers, separators, a tokenizer's leading-space token
+TEMPLATE_TOKENS_FIXED = 64         # generation prompt, a template's default system prompt
+
+
+def prompt_token_bound(body: dict) -> int:
+    """Upper bound on the prompt's tokens (sizes the context and the credit reservation): every token of a
+    byte-level BPE or byte-fallback vocabulary is at least one byte, so the UTF-8 length of the messages
+    and tools (as JSON, which only adds bytes) plus the chat template's markers can't be exceeded."""
+    messages = body.get("messages") or []
+    text = json.dumps([messages, body.get("tools") or []], ensure_ascii=False)
+    n = len(messages) if isinstance(messages, list) else 1
+    return len(text.encode("utf-8", "surrogatepass")) + TEMPLATE_TOKENS_PER_MESSAGE * n + TEMPLATE_TOKENS_FIXED
 
 
 def new_job(conn, model_id: str, requester_id: Optional[str], body: dict, stream: bool, attempt: int = 1,

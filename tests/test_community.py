@@ -9,6 +9,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import select
 from starlette.websockets import WebSocketDisconnect
 
 from slashcompute.common import protocol as P
@@ -18,6 +19,8 @@ from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
+from slashcompute.coordinator.db import User
+from slashcompute.coordinator.inference_accounting import CoreAccounting
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
 
@@ -466,6 +469,22 @@ def test_welcome_credit_backfilled_on_login(env):
     assert len(_welcome_rows(client, token)) == 1
 
 
+def test_welcome_credit_backfilled_for_a_stored_session(env):
+    # Upgraded while signed in: the app keeps polling /auth/me and never signs in again.
+    client, core, *_ = env
+    user, token = _account(core.auth, "kept@lan.test")
+    assert core.credits.balance(user.id) == 0.0
+    for _ in range(3):
+        me = client.get("/auth/me", headers=_hdr(token)).json()
+    assert me["credits"]["balance"] == WELCOME_FLOPS
+    assert len(_welcome_rows(client, token)) == 1
+
+    banned, banned_token = _account(core.auth, "ban@lan.test")
+    core.auth.set_banned(banned, True)
+    client.get("/auth/me", headers=_hdr(banned_token))
+    assert core.credits.balance(banned.id) == 0.0
+
+
 def test_welcome_credit_on_google_sign_in(env, monkeypatch):
     client, core, *_ = env
     monkeypatch.setenv("SLASHCOMPUTE_GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
@@ -684,6 +703,78 @@ def test_last_step_mints_only_charged_flops(core):
     assert job.row.error == "FLOP budget spent"
 
 
+def _ledger_total(core):
+    """Every FLOP in the book: all balances (pot included) plus reservations still in flight."""
+    with core.db.session() as s:
+        ids = [u.id for u in s.exec(select(User)).all()] + [POT_ID]
+    return sum(core.credits.balance(i) + core.credits.reserved_in_flight(i) for i in ids)
+
+
+def _host_and_chatter(core):
+    host, host_tok = _account(core.auth, "host@lan.test", name="Host")
+    chatter, _ = _account(core.auth, "bea@lan.test", name="Bea")
+    core.auth.accept_terms(host)
+    core.auth.accept_terms(chatter)
+    core.credits.contribute(chatter.id, 1e12, 0)
+    return host, host_tok, chatter
+
+
+@pytest.mark.parametrize("banned", [False, True])
+def test_inference_share_without_eligible_host_goes_to_pot(core, banned):
+    host, host_tok, chatter = _host_and_chatter(core)
+    acct = CoreAccounting(core)
+    if banned:
+        acct.bind_node("n1", host_tok)
+        core.auth.set_banned(host, True)
+    core.credits.reserve_job(chatter.id, "chat-1", 1e12)
+    before = _ledger_total(core)
+
+    acct.record("chat-1", {"n1": 4.64e11}, tokens=10, wall_s=1.0)
+
+    assert core.credits.lifetime_spent(chatter.id) == pytest.approx(4.64e11)
+    assert core.credits.lifetime_earned(host.id) == 0.0
+    assert core.credits.balance(POT_ID) == pytest.approx(4.64e11)
+    assert _ledger_total(core) == pytest.approx(before)
+
+
+@pytest.mark.parametrize("banned", [False, True])
+def test_training_share_without_eligible_host_goes_to_pot(core, banned):
+    tiny_model, tiny_dataset = core._tiny
+    host, host_tok, chatter = _host_and_chatter(core)
+    job = core.submit(_spec(tiny_model, tiny_dataset))
+    core.credits.reserve_job(chatter.id, job.id, 5e9)
+    job.current = EpochState(epoch=1, plans=[])
+    job.row.status = "running"
+
+    async def send(_):
+        return None
+
+    asyncio.run(core.on_register(P.Register(
+        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
+        data_port=9700, gpu_percent=50, session_token=host_tok if banned else None,
+    ), send))
+    if banned:
+        core.auth.set_banned(host, True)
+    before = _ledger_total(core)
+    asyncio.run(core._on_step("n1", P.StepMetrics(
+        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
+        in_digest="in", out_digest="out", usage=_usage(1e9),
+    )))
+    assert core.credits.lifetime_spent(chatter.id) == pytest.approx(1e9)
+    assert core.credits.lifetime_earned(host.id) == 0.0
+    assert core.credits.balance(POT_ID) == pytest.approx(1e9)
+    assert _ledger_total(core) == pytest.approx(before)
+
+
+def test_leaderboard_excludes_banned(core):
+    a, _ = _account(core.auth, "a@lan.test", name="A")
+    b, _ = _account(core.auth, "b@lan.test", name="B")
+    core.credits.contribute(a.id, 10.0, 0)
+    core.credits.contribute(b.id, 50.0, 0)
+    core.auth.set_banned(b, True)
+    assert [r["user_id"] for r in core.credits.leaderboard()] == [a.id]
+
+
 def test_session_without_max_flops_abandons_job(env):
     client, core, tiny_model, tiny_dataset = env
     token = client.post("/auth/register", json={
@@ -818,6 +909,23 @@ def test_http_community_lists_live_and_admin(env):
     assert flags[0]["user_id"] == member.id
     assert flags[0]["reason"] == "spam"
     assert client.get("/admin/flags", headers=_hdr(member_tok)).status_code == 403
+
+
+def test_my_nodes_shows_live_inference_nodes_online(env):
+    client, core, _, _ = env
+    token = client.post("/auth/register", json={
+        "email": "host@lan.test", "password": "password1", "name": "Host",
+    }).json()["token"]
+    user = core.auth.user_from_token(token)
+    inference = client.app.state.inference
+    for node_id, beat in [("inf-live", time.time()), ("inf-gone", time.time() - 3600)]:
+        inference.conn.execute("INSERT INTO nodes (id, name, last_heartbeat, created_at) VALUES (?,?,?,?)",
+                               (node_id, node_id, beat, beat))
+        core.credits.bind_node(node_id, user.id)
+    nodes = {n["node_id"]: n for n in client.get("/auth/me/nodes", headers=_hdr(token)).json()}
+    assert nodes["inf-live"] == {"node_id": "inf-live", "user_id": user.id, "online": True,
+                                 "status": "idle", "gpu_percent": None}
+    assert nodes["inf-gone"]["online"] is False and nodes["inf-gone"]["status"] is None
 
 
 def test_http_comment_only_on_grants_you_can_view(env):

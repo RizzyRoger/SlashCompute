@@ -27,6 +27,7 @@ class InferenceSettings:
     MAX_PIPELINE_NODES: int = 5
     PLANNER_TOP_CANDIDATES: int = 10
     DEFAULT_CTX: int = 4096
+    MAX_CTX: int = 131072                 # context ceiling for models whose GGUF doesn't state one
     KV_BYTES_PER_ELEMENT: int = 2
     COMPUTE_BUFFER_FRACTION: float = 0.10
     COMPUTE_BUFFER_FIXED_BYTES: int = 1 * GIB
@@ -57,6 +58,7 @@ class InferenceSettings:
     GEN_WEIGHT_DEFAULT: float = 10.0
     GEN_WEIGHT_MAX: float = 50.0
     GEN_WEIGHT_MIN_PROMPT: int = 64       # prompts shorter than this give a noisy prompt tok/s
+    GEN_WEIGHT_MIN_PREDICTED: int = 16    # replies shorter than this give a noisy generation tok/s
     GEN_WEIGHT_EMA: float = 0.3
 
     # ------------------------------------------------------------ service

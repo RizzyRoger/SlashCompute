@@ -6,14 +6,23 @@ from pathlib import Path
 import pytest
 
 from slashcompute.launcher.controller import (
-    Launcher, LauncherError, LauncherSettings, health_timeout, normalize_url,
+    Launcher, LauncherError, LauncherSettings, health_timeout, launch_record, normalize_url,
 )
 
 
 class FakeProc:
-    def __init__(self, pid: int, argv: list[str]) -> None:
+    def __init__(self, pid: int, argv: list[str], env: dict | None = None) -> None:
         self.pid = pid
         self.argv = argv
+        self.env = env or {}
+        self.returncode = None   # set to make the process "exit"
+
+    @property
+    def session(self) -> str:
+        return self.env.get("SLASHCOMPUTE_SESSION", "")
+
+    def poll(self):
+        return self.returncode
 
 
 class FakeResponse:
@@ -41,9 +50,9 @@ def _launcher(tmp_path: Path, **kw) -> Launcher:
     spawned: list[FakeProc] = []
     next_pid = {"n": 4000}
 
-    def popen(argv, **_kw):
+    def popen(argv, **kw):
         next_pid["n"] += 1
-        proc = FakeProc(next_pid["n"], argv)
+        proc = FakeProc(next_pid["n"], argv, kw.get("env"))
         spawned.append(proc)
         return proc
 
@@ -54,9 +63,15 @@ def _launcher(tmp_path: Path, **kw) -> Launcher:
         http=kw.pop("http", FakeHTTP()),
         discover_fn=kw.pop("discover_fn", lambda timeout=5.0: None),
         lan_ip_fn=kw.pop("lan_ip_fn", lambda: "192.168.1.20"),
+        port_free_fn=kw.pop("port_free_fn", lambda host, port: True),
     )
     launcher._spawned = spawned  # type: ignore[attr-defined]
     return launcher
+
+
+def _signed_in(launcher: Launcher, token: str, **kw) -> LauncherSettings:
+    """Settings holding `token`, issued by the pool they point at."""
+    return launcher.with_session(LauncherSettings(**kw), token)
 
 
 def test_normalize_url():
@@ -105,9 +120,6 @@ def test_coordinator_and_agent_argv(tmp_path):
         "--url", "http://192.168.1.20:8765", "--gpu-percent", "40",
         "--home", str(tmp_path),
     ]
-    assert "--session-token" in launcher.agent_argv(
-        "http://192.168.1.20:8765", 40, session_token="tok",
-    )
 
 
 def test_host_url_uses_lan_ip(tmp_path):
@@ -147,9 +159,155 @@ def test_start_host_spawns_coordinator_and_agent(tmp_path, monkeypatch):
     assert "--url" in argv_lists[1] and "127.0.0.1" in argv_lists[1][argv_lists[1].index("--url") + 1]
     assert "--no-sandbox" not in argv_lists[1]
     assert (tmp_path / "coordinator.pid").read_text().strip() == str(launcher._spawned[0].pid)
-    assert json.loads((tmp_path / "agent.args").read_text()) == argv_lists[1]
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(argv_lists[1], "")
     assert stat.S_IMODE((tmp_path / "agent.args").stat().st_mode) == 0o600
     assert snap.last_error == ""
+
+
+BIND_ERROR = (b"ERROR:    [Errno 48] error while attempting to bind on address ('0.0.0.0', 8765): "
+              b"[errno 48] address already in use\n")
+
+
+def test_coordinator_that_cannot_bind_is_reported_and_hosting_can_be_retried(tmp_path, monkeypatch):
+    # Another coordinator held :8765 but did not answer /health: ours logged the bind error and
+    # exited 3. The launcher used to keep reporting its (zombie) pid with no error, so Start
+    # hosting stayed disabled and the pool offline for good.
+    launcher = _launcher(tmp_path)
+    spawn = launcher._popen
+
+    def dies_on_bind(argv, **kw):
+        proc = spawn(argv, **kw)
+        kw["stdout"].write(BIND_ERROR)
+        proc.returncode = 3
+        return proc
+
+    launcher._popen = dies_on_bind
+    # An exited child nobody reaped still answers kill(0).
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive",
+                        lambda pid: any(p.pid == pid for p in launcher._spawned))  # type: ignore[attr-defined]
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    snap = launcher.snapshot()
+    assert snap.coordinator_pid is None and not (tmp_path / "coordinator.pid").exists()
+    assert snap.last_error == ("Port 8765 is already in use — quit the other /compute or coordinator, "
+                               "then Start hosting.")
+    assert "address already in use" in (tmp_path / "logs" / "coordinator.log").read_text()
+
+    launcher._popen = spawn   # the other app quit: Start hosting works again
+    launcher.poll_health = lambda url: {"ok": True} if len(launcher._spawned) == 2 else None  # type: ignore
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert len(launcher._spawned) == 2  # type: ignore[attr-defined]
+    assert snap.coordinator_pid == launcher._spawned[1].pid and snap.last_error == ""  # type: ignore
+
+
+def test_coordinator_exit_reports_the_end_of_its_log_but_a_stop_does_not(tmp_path, monkeypatch):
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: None)
+    launcher = _launcher(tmp_path)
+    (launcher.log_dir / "coordinator.log").write_bytes(BIND_ERROR)   # an earlier run's failure
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    launcher.start(LauncherSettings(mode="host", contribute=False))
+    with open(tmp_path / "logs" / "coordinator.log", "ab") as fh:
+        fh.write(b"Traceback (most recent call last):\nModuleNotFoundError: No module named 'zeroconf'\n")
+    launcher._spawned[0].returncode = 1  # type: ignore[attr-defined]
+    launcher.poll_health = lambda url: None  # type: ignore
+    snap = launcher.snapshot()
+    assert snap.coordinator_pid is None
+    assert snap.last_error.startswith("The coordinator exited with code 1: ")
+    assert "No module named 'zeroconf'" in snap.last_error and "Port" not in snap.last_error
+
+    launcher.poll_health = lambda url: {"ok": True} if len(launcher._spawned) == 2 else None  # type: ignore
+    assert launcher.start(LauncherSettings(mode="host", contribute=False)).last_error == ""
+    launcher.poll_health = lambda url: None  # type: ignore
+    launcher.stop()
+    launcher._spawned[-1].returncode = -signal.SIGTERM  # type: ignore[attr-defined]
+    assert launcher.snapshot().last_error == ""
+
+
+def test_start_hosting_on_a_taken_port(tmp_path):
+    # Something else answers no /health on :8765: say so instead of spawning a coordinator that dies.
+    launcher = _launcher(tmp_path, port_free_fn=lambda host, port: False)
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    # A coordinator that answers on loopback (not the LAN address) is used as it is.
+    launcher.poll_health = lambda url: {"ok": True} if "127.0.0.1" in url else None  # type: ignore
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == [] and snap.last_error == ""  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def stray_coordinator(tmp_path):
+    """A process that looks like our coordinator (serve --home tmp_path) but has no coordinator.pid."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                             "slashcompute.coordinator.main", "serve", "--home", str(tmp_path)])
+    yield proc
+    proc.kill()
+    proc.wait()
+
+
+def test_hosting_asks_loopback_and_stop_stops_our_coordinator_without_its_pid_file(
+        tmp_path, stray_coordinator):
+    # Our coordinator answered only on loopback (bound to 127.0.0.1, or the LAN reply was slow):
+    # Start spawned a duplicate that overwrote coordinator.pid and died, then Stop left ours up.
+    http = FakeHTTP({"ok": True})
+    launcher = _launcher(tmp_path, http=http)
+    snap = launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert http.urls[0] == "http://127.0.0.1:8765/health"
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    assert snap.coordinator_pid == stray_coordinator.pid   # re-recorded from its command line
+    (tmp_path / "coordinator.pid").unlink()
+    launcher.stop()
+    assert stray_coordinator.wait(timeout=10) == -signal.SIGTERM
+
+
+def test_start_never_spawns_over_our_coordinator_that_is_slow_to_answer(tmp_path, stray_coordinator):
+    launcher = _launcher(tmp_path)
+    launcher.wait_health = lambda url, timeout=8.0: False  # type: ignore[method-assign]
+    launcher.start(LauncherSettings(mode="host", contribute=False))
+    assert launcher._spawned == []  # type: ignore[attr-defined]
+    assert launcher.read_coordinator_pid() == stray_coordinator.pid
+
+
+def test_coordinator_pid_file_of_a_zombie_or_reused_pid_is_not_hosting(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    launcher = _launcher(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while psutil.Process(child.pid).status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (tmp_path / "coordinator.pid").write_text(f"{child.pid}\n")
+        assert launcher.read_coordinator_pid() is None
+        assert not (tmp_path / "coordinator.pid").exists()
+    finally:
+        child.wait()
+    (tmp_path / "coordinator.pid").write_text(f"{os.getpid()}\n")
+    assert launcher.read_coordinator_pid() == os.getpid()
+    os.utime(tmp_path / "coordinator.pid", (0, 0))   # recorded long before this process began
+    assert launcher.read_coordinator_pid() is None
+
+
+def test_port_free_sees_a_listener():
+    import socket
+
+    from slashcompute.launcher.controller import port_free
+
+    with socket.socket() as s:
+        s.bind(("0.0.0.0", 0))
+        s.listen()
+        port = s.getsockname()[1]
+        assert port_free("0.0.0.0", port) is False
+    assert port_free("0.0.0.0", port) is True
 
 
 def test_start_host_without_contribute_skips_agent(tmp_path):
@@ -169,10 +327,10 @@ def test_start_hosting_keeps_this_macs_agent_and_llm_node(tmp_path, monkeypatch)
     settings = LauncherSettings(mode="host", contribute=True, training=True, inference=True)
     local = launcher.proxy_url(settings)
     launcher.paths.pid_file.write_text("77\n")
-    (tmp_path / "agent.args").write_text(json.dumps(launcher.agent_argv(local, 50, "", 0)))
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv(local, 50), "")))
     launcher.inference_pid_path.parent.mkdir(parents=True, exist_ok=True)
     launcher.inference_pid_path.write_text("88\n")
-    (tmp_path / "inference.args").write_text(json.dumps(launcher.inference_argv(local, settings)))
+    (tmp_path / "inference.args").write_text(json.dumps(launch_record(launcher.inference_argv(local, settings), "")))
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
                         lambda paths: pytest.fail("hosting should not stop the training agent"))
@@ -197,10 +355,11 @@ def test_start_hosting_keeps_this_macs_agent_and_llm_node(tmp_path, monkeypatch)
 def test_start_restarts_agent_when_effective_arguments_change(
     tmp_path, monkeypatch, old_token, new_url, new_gpu, new_token,
 ):
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
     http = FakeHTTP({"ok": True, "nodes": 0, "jobs": 0})
     launcher = _launcher(tmp_path, http=http)
     (tmp_path / "agent" / "agent.pid").write_text("77\n")
-    old_args = launcher.agent_argv("http://10.0.0.1:8765", 50, old_token)
+    old_args = launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), old_token)
     (tmp_path / "agent.args").write_text(json.dumps(old_args))
     running = {77: True}
     stopped = []
@@ -216,14 +375,13 @@ def test_start_restarts_agent_when_effective_arguments_change(
 
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", alive)
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop", stop)
-    snap = launcher.start(LauncherSettings(
-        mode="join", url=new_url, gpu_percent=new_gpu, session_token=new_token,
-    ))
+    snap = launcher.start(_signed_in(launcher, new_token, mode="join", url=new_url, gpu_percent=new_gpu))
     spawned = launcher._spawned  # type: ignore[attr-defined]
     assert stopped == [77]
     assert len(spawned) == 1
-    assert spawned[0].argv == launcher.agent_argv(new_url, new_gpu, new_token)
-    assert json.loads((tmp_path / "agent.args").read_text()) == spawned[0].argv
+    assert spawned[0].argv == launcher.agent_argv(new_url, new_gpu)
+    assert spawned[0].session == new_token
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(spawned[0].argv, new_token)
     assert snap.last_error == ""
 
 
@@ -235,13 +393,10 @@ def test_agent_restart_compares_effective_environment_session(
     tmp_path, monkeypatch, explicit_token, expected_token, should_restart,
 ):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
-    settings = LauncherSettings(
-        mode="join", url="http://10.0.0.1:8765", session_token=explicit_token,
-    )
+    settings = _signed_in(launcher, explicit_token, mode="join", url="http://10.0.0.1:8765")
     monkeypatch.setenv("SLASHCOMPUTE_SESSION", "old-environment-token")
     launcher.start(settings)
-    old_args = launcher._spawned[0].argv
-    assert old_args[-2:] == ["--session-token", explicit_token or "old-environment-token"]
+    assert launcher._spawned[0].session == (explicit_token or "old-environment-token")
     launcher.paths.pid_file.write_text("77\n")
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
     stopped = []
@@ -259,46 +414,49 @@ def test_agent_restart_compares_effective_environment_session(
 
     assert stopped == ([77] if should_restart else [])
     assert len(launcher._spawned) == (2 if should_restart else 1)
-    assert launcher._spawned[-1].argv[-2:] == ["--session-token", expected_token]
-    assert json.loads((tmp_path / "agent.args").read_text()) == launcher._spawned[-1].argv
+    assert launcher._spawned[-1].session == expected_token
+    assert "--session-token" not in launcher._spawned[-1].argv   # argv shows in ps
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(
+        launcher._spawned[-1].argv, expected_token)
     assert stat.S_IMODE((tmp_path / "agent.args").stat().st_mode) == 0o600
 
 
 def test_start_when_already_up_is_noop(tmp_path, monkeypatch):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 1, "jobs": 0}))
     (tmp_path / "agent" / "agent.pid").write_text("77\n")
-    argv = launcher.agent_argv("http://10.0.0.1:8765", 100, "tok")
-    (tmp_path / "agent.args").write_text(json.dumps(argv))
+    argv = launcher.agent_argv("http://10.0.0.1:8765", 100)
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(argv, "tok")))
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
                         lambda paths: pytest.fail("unchanged agent should not stop"))
-    snap = launcher.start(LauncherSettings(
-        mode="join", url="http://10.0.0.1:8765/", gpu_percent=999, session_token="tok",
-    ))
+    snap = launcher.start(_signed_in(launcher, "tok", mode="join", url="http://10.0.0.1:8765/", gpu_percent=999))
     assert launcher._spawned == []  # type: ignore[attr-defined]
     assert snap.agent_running and snap.last_error == ""
 
 
-@pytest.mark.parametrize("args_text", [None, "not-json"])
+@pytest.mark.parametrize("args_text", [None, "not-json", "argv"])
 def test_start_restarts_agent_with_unknown_previous_arguments(tmp_path, monkeypatch, args_text):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.paths.pid_file.write_text("77\n")
-    # Launchers before agent.args recorded only the bound session.
+    settings = _signed_in(launcher, "tok", mode="host")
+    # Launchers before agent.args recorded only the bound session; later ones the bare argv, token included.
     (tmp_path / "agent.session").write_text("tok")
+    if args_text == "argv":
+        args_text = json.dumps(launcher.agent_argv(launcher.proxy_url(settings), 50) + ["--session-token", "tok"])
     if args_text is not None:
         (tmp_path / "agent.args").write_text(args_text)
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop",
                         lambda paths: paths.clear_pid())
-    launcher.start(LauncherSettings(mode="host", session_token="tok"))
+    launcher.start(settings)
     assert len(launcher._spawned) == 1
-    assert json.loads((tmp_path / "agent.args").read_text()) == launcher._spawned[0].argv
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(launcher._spawned[0].argv, "tok")
 
 
 def test_agent_restart_waits_for_graceful_stop_and_reports_timeout(tmp_path, monkeypatch):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.paths.pid_file.write_text("77\n")
-    old_args = launcher.agent_argv("http://10.0.0.1:8765", 50, "tok")
+    old_args = launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "tok")
     (tmp_path / "agent.args").write_text(json.dumps(old_args))
     stopped = []
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
@@ -307,7 +465,7 @@ def test_agent_restart_waits_for_graceful_stop_and_reports_timeout(tmp_path, mon
     times = iter([0.0, 0.0, 4.0])
     monkeypatch.setattr("slashcompute.launcher.controller.time.monotonic", lambda: next(times))
     monkeypatch.setattr("slashcompute.launcher.controller.time.sleep", lambda seconds: None)
-    settings = LauncherSettings(mode="join", url="http://10.0.0.2:8765", session_token="tok")
+    settings = _signed_in(launcher, "tok", mode="join", url="http://10.0.0.2:8765")
 
     snap = launcher.start(settings)
 
@@ -321,8 +479,8 @@ def test_agent_restart_waits_for_graceful_stop_and_reports_timeout(tmp_path, mon
     launcher.paths.clear_pid()
     snap = launcher.start(settings)
     assert len(launcher._spawned) == 1
-    assert launcher._spawned[0].argv == launcher.agent_argv(settings.url, 50, "tok")
-    assert json.loads((tmp_path / "agent.args").read_text()) == launcher._spawned[0].argv
+    assert launcher._spawned[0].argv == launcher.agent_argv(settings.url, 50)
+    assert json.loads((tmp_path / "agent.args").read_text()) == launch_record(launcher._spawned[0].argv, "tok")
     assert snap.last_error == ""
 
 
@@ -355,6 +513,35 @@ def test_unreachable_error_clears_once_the_coordinator_answers(tmp_path):
     assert launcher.last_error == ""
 
 
+def test_switching_pool_drops_the_old_pools_error(tmp_path):
+    launcher = _launcher(tmp_path, port_free_fn=lambda host, port: False)
+    with pytest.raises(LauncherError, match="Port 8765 is already in use"):
+        launcher.start(LauncherSettings(mode="host", contribute=False))
+    launcher.save_settings(LauncherSettings(mode="host", gpu_percent=80))   # same pool: still true
+    assert launcher.snapshot().last_error.startswith("Port 8765 is already in use")
+    launcher.save_settings(LauncherSettings(mode="join", url="http://10.0.0.8:8765"))
+    assert launcher.snapshot().last_error == ""   # nothing answers there yet, but it was never hosting
+
+
+def test_join_stops_the_pool_hosted_here_and_moves_the_agent(tmp_path, monkeypatch):
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr("slashcompute.launcher.controller.os.kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: True)
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", lambda paths: paths.clear_pid())
+    launcher = _launcher(tmp_path)
+    launcher.poll_health = lambda url: {"ok": True} if launcher._spawned else None  # type: ignore
+    launcher.start(LauncherSettings(mode="host", contribute=True))
+    coord, agent = launcher._spawned  # type: ignore[attr-defined]
+    launcher.paths.pid_file.write_text(f"{agent.pid}\n")
+
+    snap = launcher.start(LauncherSettings(mode="join", url="http://10.0.0.8:8765", training=True))
+    assert (coord.pid, signal.SIGTERM) in kills
+    moved = launcher._spawned[-1].argv  # type: ignore[attr-defined]
+    assert moved[2] == "slashcompute.agent.main" and moved[moved.index("--url") + 1] == "http://10.0.0.8:8765"
+    coord.returncode = -signal.SIGTERM   # the stop we asked for is not an error
+    assert launcher.snapshot().last_error == snap.last_error == ""
+
+
 def test_reachable_coordinator_keeps_other_errors(tmp_path):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     launcher.last_error = "Training agent is still stopping. Settings have not been applied."
@@ -364,7 +551,7 @@ def test_reachable_coordinator_keeps_other_errors(tmp_path):
 def test_start_public_requires_url_and_token(tmp_path):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True}))
     with pytest.raises(LauncherError, match="public coordinator URL"):
-        launcher.start(LauncherSettings(mode="public", url="", session_token="tok"))
+        launcher.start(_signed_in(launcher, "tok", mode="public", url=""))
     with pytest.raises(LauncherError, match="Sign in first"):
         launcher.start(LauncherSettings(mode="public", url="https://pool.example.com"))
     assert launcher._spawned == []  # type: ignore[attr-defined]
@@ -374,16 +561,102 @@ def test_start_public_does_not_spawn_coordinator(tmp_path, monkeypatch):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 0, "jobs": 0}))
     monkeypatch.setattr("slashcompute.launcher.controller.process_alive",
                         lambda pid: any(p.pid == pid for p in launcher._spawned))
-    snap = launcher.start(LauncherSettings(
-        mode="public", url="https://pool.example.com", session_token="tok",
-        contribute=True,
-    ))
+    snap = launcher.start(_signed_in(launcher, "tok", mode="public", url="https://pool.example.com",
+                                     contribute=True))
     kinds = [p.argv[2] for p in launcher._spawned]  # type: ignore[attr-defined]
     assert kinds == ["slashcompute.agent.main"]
     assert snap.coordinator_pid is None
     agent = launcher._spawned[0].argv  # type: ignore[attr-defined]
     assert agent[agent.index("--url") + 1] == "https://pool.example.com"
-    assert agent[agent.index("--session-token") + 1] == "tok"
+    assert launcher._spawned[0].session == "tok"  # type: ignore[attr-defined]
+
+
+def _running(launcher: Launcher, monkeypatch) -> dict:
+    """Spawned agents and LLM nodes stay up until stopped through the launcher."""
+    alive: dict[int, bool] = {}
+    monkeypatch.setattr("slashcompute.launcher.controller.process_alive", lambda pid: alive.get(pid, False))
+
+    def popen(argv, **kw):
+        proc = FakeProc(4000 + len(launcher._spawned) + 1, argv, kw.get("env"))  # type: ignore[attr-defined]
+        launcher._spawned.append(proc)  # type: ignore[attr-defined]
+        alive[proc.pid] = True
+        if argv[2] == "slashcompute.agent.main":
+            launcher.paths.pid_file.write_text(f"{proc.pid}\n")
+        else:
+            launcher.inference_pid_path.parent.mkdir(parents=True, exist_ok=True)
+            launcher.inference_pid_path.write_text(f"{proc.pid}\n")
+        return proc
+
+    def stop_agent(paths):
+        alive[paths.read_pid()] = False
+        paths.clear_pid()
+
+    launcher._popen = popen
+    monkeypatch.setattr("slashcompute.launcher.controller.request_stop", stop_agent)
+    monkeypatch.setattr(launcher, "_stop_inference",
+                        lambda wait=0.0: alive.update({launcher.read_inference_pid(): False}))
+    monkeypatch.delenv("SLASHCOMPUTE_SESSION", raising=False)
+    return alive
+
+
+def test_sign_in_rebinds_the_running_agent_and_llm_node(tmp_path, monkeypatch):
+    # Signing in while contributing must reach the processes already running, not the next Start.
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 0, "jobs": 0}))
+    _running(launcher, monkeypatch)
+    pool = "http://10.0.0.1:8765"
+    launcher.start(LauncherSettings(mode="join", url=pool, inference=True))
+    first = list(launcher._spawned)  # type: ignore[attr-defined]
+    assert [p.session for p in first] == ["", ""]
+
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), "tok"))
+    launcher.rebind_session()
+    rebound = launcher._spawned[2:]  # type: ignore[attr-defined]
+    assert [p.argv for p in rebound] == [p.argv for p in first]   # same pool and settings, new session
+    assert [p.session for p in rebound] == ["tok", "tok"]
+    assert all("tok" not in arg for p in rebound for arg in p.argv)  # never on the command line
+    for name in ("agent.args", "inference.args", "launcher.json"):
+        assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o600, name
+
+    launcher.rebind_session()   # nothing changed: nothing restarts
+    assert len(launcher._spawned) == 4  # type: ignore[attr-defined]
+
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), ""))   # sign out
+    launcher.rebind_session()
+    assert [p.session for p in launcher._spawned[4:]] == ["", ""]  # type: ignore[attr-defined]
+
+
+def test_a_session_is_only_ever_sent_to_the_pool_that_issued_it(tmp_path, monkeypatch):
+    launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 0, "jobs": 0}))
+    _running(launcher, monkeypatch)
+    a, b = "https://a.example.com", "https://b.example.com"
+    launcher.save_settings(_signed_in(launcher, "tok-a", mode="public", url=a))
+    launcher.start(launcher.load_settings())
+    assert launcher._spawned[-1].session == "tok-a"  # type: ignore[attr-defined]
+
+    to_b = launcher.load_settings()
+    to_b.url = b
+    with pytest.raises(LauncherError, match="Sign in first"):
+        launcher.start(to_b)
+    to_b.mode, to_b.url = "join", "http://10.0.0.2:8765"
+    launcher.start(to_b)
+    assert launcher._spawned[-1].session == ""  # type: ignore[attr-defined]
+
+    # Signing out of B leaves A's session; going back to A uses it again.
+    launcher.save_settings(launcher.with_session(launcher.load_settings(), ""))
+    back = launcher.load_settings()
+    back.mode, back.url = "public", a
+    launcher.start(back)
+    assert launcher._spawned[-1].session == "tok-a"  # type: ignore[attr-defined]
+
+
+def test_a_session_stored_before_pools_were_tracked_stays_with_its_pool(tmp_path):
+    launcher = _launcher(tmp_path)
+    (tmp_path / "launcher.json").write_text(json.dumps(
+        {"mode": "public", "url": "https://a.example.com", "session_token": "tok"}))
+    s = launcher.load_settings()
+    assert launcher.session_for(s) == "tok"
+    s.url = "https://b.example.com"
+    assert launcher.session_for(s) == ""
 
 
 def test_find_on_lan(tmp_path):
@@ -465,13 +738,13 @@ def test_memory_setting_round_trips_clamps_and_reaches_the_agent(tmp_path):
     assert LauncherSettings(memory_gb="lots").clamp().memory_gb == 0
     assert LauncherSettings(memory_gb=-3).clamp().memory_gb == 0
     assert "--max-memory-gb" not in launcher.agent_argv("http://10.0.0.1:8765", 50)       # 0 = automatic
-    assert launcher.agent_argv("http://10.0.0.1:8765", 50, "", 6)[-2:] == ["--max-memory-gb", "6"]
+    assert launcher.agent_argv("http://10.0.0.1:8765", 50, 6)[-2:] == ["--max-memory-gb", "6"]
 
 
 def test_changing_memory_restarts_the_running_agent(tmp_path, monkeypatch):
     launcher = _launcher(tmp_path, http=FakeHTTP({"ok": True, "nodes": 0, "jobs": 0}))
     (tmp_path / "agent" / "agent.pid").write_text("77\n")
-    (tmp_path / "agent.args").write_text(json.dumps(launcher.agent_argv("http://10.0.0.1:8765", 50)))
+    (tmp_path / "agent.args").write_text(json.dumps(launch_record(launcher.agent_argv("http://10.0.0.1:8765", 50), "")))
     running = {77: True}
     stopped = []
 
@@ -485,7 +758,7 @@ def test_changing_memory_restarts_the_running_agent(tmp_path, monkeypatch):
     monkeypatch.setattr("slashcompute.launcher.controller.request_stop", stop)
     launcher.start(LauncherSettings(mode="join", url="http://10.0.0.1:8765", memory_gb=6))
     assert stopped == [77]
-    assert launcher._spawned[0].argv == launcher.agent_argv("http://10.0.0.1:8765", 50, "", 6)  # type: ignore
+    assert launcher._spawned[0].argv == launcher.agent_argv("http://10.0.0.1:8765", 50, 6)  # type: ignore
 
 
 def test_status_reports_this_macs_memory(tmp_path):

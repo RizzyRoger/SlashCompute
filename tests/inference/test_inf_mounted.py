@@ -10,8 +10,12 @@ import pytest
 from inf_harness import FakeNode, chat, fast_settings, start_harness
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
+from fastapi import HTTPException
+
 from slashcompute.inference.coordinator.layers import synthetic_layout
+from slashcompute.inference.coordinator.service import ctx_for
 from slashcompute.inference.node.agent import training_busy
+from slashcompute.inference.node.engine import EngineError
 from slashcompute.inference.node.fake_engine import FakeEngine
 
 GB = 10 ** 9
@@ -110,13 +114,52 @@ async def test_anonymous_chat_is_free_and_earns_nobody(pool):
 @pytest.mark.parametrize("pool", [False, True], indirect=True, ids=["lan", "public"])
 async def test_broke_or_unconsented_chatters_are_refused(pool):
     h = pool
-    await two_nodes(h)
+    _, host_token = account(h, "host@lan.test")
+    await two_nodes(h, session_token=host_token)
     _, broke = account(h, "broke@lan.test")
     r = await chat(h, QWEN, headers={"Authorization": f"Bearer {broke}"})
-    assert r.status_code == 400 and "Contribute first" in r.text   # CreditError, same as training
+    assert r.status_code == 402 and "Contribute first" in r.text   # Payment Required (training says 400)
     _, no_terms = account(h, "new@lan.test", terms=False, balance=1e16)
     r = await chat(h, QWEN, headers={"Authorization": f"Bearer {no_terms}"})
     assert r.status_code == 403
+
+
+async def test_hanging_up_on_a_non_streaming_chat_charges_only_the_partial_work(tmp_path):
+    cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.05, verify_rate=0.0)
+    h = await start_harness(fast_settings(), time_scale=1.0, tmp=str(tmp_path / "nodes"),
+                            app_factory=lambda: create_app(cfg, inference=fast_settings()))
+    try:
+        h.add_model(synthetic_layout(QWEN, n_layers=64, total_bytes=int(17.56 * GB), head_bytes=1 * GB))
+        host, host_token = account(h, "host@lan.test")
+        chatter, chat_token = account(h, "chatter@lan.test", balance=1e18)
+        await two_nodes(h, session_token=host_token)
+        credits = core(h).credits
+        start = credits.balance(chatter.id)
+        async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+            req = asyncio.create_task(c.post("/v1/chat/completions", headers={"Authorization": f"Bearer {chat_token}"},
+                                             json={"model": QWEN, "max_tokens": 1500,
+                                                   "messages": [{"role": "user", "content": "go on"}]}))
+            for _ in range(100):
+                await asyncio.sleep(0.1)
+                if h.agents["head"].jobs:
+                    break
+            await asyncio.sleep(0.5)
+            req.cancel()  # curl -m
+            with pytest.raises(asyncio.CancelledError):
+                await req
+        svc = h.app.state.inference
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            job = svc.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if job["state"] != "running" and credits.reserved_in_flight(chatter.id) == 0:
+                break
+        assert job["state"] == "cancelled" and 1 <= job["predicted_n"] < 1500
+        assert credits.reserved_in_flight(chatter.id) == 0                     # settled once
+        spent = start - credits.balance(chatter.id)
+        assert spent == pytest.approx(job["flops"]) and spent > 0              # only the partial work
+        assert credits.lifetime_earned(host.id) == pytest.approx(job["flops"])
+    finally:
+        await h.stop()
 
 
 @pytest.mark.parametrize("pool", [True], indirect=True, ids=["public"])
@@ -149,6 +192,62 @@ async def test_banned_chatter_is_refused(pool):
     core(pool).auth.set_banned(user, True)
     r = await chat(pool, QWEN, headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 403 and "banned" in r.text
+
+
+async def register(h, session_token=None):
+    async with httpx.AsyncClient(base_url=h.node_url) as c:
+        return await c.post("/nodes/register", json={"name": "stranger", "llama_build": "b11160-fake",
+                                                     "session_token": session_token})
+
+
+@pytest.mark.parametrize("pool", [True], indirect=True, ids=["public"])
+async def test_public_inference_node_must_belong_to_a_consenting_account(pool):
+    h = pool
+    assert (await register(h)).status_code == 401                      # no session: it would serve anonymously
+    assert (await register(h, "invalid-session")).status_code == 401
+    _, no_terms = account(h, "new@lan.test", terms=False)
+    assert (await register(h, no_terms)).status_code == 403
+    banned, banned_token = account(h, "banned@lan.test")
+    core(h).auth.set_banned(banned, True)
+    assert (await register(h, banned_token)).status_code == 403
+    assert not h.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    host, host_token = account(h, "host@lan.test")
+    r = await register(h, host_token)
+    assert r.status_code == 200
+    assert core(h).credits.owner_of(r.json()["node_id"]) == host.id     # its earnings have an owner
+
+
+async def test_lan_inference_node_may_register_without_an_account(pool):
+    assert (await register(pool)).status_code == 200
+
+
+@pytest.mark.parametrize("pool", [False, True], indirect=True, ids=["lan", "public"])
+async def test_public_model_and_pipeline_management_is_admin_only(pool):
+    h = pool
+    public = core(h).cfg.public_pool
+    admin, admin_token = account(h, "admin@lan.test")                   # the first account is the admin
+    _, user_token = account(h, "user@lan.test", balance=1e16)
+    assert admin.admin
+    await two_nodes(h, session_token=admin_token)
+    assert (await chat(h, QWEN, max_tokens=4, headers={"Authorization": f"Bearer {user_token}"})).status_code == 200
+    [pipeline_id] = h.svc.mgr.runtimes
+
+    async def manage(headers, pipeline="p-missing"):
+        async with httpx.AsyncClient(base_url=h.node_url, headers=headers) as c:
+            return [(await c.post("/models/upload", params={"name": "m.txt"}, content=b"")).status_code,
+                    (await c.delete("/models/missing.gguf")).status_code,
+                    (await c.post(f"/pipelines/{pipeline}/stop")).status_code]
+
+    allowed = [400, 404, 404]                                           # past auth: bad file name, unknown names
+    assert await manage({}) == ([401] * 3 if public else allowed)
+    assert await manage({"Authorization": "Bearer invalid"}) == ([401] * 3 if public else allowed)
+    user = {"Authorization": f"Bearer {user_token}"}
+    assert await manage(user) == ([403] * 3 if public else allowed)
+    if public:
+        assert (await manage(user, pipeline_id))[2] == 403 and pipeline_id in h.svc.mgr.runtimes
+    assert await manage({"Cookie": f"slashcompute_session={admin_token}"}) == allowed   # the web shell's cookie
+    stopper = {"Authorization": f"Bearer {admin_token}"} if public else {}
+    assert (await manage(stopper, pipeline_id))[2] == 200
 
 
 async def test_non_numeric_max_tokens_is_a_400(pool):
@@ -204,6 +303,72 @@ async def test_engine_is_capped_at_the_budget_the_chatter_paid_for(pool, limit, 
     credits = core(h).credits
     assert credits.lifetime_earned(host.id) == pytest.approx(flops)
     assert credits.balance(chatter.id) == pytest.approx(1e16 - flops)   # charged for every token generated
+
+
+class DenseEngine(FakeEngine):
+    """Counts prompt tokens like llama.cpp does for dense text (one per digit, plus the chat template),
+    rejects prompts that don't fit the pipeline's context, and generates slowly (weight above the default)."""
+
+    async def complete(self, pipeline_id, body):
+        ctx = self.heads[pipeline_id]["ctx"]
+        prompt_n = sum(len(m["content"].encode()) + 5 for m in body["messages"]) + 5
+        if prompt_n + body["max_tokens"] > ctx:
+            raise EngineError(f"request ({prompt_n} tokens) exceeds the available context size ({ctx} tokens)",
+                              pipeline_broken=False, status=400)
+        async for ev in super().complete(pipeline_id, body):
+            if ev["type"] == "final":
+                n = ev["timings"]["predicted_n"]
+                ev["timings"] = {"cache_n": 0, "prompt_n": prompt_n, "prompt_per_second": 1000.0,
+                                 "predicted_n": n, "predicted_per_second": 1e6 if n == 1 else 10.0}
+            yield ev
+
+
+async def test_reservation_covers_the_real_charge_of_dense_prompts_and_slow_replies(pool):
+    h = pool
+    svc = h.app.state.inference
+    host, host_token = account(h, "host@lan.test")
+    chatter, chat_token = account(h, "chatter@lan.test", balance=1e16)
+    await two_nodes(h, session_token=host_token, engine_cls=DenseEngine)
+    credits = core(h).credits
+    headers = {"Authorization": f"Bearer {chat_token}"}
+    paid = 0.0
+    # 2010 real prompt tokens (~510 by len(json)/4); then a slow reply after a 1-token one "ran" at 1e6 tok/s
+    for content, max_tokens, live_tok_s in (("1" * 2000, 1, None), ("Write an essay about rivers.", 200, 10.0)):
+        r = await chat(h, QWEN, content=content, max_tokens=max_tokens, headers=headers)
+        assert r.status_code == 200, r.text
+        paid += r.json()["network"]["flops"]
+        assert credits.balance(chatter.id) == pytest.approx(1e16 - paid)    # charged in full, never capped
+        assert credits.lifetime_earned(host.id) == pytest.approx(paid)      # so the hosts are paid in full
+        assert credits.reserved_in_flight(chatter.id) == 0                  # and the rest of the hold refunded
+        assert svc.conn.execute("SELECT live_tok_s FROM pipelines").fetchone()["live_tok_s"] == live_tok_s
+    assert r.json()["network"]["gen_weight"] == svc.s.GEN_WEIGHT_MAX
+
+
+async def test_pipeline_context_is_sized_from_the_prompt_byte_bound(pool):
+    await two_nodes(pool, engine_cls=DenseEngine)
+    r = await chat(pool, QWEN, content="1" * 6000, max_tokens=5)        # 6010 tokens: needs 8192, not 4096
+    assert r.status_code == 200, r.text
+    assert [rt.ctx for rt in pool.app.state.inference.mgr.runtimes.values()] == [8192]
+
+
+def test_ctx_is_capped_at_the_model_context_length():
+    s = fast_settings()
+    body = {"messages": [{"role": "user", "content": "1" * 6000}], "max_tokens": 3000}
+    assert ctx_for(body, s, 32768) == 16384
+    assert ctx_for(body, s, 8192) == 8192             # the engine rejects the prompt if it really doesn't fit
+    with pytest.raises(HTTPException) as e:
+        ctx_for({**body, "max_tokens": 8192}, s, 8192)
+    assert e.value.status_code == 400
+
+
+@pytest.mark.parametrize("model, max_tokens", [(QWEN, 1e30), (QWEN, 131072), ("Small.gguf", 8192)])
+async def test_max_tokens_beyond_the_model_context_is_a_400(pool, model, max_tokens):
+    pool.add_model(replace(synthetic_layout("Small.gguf", n_layers=8, total_bytes=GB, head_bytes=GB // 8),
+                           max_ctx=8192))   # context_length from its GGUF; QWEN has none (MAX_CTX)
+    await two_nodes(pool)
+    r = await chat(pool, model, max_tokens=max_tokens)
+    assert r.status_code == 400 and "context length" in r.text, r.text
+    assert not pool.app.state.inference.mgr.runtimes                       # nothing planned for it
 
 
 async def test_training_on_a_mac_drains_its_inference_pipelines(pool):

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -33,6 +36,7 @@ TRANSPORTS = ("direct", "relay")
 UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answering ")
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
+PORT_IN_USE = "Port {port} is already in use — quit the other /compute or coordinator, then Start hosting."
 
 
 def stateless_http(**kw: Any) -> httpx.Client:
@@ -57,6 +61,7 @@ class LauncherSettings:
     contribute: bool = True
     finish: str = "carbon"
     session_token: str = ""
+    session_url: str = ""              # the pool that issued session_token: it is never sent to another
     grant_split: int = 0
     training: bool = True              # lend this Mac to MLX fine-tunes
     memory_gb: int = 0                 # GiB lent to fine-tunes; 0 = automatic (what is free at start)
@@ -89,7 +94,8 @@ class LauncherSettings:
         return LauncherSettings(
             mode=mode, url=str(self.url or ""), gpu_percent=gpu,
             contribute=bool(self.contribute), finish=finish,
-            session_token=str(self.session_token or ""), grant_split=split,
+            session_token=str(self.session_token or ""), session_url=str(self.session_url or ""),
+            grant_split=split,
             training=bool(self.training), memory_gb=train_mem, inference=bool(self.inference),
             inference_memory_gb=mem,
             inference_head=bool(self.inference_head), models_dir=str(self.models_dir or "~/models"),
@@ -133,6 +139,32 @@ def normalize_url(url: str, port: int = 8765, scheme: str = "http") -> str:
     return u.rstrip("/")
 
 
+def write_private(path: Path, text: str) -> None:
+    """Write a file only this user can read: it holds a session or a fingerprint of one."""
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    path.write_text(text)
+
+
+def launch_record(argv: list[str], session: str) -> dict:
+    """What an agent or LLM node was started with. Its session goes through the environment (argv
+    shows in ps), so only a digest of it is kept to notice when it changes."""
+    return {"argv": argv, "session": hashlib.sha256(session.encode()).hexdigest() if session else ""}
+
+
+def recorded_argv(record: Any) -> Optional[list[str]]:
+    """The argv a running agent or node was started with, from its launch record (or the bare argv,
+    session included, that launchers before records wrote). None when unknown."""
+    if isinstance(record, dict):
+        record = record.get("argv")
+    if not isinstance(record, list) or "--url" not in record:
+        return None
+    if "--session-token" in record:
+        i = record.index("--session-token")
+        record = record[:i] + record[i + 2:]
+    return record
+
+
 def health_timeout(url: str) -> float:
     return 5.0 if (url or "").lower().startswith("https://") else 1.0
 
@@ -145,9 +177,31 @@ def system_memory() -> tuple[int, int]:
 def process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    try:   # an exited child its parent has not reaped yet still answers kill(0)
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def started_after(pid: int, when: float) -> bool:
+    """Whether process `pid` began after `when`, i.e. the pid was reused since we recorded it."""
+    try:
+        return psutil.Process(pid).create_time() > when + 1.0
+    except psutil.Error:
+        return False
+
+
+def port_free(host: str, port: int) -> bool:
+    """Whether a server could bind host:port (uvicorn binds with SO_REUSEADDR too)."""
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            return e.errno != errno.EADDRINUSE
+    return True
 
 
 class Launcher:
@@ -160,6 +214,7 @@ class Launcher:
         discover_fn: Callable[[float], Optional[str]] = discover,
         lan_ip_fn: Callable[[], str] = lan_ip,
         memory_fn: Callable[[], tuple[int, int]] = system_memory,
+        port_free_fn: Callable[[str, int], bool] = port_free,
     ) -> None:
         self.cfg = EngineConfig.from_env(home=home)
         if home is not None:
@@ -172,7 +227,11 @@ class Launcher:
         self._discover = discover_fn
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn
+        self._port_free = port_free_fn
         self.last_error = ""
+        self._coordinator_proc: Any = None      # the coordinator this launcher spawned, while it runs
+        self._coordinator_log_at = 0            # coordinator.log size when it was spawned
+        self._stopping: list[Any] = []          # coordinators we stopped, reaped once they exit
         self.paths = AgentPaths(self.home)
 
     @property
@@ -198,13 +257,14 @@ class Launcher:
             return LauncherSettings()
         if not isinstance(raw, dict):
             return LauncherSettings()
-        return LauncherSettings(
+        s = LauncherSettings(
             mode=raw.get("mode", "host"),
             url=raw.get("url", ""),
             gpu_percent=raw.get("gpu_percent", 50),
             contribute=raw.get("contribute", True),
             finish=raw.get("finish", "carbon"),
             session_token=raw.get("session_token", ""),
+            session_url=raw.get("session_url", ""),
             grant_split=raw.get("grant_split", 0),
             training=raw.get("training", True),
             memory_gb=raw.get("memory_gb", 0),
@@ -214,10 +274,31 @@ class Launcher:
             models_dir=raw.get("models_dir", "~/models"),
             transport=raw.get("transport", "direct"),
         ).clamp()
+        if s.session_token and "session_url" not in raw:   # stored before sessions were tied to a pool
+            s.session_url = self.proxy_url(s)
+        return s
 
     def save_settings(self, settings: LauncherSettings) -> None:
         s = settings.clamp()
-        self.settings_path.write_text(json.dumps(asdict(s), indent=2) + "\n")
+        before = self.load_settings()
+        if (s.mode, s.url) != (before.mode, before.url):
+            self.last_error = ""   # it was about the pool we just left (e.g. the port taken while hosting)
+        write_private(self.settings_path, json.dumps(asdict(s), indent=2) + "\n")
+
+    def session_for(self, settings: LauncherSettings, url: Optional[str] = None) -> str:
+        """The stored session, but only for the pool that issued it (`url`, default the pool the
+        settings point at): pool A's token is never presented to pool B."""
+        s = settings.clamp()
+        url = self.proxy_url(s) if url is None else url
+        return s.session_token if s.session_token and s.session_url == url else ""
+
+    def with_session(self, settings: LauncherSettings, token: str) -> LauncherSettings:
+        """Settings holding a session just issued by the pool they point at ("" = signed out of it)."""
+        s = settings.clamp()
+        url = self.proxy_url(s)
+        if not token and s.session_url != url:
+            return s   # signing out of this pool leaves another pool's session alone
+        return replace(s, session_token=token, session_url=url if token else "")
 
     def coordinator_url(self, settings: LauncherSettings) -> str:
         if settings.mode == "host":
@@ -240,7 +321,7 @@ class Launcher:
             argv.extend(["--inference-transport", transport])
         return argv
 
-    def agent_argv(self, url: str, gpu_percent: int, session_token: str = "", memory_gb: int = 0) -> list[str]:
+    def agent_argv(self, url: str, gpu_percent: int, memory_gb: int = 0) -> list[str]:
         argv = [
             self.python, "-m", "slashcompute.agent.main", "start",
             "--url", url, "--gpu-percent", str(int(gpu_percent)),
@@ -248,20 +329,15 @@ class Launcher:
         ]
         if memory_gb:
             argv.extend(["--max-memory-gb", str(int(memory_gb))])
-        if session_token:
-            argv.extend(["--session-token", session_token])
         return argv
 
     def inference_argv(self, url: str, settings: LauncherSettings) -> list[str]:
         s = settings.clamp()
-        argv = [
+        return [
             self.python, "-m", "slashcompute.inference.node", "start",
             "--url", url, "--home", str(self.home), "--models-dir", s.models_dir,
             "--memory-gb", str(s.inference_memory_gb), "--head" if s.inference_head else "--no-head",
         ]
-        if s.session_token:
-            argv.extend(["--session-token", s.session_token])
-        return argv
 
     @property
     def inference_pid_path(self) -> Path:
@@ -303,6 +379,7 @@ class Launcher:
             self.last_error = ("Inference transport can only change when this app started the coordinator; "
                                "restart it with --inference-transport " + settings.transport + ".")
             return
+        self._forget_coordinator()
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -310,9 +387,11 @@ class Launcher:
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and process_alive(pid):
             time.sleep(0.05)
+        if process_alive(pid):   # never start a second one over it
+            self.last_error = "The coordinator did not stop in time; Stop it, then Start hosting again."
+            return
         self.coordinator_pid_path.unlink(missing_ok=True)
-        self._spawn(self.coordinator_argv(settings.transport), self.log_dir / "coordinator.log",
-                    pid_writer=self.write_coordinator_pid)
+        self._spawn_coordinator(settings.transport)
         self.wait_health(self.proxy_url(settings))
 
     def read_coordinator_pid(self) -> Optional[int]:
@@ -320,12 +399,71 @@ class Launcher:
             return None
         try:
             pid = int(self.coordinator_pid_path.read_text().strip())
-        except ValueError:
+            written = self.coordinator_pid_path.stat().st_mtime
+        except (OSError, ValueError):
             return None
-        if process_alive(pid):
+        if process_alive(pid) and not started_after(pid, written):
             return pid
         self.coordinator_pid_path.unlink(missing_ok=True)
         return None
+
+    def find_coordinators(self) -> list[int]:
+        """Coordinators serving this home, found by their command line: ours even if coordinator.pid
+        was lost or overwritten."""
+        pids = []
+        for proc in psutil.process_iter(["cmdline", "status"]):
+            argv = proc.info["cmdline"] or []
+            if (proc.info["status"] != psutil.STATUS_ZOMBIE and "slashcompute.coordinator.main" in argv
+                    and "serve" in argv and "--home" in argv[:-1]
+                    and argv[argv.index("--home") + 1] == str(self.home)):
+                pids.append(proc.pid)
+        return pids
+
+    def own_coordinator_pid(self) -> Optional[int]:
+        """Our running coordinator, re-recording its pid when coordinator.pid was lost."""
+        pid = self.read_coordinator_pid()
+        if pid is None and (found := self.find_coordinators()):
+            pid = found[0]
+            self.write_coordinator_pid(pid)
+        return pid
+
+    def _spawn_coordinator(self, transport: str) -> None:
+        log = self.log_dir / "coordinator.log"
+        self._coordinator_log_at = log.stat().st_size if log.exists() else 0
+        self._coordinator_proc = self._spawn(self.coordinator_argv(transport), log,
+                                             pid_writer=self.write_coordinator_pid)
+
+    def _forget_coordinator(self) -> None:
+        """We are stopping our coordinator: its exit is expected, so only reap it."""
+        if self._coordinator_proc is not None:
+            self._stopping.append(self._coordinator_proc)
+            self._coordinator_proc = None
+
+    def _check_coordinator(self) -> bool:
+        """Reap the coordinator we spawned once it exits (e.g. its port was taken): forget its pid and
+        say why in last_error. True when it had exited."""
+        self._stopping = [p for p in self._stopping if p.poll() is None]
+        proc = self._coordinator_proc
+        if proc is None or (code := proc.poll()) is None:
+            return False
+        self._coordinator_proc = None
+        self.coordinator_pid_path.unlink(missing_ok=True)
+        if self.load_settings().mode == "host":   # after a switch to another pool it is not news
+            self.last_error = self._coordinator_exit_reason(code)
+        return True
+
+    def _coordinator_exit_reason(self, code: int) -> str:
+        log = self.log_dir / "coordinator.log"
+        try:
+            with open(log, "rb") as fh:
+                fh.seek(self._coordinator_log_at)   # only what this run wrote
+                lines = [ln.strip() for ln in fh.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+        except OSError:
+            lines = []
+        if code == 3 or any("address already in use" in ln.lower() for ln in lines):
+            return PORT_IN_USE.format(port=self.cfg.coordinator_port)
+        how = f"was stopped by signal {-code}" if code < 0 else f"exited with code {code}"
+        return f"The coordinator {how}: " + (" | ".join(lines[-3:]) if lines else f"see {log}.")
 
     def write_coordinator_pid(self, pid: int) -> None:
         self.coordinator_pid_path.write_text(str(pid) + "\n")
@@ -347,6 +485,8 @@ class Launcher:
         while time.monotonic() < deadline:
             if self.poll_health(url):
                 return True
+            if self._check_coordinator():
+                return False
             time.sleep(0.2)
         return False
 
@@ -365,7 +505,7 @@ class Launcher:
         if s.mode == "public" and not url:
             self.last_error = "Enter the public coordinator URL."
             raise LauncherError(self.last_error)
-        if s.mode == "public" and not s.session_token:
+        if s.mode == "public" and not self.session_for(s):
             self.last_error = "Sign in first."
             raise LauncherError(self.last_error)
 
@@ -374,12 +514,21 @@ class Launcher:
         want_agent = lend and s.training
         want_inference = lend and s.inference
 
-        health = self.poll_health(url) if want_coord else None
+        # Hosting: ask on loopback first, the LAN address may not answer (bound to 127.0.0.1, slow Wi-Fi).
+        health = (self.poll_health(self.proxy_url(s)) or self.poll_health(url)) if want_coord else None
+        if want_coord:
+            self._check_coordinator()
+            self.own_coordinator_pid()
         if want_coord and not health:
-            self._spawn(self.coordinator_argv(s.transport), self.log_dir / "coordinator.log",
-                        pid_writer=self.write_coordinator_pid)
-            check = self.proxy_url(s) if s.mode == "host" else url
-            if not (self.wait_health(check) or self.poll_health(url)):
+            if self.read_coordinator_pid() is None:   # ours may just be slow to answer: never start two
+                if not self._port_free(self.cfg.coordinator_host, self.cfg.coordinator_port):
+                    self.last_error = PORT_IN_USE.format(port=self.cfg.coordinator_port)
+                    raise LauncherError(self.last_error)
+                self.last_error = ""
+                self._spawn_coordinator(s.transport)
+            if not (self.wait_health(self.proxy_url(s)) or self.poll_health(url)):
+                if self._coordinator_proc is None and self.last_error:
+                    raise LauncherError(self.last_error)   # it exited: nothing to lend to
                 self.last_error = (
                     f"Coordinator started but is not answering {url}/health yet. "
                     f"Watch {self.log_dir / 'coordinator.log'}."
@@ -391,54 +540,83 @@ class Launcher:
         if s.mode in ("join", "public") and not self.poll_health(url):
             self.last_error = f"No coordinator at {url}."
             raise LauncherError(self.last_error)
+        if s.mode in ("join", "public"):
+            self._stop_coordinator()   # the new pool answers: stop hosting ours, nothing here dials it now
         if not want_agent and self._agent_running():
             request_stop(self.paths)
         if want_agent:
-            token = s.session_token or os.environ.get("SLASHCOMPUTE_SESSION", "")
-            argv = self.agent_argv(agent_url, s.gpu_percent, token, s.memory_gb)
-            if self._agent_running() and self._read_agent_args() != argv:
-                request_stop(self.paths)
-                deadline = time.monotonic() + 3.0
-                while time.monotonic() < deadline and self._agent_running():
-                    time.sleep(0.05)
-                if self._agent_running():
-                    self.last_error = (
-                        "Training agent is still stopping. Settings have not been applied; "
-                        "start again after its current work finishes."
-                    )
-            if not self._agent_running():
-                self._spawn(argv, self.log_dir / "agent.log")
-                args_path = self._agent_args_path()
-                args_path.touch(mode=0o600)
-                args_path.chmod(0o600)
-                args_path.write_text(json.dumps(argv))
+            self._ensure_agent(self.agent_argv(agent_url, s.gpu_percent, s.memory_gb),
+                               self._agent_session(s, agent_url))
 
         if want_inference:
             if s.mode == "join" and not self.poll_health(url):
                 self.last_error = f"No coordinator at {url}."
                 raise LauncherError(self.last_error)
-            argv = self.inference_argv(agent_url, s)
-            if self.read_inference_pid() is not None and self._read_inference_args() != argv:
-                self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
-            if self.read_inference_pid() is None:
-                self._spawn(argv, self.log_dir / "inference.log")
-                self._inference_args_path().write_text(json.dumps(argv))
+            self._ensure_inference(self.inference_argv(agent_url, s), self.session_for(s, agent_url))
         else:
             self._stop_inference()
 
         return self.snapshot(s)
 
+    def rebind_session(self) -> StatusSnapshot:
+        """After a sign-in or sign-out: restart the agent and LLM node running here with the session
+        now stored for their pool, so they earn for the signed-in account without another Start."""
+        s = self.load_settings()
+        try:
+            if self._agent_running() and (argv := recorded_argv(self._read_agent_args())):
+                self._ensure_agent(argv, self._agent_session(s, argv[argv.index("--url") + 1]))
+            if self.read_inference_pid() is not None and (argv := recorded_argv(self._read_inference_args())):
+                self._ensure_inference(argv, self.session_for(s, argv[argv.index("--url") + 1]))
+        except LauncherError:
+            pass   # last_error says why
+        return self.snapshot(s)
+
+    def _agent_session(self, s: LauncherSettings, url: str) -> str:
+        return self.session_for(s, url) or os.environ.get("SLASHCOMPUTE_SESSION", "")
+
+    def _ensure_agent(self, argv: list[str], session: str) -> None:
+        """Run the training agent as `argv` with `session`, restarting one started differently."""
+        record = launch_record(argv, session)
+        if self._agent_running() and self._read_agent_args() != record:
+            request_stop(self.paths)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self._agent_running():
+                time.sleep(0.05)
+            if self._agent_running():
+                self.last_error = (
+                    "Training agent is still stopping. Settings have not been applied; "
+                    "start again after its current work finishes."
+                )
+        if not self._agent_running():
+            self._spawn(argv, self.log_dir / "agent.log", session=session)
+            write_private(self._agent_args_path(), json.dumps(record))
+
+    def _ensure_inference(self, argv: list[str], session: str) -> None:
+        """Run the LLM node as `argv` with `session`, restarting one started differently."""
+        record = launch_record(argv, session)
+        if self.read_inference_pid() is not None and self._read_inference_args() != record:
+            self._stop_inference(wait=10.0)   # settings changed: drain, then rejoin with the new ones
+        if self.read_inference_pid() is None:
+            self._spawn(argv, self.log_dir / "inference.log", session=session)
+            write_private(self._inference_args_path(), json.dumps(record))
+
     def stop(self) -> StatusSnapshot:
         self.last_error = ""
         request_stop(self.paths)
         self._stop_inference()
-        pid = self.read_coordinator_pid()
-        if pid is not None:
+        self._stop_coordinator()
+        return self.snapshot()
+
+    def _stop_coordinator(self) -> None:
+        self._forget_coordinator()
+        # Also those found by command line: Stop must not leave ours up when its pid file was lost.
+        for pid in dict.fromkeys([self.read_coordinator_pid(), *self.find_coordinators()]):
+            if pid is None:
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 self.coordinator_pid_path.unlink(missing_ok=True)
-        return self.snapshot()
 
     def stop_agent(self) -> StatusSnapshot:
         """Stop contributing; a coordinator hosted here keeps running."""
@@ -470,10 +648,10 @@ class Launcher:
 
     def snapshot(self, settings: Optional[LauncherSettings] = None) -> StatusSnapshot:
         s = settings.clamp() if settings is not None else self.load_settings()
+        self._check_coordinator()
         url = self.coordinator_url(s)
-        health = self.poll_health(url) or {}
-        if not health and s.mode == "host":
-            health = self.poll_health(self.proxy_url(s)) or {}
+        health = self.poll_health(self.proxy_url(s)) if s.mode == "host" else None
+        health = health or self.poll_health(url) or {}
         if health and self.last_error.startswith(UNREACHABLE_ERRORS):
             self.last_error = ""   # the coordinator answers now (e.g. after Connect fixed the address)
         agent = self.paths.read_status()
@@ -505,7 +683,7 @@ class Launcher:
             memory_available_bytes=mem_free,
         )
 
-    def _read_inference_args(self) -> list[str]:
+    def _read_inference_args(self) -> Any:
         try:
             return json.loads(self._inference_args_path().read_text())
         except (OSError, ValueError):
@@ -514,7 +692,7 @@ class Launcher:
     def _agent_args_path(self) -> Path:
         return self.home / "agent.args"
 
-    def _read_agent_args(self) -> list[str]:
+    def _read_agent_args(self) -> Any:
         try:
             return json.loads(self._agent_args_path().read_text())
         except (OSError, ValueError):
@@ -525,18 +703,24 @@ class Launcher:
         return bool(pid and process_alive(pid))
 
     def _spawn(self, argv: list[str], log_path: Path,
-               pid_writer: Optional[Callable[[int], None]] = None) -> Any:
+               pid_writer: Optional[Callable[[int], None]] = None, session: Optional[str] = None) -> Any:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(log_path, "ab")
-        try:
-            proc = self._popen(
-                argv, stdout=fh, stderr=subprocess.STDOUT,
-                start_new_session=True, env=os.environ.copy(),
-            )
-        except OSError as e:
-            fh.close()
-            self.last_error = f"Could not start process: {e}"
-            raise LauncherError(self.last_error) from e
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if session is not None:   # through the environment: argv is visible to every user in ps
+            env.pop("SLASHCOMPUTE_SESSION", None)
+            if session:
+                env["SLASHCOMPUTE_SESSION"] = session
+        # Append, never truncate: a failed start's reason must survive the next attempt. Unbuffered,
+        # so a child that dies at once still leaves its last words in the log.
+        with open(log_path, "ab") as fh:
+            try:
+                proc = self._popen(
+                    argv, stdout=fh, stderr=subprocess.STDOUT,
+                    start_new_session=True, env=env,
+                )
+            except OSError as e:
+                self.last_error = f"Could not start process: {e}"
+                raise LauncherError(self.last_error) from e
         if pid_writer is not None:
             pid_writer(int(proc.pid))
         return proc

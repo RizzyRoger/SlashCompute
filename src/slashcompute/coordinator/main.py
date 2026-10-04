@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,19 @@ def _url(url: Optional[str]) -> str:
 
 SessionToken = typer.Option(None, "--session-token", envvar="SLASHCOMPUTE_SESSION",
                             help="Account session (needed on a public pool)")
+
+
+def _bind(host: str, port: int) -> socket.socket:
+    """Take the listening socket the way uvicorn would, or exit 3 like uvicorn does when it can't."""
+    sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as e:
+        sock.close()
+        typer.echo(f"cannot listen on {host}:{port}: {e.strerror or e}", err=True)
+        raise typer.Exit(3)
+    return sock
 
 
 def _call(method: str, path: str, url: Optional[str], token: Optional[str] = None,
@@ -68,6 +82,9 @@ def serve(
         if inference_transport not in TRANSPORTS:
             raise typer.BadParameter(f"--inference-transport must be one of {', '.join(TRANSPORTS)}")
         inference = inference.replace(TRANSPORT=inference_transport)
+    # Bind before building the app: the Coordinator rewrites live jobs to `recovering` as it loads,
+    # and the lifespan starts scheduling and mDNS, none of which a run that can't listen may do.
+    sock = _bind(cfg.coordinator_host, cfg.coordinator_port)
     api = create_app(cfg, advertise=bool(mdns) and not cfg.public_pool, inference=inference)
 
     class Server(uvicorn.Server):
@@ -82,9 +99,9 @@ def serve(
                                    log_level="warning", ws_ping_interval=20, ws_max_size=64 * 1024 * 1024,
                                    timeout_graceful_shutdown=SHUTDOWN_GRACE_S))
     with contextlib.suppress(KeyboardInterrupt):
-        server.run()
+        server.run(sockets=[sock])
     if not server.started:
-        raise typer.Exit(3)  # couldn't bind, like uvicorn.run
+        raise typer.Exit(3)  # startup failed, like uvicorn.run
 
 
 @app.command()

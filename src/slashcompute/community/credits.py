@@ -26,11 +26,16 @@ class CreditError(Exception):
         self.status = status
 
 
+class InsufficientCredits(CreditError):
+    """The balance does not cover a reservation (training keeps its 400; chat answers 402)."""
+
+
 class Credits:
     def __init__(self, db: Database) -> None:
         self.db = db
         # Serialises check-balance-then-debit so concurrent spends cannot overdraw.
         self._spend_lock = threading.Lock()
+        self._welcomed: set[str] = set()   # users known to hold their welcome credit: skip the insert
 
     def post(self, user_id: str, kind: str, amount: float, *, job_id: Optional[str] = None,
              grant_id: Optional[str] = None, node_id: Optional[str] = None,
@@ -139,10 +144,11 @@ class Credits:
         with self.db.session() as s:
             return list(s.exec(select(NodeOwner).where(NodeOwner.user_id == user_id)).all())
 
-    def bind_node(self, node_id: str, user_id: str) -> None:
-        # Node ids are public: never hand one user's node (and its earnings) to another.
+    def bind_node(self, node_id: str, user_id: str, *, take_over: bool = False) -> None:
+        # Node ids are public: never hand one user's node (and its earnings) to another unless
+        # the caller has established the new account may take it over (see Coordinator._check_claim).
         owner = self.owner_of(node_id)
-        if owner is not None and owner != user_id:
+        if owner is not None and owner != user_id and not take_over:
             raise PermissionError("node id belongs to another account")
         self.db.save(NodeOwner(node_id=node_id, user_id=user_id))
 
@@ -164,9 +170,22 @@ class Credits:
             self.post(POT_ID, "earn", pot, node_id=node_id, job_id=job_id,
                       note=f"tithe from {user_id}")
 
+    def credit_host(self, owner_id: Optional[str], flops: float, *,
+                    node_id: Optional[str] = None, job_id: Optional[str] = None) -> None:
+        """Pay out FLOPs a job was charged for a node's work. A share nobody may earn (unbound
+        node, missing or banned owner) goes to the community pot so charged FLOPs never vanish."""
+        if flops <= 0:
+            return
+        owner = self.db.get(User, owner_id) if owner_id else None
+        if owner is None or owner.banned:
+            self.post(POT_ID, "earn", flops, node_id=node_id, job_id=job_id,
+                      note="unclaimed host share")
+            return
+        self.contribute(owner.id, flops, owner.grant_split, node_id=node_id, job_id=job_id)
+
     def grant_welcome(self, user_id: str, flops: float = WELCOME_FLOPS) -> float:
         """One-time sign-in credit. Returns FLOPs granted (0 if already given)."""
-        if not math.isfinite(flops) or flops <= 0:
+        if not math.isfinite(flops) or flops <= 0 or user_id in self._welcomed:
             return 0.0
         user = self.db.get(User, user_id)
         if user is None or user.banned:
@@ -174,7 +193,9 @@ class Credits:
         try:
             self.post(user_id, "welcome", flops, note="Welcome credit")
         except IntegrityError:  # uq_credit_txns_welcome: someone else got there first
+            self._welcomed.add(user_id)
             return 0.0
+        self._welcomed.add(user_id)
         return float(flops)
 
     def reserve_job(self, user_id: str, job_id: str, flops: float) -> JobAccount:
@@ -183,7 +204,7 @@ class Credits:
         with self._spend_lock:
             have = self.balance(user_id)
             if have < flops:
-                raise CreditError(
+                raise InsufficientCredits(
                     f"Need {flops:.3e} FLOPs; you have {have:.3e}. Contribute first.",
                 )
             acct = JobAccount(job_id=job_id, user_id=user_id, reserved_flops=flops, spent_flops=0.0)
@@ -261,7 +282,8 @@ class Credits:
             ).all()
             users = {u.id: u for u in s.exec(select(User)).all()}
         ranked = sorted(
-            ((uid, float(total or 0.0)) for uid, total in rows if uid != POT_ID),
+            ((uid, float(total or 0.0)) for uid, total in rows
+             if uid != POT_ID and not (uid in users and users[uid].banned)),
             key=lambda x: x[1], reverse=True,
         )[:limit]
         out = []

@@ -160,7 +160,7 @@ class Agent:
         }
         headers = {TOKEN_HEADER: self.cfg.inference_token} if self.cfg.inference_token else {}
         r = await self.client.post("/nodes/register", json=body, headers=headers)
-        if r.status_code in (401, 409):
+        if r.status_code in (401, 403, 409):
             raise SystemExit(f"coordinator refused this node: {r.json().get('detail')}")
         r.raise_for_status()
         data = r.json()

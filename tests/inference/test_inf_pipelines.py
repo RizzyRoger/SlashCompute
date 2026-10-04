@@ -131,6 +131,45 @@ async def test_client_disconnect_mid_stream_cancels_the_head_and_credits_partial
         await h.stop()
 
 
+async def test_client_disconnect_from_a_non_streaming_chat_cancels_the_head():
+    """`curl -m 2` on a non-streaming chat: nothing is written until the reply is done, so the
+    coordinator has to notice the hang-up itself, stop the head and charge only the partial work."""
+    h = await start_harness(fast_settings(), time_scale=1.0)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 16, may_be_head=True, files=(QWEN,)), FakeNode("worker", 16)])
+        assert (await chat(h, QWEN, max_tokens=2)).status_code == 200
+        records = len(h.svc.accounting.records)
+        head = h.agents["head"]
+
+        async with httpx.AsyncClient(base_url=h.url, timeout=30) as c:
+            req = asyncio.create_task(c.post("/v1/chat/completions", json={
+                "model": QWEN, "messages": [{"role": "user", "content": "go on forever"}], "max_tokens": 3000}))
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if head.jobs:
+                    break
+            assert head.jobs  # the head is generating
+            await asyncio.sleep(0.3)
+            req.cancel()  # hang up
+            with pytest.raises(asyncio.CancelledError):
+                await req
+        job = None
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            job = h.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if job["state"] != "running" and not head.jobs:
+                break
+        assert job["state"] == "cancelled" and job["finished_at"]
+        assert not head.jobs  # cancel_job reached the head
+        assert 1 <= job["predicted_n"] < 3000
+        (rec,) = h.svc.accounting.records[records:]  # charged once, for the partial work
+        assert rec["tokens"] == job["prompt_n"] + job["predicted_n"]
+        assert (await chat(h, QWEN, max_tokens=2, content="next")).status_code == 200
+    finally:
+        await h.stop()
+
+
 async def test_closing_serve_mid_stream_records_before_returning():
     """sse() closes serve() when the requester goes away and then settles: the partial work must
     already be recorded by the time aclose() returns, or settle() releases the reservation first."""
@@ -173,6 +212,62 @@ async def test_idle_pipeline_is_torn_down():
         assert h.agents["worker"].in_use == {} and h.agents["head"].in_use == {}
     finally:
         await h.stop()
+
+
+async def test_coordinator_restart_stops_the_pipelines_it_left_live(tmp_path):
+    """A restarted coordinator has no runtime for the pipelines its DB still shows live: they must not
+    keep holding the node's memory (every chat then fails with 'only 0.3 GB usable'), and the node
+    must stop the llama.cpp processes it still runs for them."""
+    from inf_harness import Harness
+    from slashcompute.inference.node.fake_engine import FakeCluster
+
+    # slow offline detection: the old run must not break the pipeline while it shuts down
+    settings = fast_settings(DB_PATH=str(tmp_path / "inference.db"), PIPELINE_IDLE_SECONDS=30,
+                             OFFLINE_AFTER_SECONDS=5)
+    h = await Harness(settings, FakeCluster()).start(9870)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 24, may_be_head=True, files=(QWEN,))])
+        r1 = await chat(h, QWEN)
+        assert r1.status_code == 200, r1.text
+        old = r1.json()["network"]["pipeline_id"]
+
+        h.server.should_exit = True  # SIGTERM; the node keeps running
+        await h._task
+        await h.start(9870)
+        (stale,) = pipelines(h)
+        assert stale["state"] == "stopped" and stale["stopped_at"] and stale["broken_reason"] == "coordinator restarted"
+
+        r2 = await chat(h, QWEN, content="again")
+        assert r2.status_code == 200, r2.text
+        new = r2.json()["network"]["pipeline_id"]
+        assert new != old
+        agent = h.agents["head"]
+        for _ in range(40):
+            if old not in agent.engine.heads:
+                break
+            await asyncio.sleep(0.05)
+        assert set(agent.engine.heads) == {new} and set(agent.in_use) == {new}
+    finally:
+        await h.stop()
+
+
+async def test_node_stops_pipelines_the_coordinator_does_not_know(two_node):
+    """A node reports the pipelines it holds on each heartbeat; ones the coordinator isn't running
+    (e.g. broken while the node was unreachable, so the stop never arrived) are stopped."""
+    h = two_node
+    assert (await chat(h, QWEN)).status_code == 200
+    (p,) = pipelines(h)
+    head, worker = h.agents["head"], h.agents["worker"]
+    head.in_use["p-ghost"], head.engine.heads["p-ghost"] = GB, {}
+    worker.in_use["p-ghost"], worker.engine.workers["p-ghost"] = GB, {}
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if "p-ghost" not in head.in_use and "p-ghost" not in worker.in_use:
+            break
+    assert set(head.in_use) == set(head.engine.heads) == {p["id"]}
+    assert set(worker.in_use) == set(worker.engine.workers) == {p["id"]}
+    assert (await chat(h, QWEN, content="again")).status_code == 200
 
 
 async def test_node_failure_breaks_pipeline_replans_and_retries():
@@ -273,6 +368,21 @@ async def test_idle_pipeline_of_the_same_model_is_evicted_for_a_larger_ctx(two_n
     # a smaller request reuses the bigger pipeline instead of evicting it
     again = await chat(h, QWEN, content="short again", max_tokens=16)
     assert again.json()["network"]["pipeline_id"] == big.json()["network"]["pipeline_id"]
+
+
+async def test_a_request_too_big_to_ever_fit_does_not_evict_the_idle_pipeline(two_node):
+    h = two_node
+    small = await chat(h, QWEN, max_tokens=16)
+    assert small.status_code == 200, small.text
+    (first,) = pipelines(h)
+    # a ctx near the model's limit fits nowhere even with the idle pipeline gone, so it must not
+    # be torn down (beyond the limit is a 400 before planning)
+    huge = await chat(h, QWEN, content="endless answer", max_tokens=100_000)
+    assert huge.status_code == 503, huge.text
+    (still,) = pipelines(h)
+    assert (still["id"], still["state"]) == (first["id"], "active")
+    again = await chat(h, QWEN, content="short again", max_tokens=16)
+    assert again.json()["network"]["pipeline_id"] == first["id"]
 
 
 async def test_requests_during_a_drain_wait_instead_of_failing():

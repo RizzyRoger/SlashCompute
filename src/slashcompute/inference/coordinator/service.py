@@ -36,7 +36,7 @@ from slashcompute.inference.coordinator import nodes, registry, status
 from slashcompute.inference.coordinator.bus import CommandBus, CommandFailed, JobStreams
 from slashcompute.inference.coordinator.db import connect, tx
 from slashcompute.inference.coordinator.layers import build_layout
-from slashcompute.inference.coordinator.pipelines import PipelineManager, estimate_prompt_tokens, serve
+from slashcompute.inference.coordinator.pipelines import PipelineManager, prompt_token_bound, serve
 from slashcompute.inference.coordinator.planner import NoPlan, build_matches
 from slashcompute.inference.coordinator.relay import Relay
 from slashcompute.inference.gguf import read_header_file
@@ -61,12 +61,22 @@ def completion_limit(body: dict) -> int:
     return n
 
 
-def ctx_for(body: dict, s: InferenceSettings) -> int:
-    need = estimate_prompt_tokens(body) + completion_limit(body) + 64
+def max_ctx_for(row, s: InferenceSettings) -> int:
+    """The longest context a pipeline for this model gets: its trained length (GGUF), else MAX_CTX."""
+    return registry.model_layout(row).max_ctx or s.MAX_CTX
+
+
+def ctx_for(body: dict, s: InferenceSettings, max_ctx: int) -> int:
+    """Context to plan for: room for an upper bound on the prompt plus the whole completion budget, capped at
+    the model's context length (a prompt that really doesn't fit is then rejected by the engine)."""
+    limit = completion_limit(body)
+    if limit >= max_ctx:
+        raise HTTPException(400, f"max_tokens ({limit}) must be below the model's context length ({max_ctx} tokens).")
+    need = prompt_token_bound(body) + limit + 64
     ctx = s.DEFAULT_CTX
-    while ctx < need:
+    while ctx < min(need, max_ctx):
         ctx *= 2
-    return ctx
+    return min(ctx, max_ctx)
 
 
 def hash_token(token: str) -> str:
@@ -109,6 +119,7 @@ class InferenceService:
     def start(self) -> None:
         self.latency_kick = asyncio.Event()
         self.bus.closing = asyncio.Event()  # bound to this run's event loop
+        self.mgr.recover()
         if self.s.BACKGROUND_TASKS:
             for loop in (self.monitor_loop, self.tick_loop, self.latency_loop):
                 self.spawn(loop())
@@ -122,6 +133,16 @@ class InferenceService:
     def kick_latency(self) -> None:
         if self.latency_kick is not None:
             self.latency_kick.set()
+
+    def node_state(self, node_id: str) -> Optional[dict]:
+        """Liveness of an inference node for its owner's node list (None: not an inference node)."""
+        row = self.conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if row is None:
+            return None
+        if not nodes.is_online(row, self.s):
+            return {"online": False, "status": None}
+        busy = node_id in nodes.reserved_bytes(self.conn)  # a member of a live pipeline
+        return {"online": True, "status": "draining" if row["draining"] else "running" if busy else "idle"}
 
     # ------------------------------------------------------------ auth
 
@@ -138,6 +159,14 @@ class InferenceService:
         """When a shared secret is set (internet-facing pools), require it."""
         if self.s.TOKEN and not secrets.compare_digest(request.headers.get(TOKEN_HEADER, ""), self.s.TOKEN):
             raise HTTPException(401, "missing or wrong inference token")
+
+    def check_admin(self, request: Request) -> None:
+        """Model and pipeline management: the shared secret, plus an admin session on public pools."""
+        self.check_token(request)
+        try:
+            self.accounting.require_admin(request)
+        except AccountingError as e:
+            raise HTTPException(e.status, str(e)) from e
 
     # ------------------------------------------------------------ background loops
 
@@ -356,6 +385,10 @@ def make_router(svc: InferenceService) -> APIRouter:
     @r.post("/nodes/register")
     async def register_node(body: dict, request: Request):
         svc.check_token(request)
+        try:
+            svc.accounting.admit_node(body.get("session_token"))
+        except AccountingError as e:
+            raise HTTPException(e.status, str(e)) from e
         build = body.get("llama_build", "")
         if not build_matches(build, s.PINNED_LLAMA_BUILD):
             raise HTTPException(409, f"llama.cpp build {build!r} does not match the pinned build "
@@ -411,6 +444,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         conn.execute("UPDATE nodes SET last_heartbeat=?, available=?, downloads_json=? WHERE id=?",
                      (time.time(), available, json.dumps(body.get("downloads") or {}), row["id"]))
         svc.online.add(row["id"])
+        mgr.reconcile(row["id"], body.get("pipelines") or [])
         if row["available"] and not available:
             # paused, training took the Mac, or shutting down: finish the current job, then leave pipelines
             reason = body.get("reason") or ("node shutting down" if body.get("leaving") else "node unavailable")
@@ -465,7 +499,10 @@ def make_router(svc: InferenceService) -> APIRouter:
     async def agent_commands(request: Request, wait: float = 25.0):
         row = svc.node_from(request)
         conn.execute("UPDATE nodes SET last_heartbeat=? WHERE id=?", (time.time(), row["id"]))
-        return {"commands": await bus.poll(row["id"], min(wait, s.COMMAND_LONG_POLL_SECONDS))}
+        commands = await bus.poll(row["id"], min(wait, s.COMMAND_LONG_POLL_SECONDS))
+        if not commands and bus.closing.is_set():  # an empty 200 would have agents re-poll in a hot loop
+            raise HTTPException(503, "coordinator shutting down", headers={"Retry-After": "1"})
+        return {"commands": commands}
 
     @r.post("/agent/commands/{cid}/result")
     async def agent_result(cid: str, body: dict, request: Request):
@@ -495,7 +532,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.post("/models/upload")
     async def upload_model(request: Request, name: str = ""):
-        svc.check_token(request)
+        svc.check_admin(request)
         return await svc.receive_upload(request, name or request.headers.get("x-filename", ""))
 
     @r.get("/models/files/{name}")
@@ -509,7 +546,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.delete("/models/{name}")
     async def delete_model(name: str, request: Request):
-        svc.check_token(request)
+        svc.check_admin(request)
         row = conn.execute("SELECT name FROM model_files WHERE name=?", (name,)).fetchone()
         if row is None:
             raise HTTPException(404, "no such uploaded model")
@@ -522,7 +559,7 @@ def make_router(svc: InferenceService) -> APIRouter:
     async def plan_view(model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
         row = svc.model_or_404(model)
         body = {"model": model, "max_tokens": max_tokens}
-        ctx = ctx_for(body, s)
+        ctx = ctx_for(body, s, max_ctx_for(row, s))
         active = next((rt for rt in mgr.live(row["id"]) if rt.state == "active" and rt.ctx >= ctx), None)
         if active:
             view = {"source": "active pipeline", "pipeline_id": active.id,
@@ -538,7 +575,7 @@ def make_router(svc: InferenceService) -> APIRouter:
 
     @r.post("/pipelines/{pipeline_id}/stop")
     async def stop_pipeline(pipeline_id: str, request: Request):
-        svc.check_token(request)
+        svc.check_admin(request)
         if pipeline_id not in mgr.runtimes:
             raise HTTPException(404, "unknown pipeline")
         svc.spawn(mgr.stop_pipeline(pipeline_id, "unloaded from the app"))
@@ -574,6 +611,7 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) for m in messages):
             raise HTTPException(400, "messages must be a non-empty list of message objects.")
         stream = body_bool(body, "stream")
+        ctx = ctx_for(body, s, max_ctx_for(row, s))
         # the engine gets exactly the budget we reserved for (llama-server alone would run to the end of the ctx)
         engine_body = {k: v for k, v in body.items()
                        if k not in ("stream", "stream_options", "model", "max_completion_tokens", "n_predict")}
@@ -581,8 +619,8 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False
         if user_id:
-            est = fl.estimate_flops(registry.model_flops(row), estimate_prompt_tokens(body),
-                                    max_tokens, mgr.gen_weight_for(row["id"]))
+            # a true upper bound (the charge is capped at it); settle() refunds the rest
+            est = fl.estimate_flops(registry.model_flops(row), prompt_token_bound(body), max_tokens, s.GEN_WEIGHT_MAX)
             try:
                 svc.accounting.reserve(user_id, account_id, est)
             except AccountingError as e:
@@ -596,11 +634,13 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                 except Exception:  # noqa: BLE001
                     log.exception("settling %s failed", account_id)
 
-        events = serve(mgr, row["id"], engine_body, ctx_for(body, s), user_id or "anonymous", stream, account_id)
+        events = serve(mgr, row["id"], engine_body, ctx, user_id or "anonymous", stream, account_id)
 
         if not stream:
-            try:
-                text, reasoning, final = [], [], None
+            text, reasoning = [], []
+
+            async def collect() -> Optional[dict]:
+                """The 'final' or 'error' event, accumulating the reply text on the way."""
                 async for ev in events:
                     if ev["type"] == "reset":
                         text.clear()
@@ -610,13 +650,37 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
                         text.append(delta.get("content") or "")
                         # thinking models (Qwen3 etc.) stream their reasoning separately from the answer
                         reasoning.append(delta.get("reasoning_content") or "")
-                    elif ev["type"] == "error":
-                        return JSONResponse({"error": {"message": ev["error"], "retryable": ev["retryable"],
-                                                       "job_id": ev["job_id"]}}, status_code=ev["status"])
-                    elif ev["type"] == "final":
-                        final = ev
+                    elif ev["type"] in ("error", "final"):
+                        return ev
+                return None
+
+            async def hung_up() -> None:
+                # the body is read, so the next ASGI message is the disconnect (request.is_disconnected()
+                # never sees it behind the main coordinator's BaseHTTPMiddleware)
+                while (await request.receive())["type"] != "http.disconnect":
+                    pass
+
+            # nothing is written until the reply is done, so watch for a hang-up (curl -m, a closed tab)
+            # and cancel serve() then: the head stops and only the partial work is charged
+            collector, watcher = asyncio.ensure_future(collect()), asyncio.ensure_future(hung_up())
+            try:
+                await asyncio.wait({collector, watcher}, return_when=asyncio.FIRST_COMPLETED)
             finally:
+                watcher.cancel()
+                collector.cancel()  # a no-op once it has finished
+                await asyncio.wait({collector})
+                # like sse(): serve() has cancelled the job on the head and recorded the tokens so far
+                # *before* settle() releases the reservation
+                await events.aclose()
                 settle()
+            if collector.cancelled():
+                return JSONResponse({"error": {"message": "client disconnected", "retryable": True,
+                                               "job_id": None}}, status_code=499)
+            final = collector.result()
+            if final is None or final["type"] == "error":
+                err = final or {"error": "no response", "status": 503, "retryable": True, "job_id": None}
+                return JSONResponse({"error": {"message": err["error"], "retryable": err["retryable"],
+                                               "job_id": err["job_id"]}}, status_code=err["status"])
             summ = final["summary"]
             message = {"role": "assistant", "content": "".join(text)}
             if any(reasoning):
