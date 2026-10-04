@@ -377,3 +377,60 @@ def test_uploads_to_a_closed_epoch_or_unknown_stage_are_refused(core, two_stage_
     with pytest.raises(ValueError, match="stale"):
         asyncio.run(core.on_checkpoint_upload(job.id, 1, 0, 5, parts[0]))
     assert job.row.last_checkpoint_step == 0 and not merges
+
+
+# ------------------------------------------------------------ loops and liveness
+
+
+def test_database_uses_wal(core):
+    with core.db.engine.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+
+
+def test_blocked_loop_does_not_evict_live_nodes(core):
+    core.cfg.heartbeat_interval_s, core.cfg.heartbeat_timeout_s = 0.1, 0.3
+    core.cfg.scheduler_tick_s = 0.02
+    _online(core, "n1", {})
+
+    async def scenario():
+        await core.recovery.tick()
+        time.sleep(0.5)  # a slow write blocks the loop past the heartbeat timeout
+        await core.recovery.tick()  # the node's heartbeats are still unread in its socket
+        assert core.registry.get("n1") is not None
+        core.registry.heartbeat("n1", "idle")  # ...and get read now
+        await core.recovery.tick()
+        assert core.registry.get("n1") is not None
+
+        # A node that really went quiet is still evicted once the loop runs normally.
+        for _ in range(40):
+            await asyncio.sleep(0.02)
+            await core.recovery.tick()
+        assert core.registry.get("n1") is None
+
+    asyncio.run(scenario())
+
+
+def test_liveness_checks_keep_running_while_scheduling_is_stuck(core):
+    core.cfg.scheduler_tick_s = 0.01
+    recovery_ticks = []
+    real = core.recovery.tick
+
+    async def counted():
+        recovery_ticks.append(1)
+        await real()
+
+    async def stuck():
+        await asyncio.sleep(3600)  # e.g. profiling a model over a slow link
+
+    async def broken():
+        raise RuntimeError("verification bug")
+
+    core.recovery.tick, core.scheduler.tick, core.verification.tick = counted, stuck, broken
+
+    async def scenario():
+        core.start()
+        await asyncio.sleep(0.3)
+        await core.stop()
+
+    asyncio.run(scenario())
+    assert len(recovery_ticks) >= 10

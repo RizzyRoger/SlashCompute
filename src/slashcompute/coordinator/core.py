@@ -1,5 +1,11 @@
 """Coordinator state and message routing. All mutation happens on the event
-loop thread, so no locking is needed."""
+loop thread, so no locking is needed. Blocking work (checkpoint merges, adapter
+exports, verification checks, model profiling) runs off the loop and only
+returns results; state changes after it re-check what may have moved meanwhile.
+
+Recovery, verification and scheduling tick in separate loops, so a slow
+scheduler pass can't hold up liveness checks and one failing part doesn't skip
+the others."""
 
 from __future__ import annotations
 
@@ -9,8 +15,9 @@ import logging
 import shutil
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from pydantic import BaseModel
 from sqlmodel import select
@@ -35,6 +42,7 @@ from slashcompute.common.config import allowed_model
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 MAX_DATASET_BYTES = 32 * 1024 * 1024
 
@@ -76,7 +84,10 @@ class Coordinator:
         self.verification = VerificationManager(self)
         self.jobs: dict[str, JobRuntime] = {}
         self._checkpoint_locks: dict[str, asyncio.Lock] = {}
-        self._task: Optional[asyncio.Task] = None
+        self._tasks: list[asyncio.Task] = []
+        # MLX must not be driven from several threads at once, so all of the coordinator's
+        # tensor and file work shares one thread.
+        self._mlx = ThreadPoolExecutor(max_workers=1, thread_name_prefix="coordinator-mlx")
         self._load_jobs()
 
     def _load_jobs(self) -> None:
@@ -94,25 +105,31 @@ class Coordinator:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._loop())
+        self._tasks = [asyncio.create_task(self._every(name, tick)) for name, tick in (
+            ("recovery", self.recovery.tick), ("verification", self.verification.tick),
+            ("scheduler", self.scheduler.tick))]
 
     async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        self._mlx.shutdown(wait=False, cancel_futures=True)
 
-    async def _loop(self) -> None:
+    async def _every(self, name: str, tick: Callable) -> None:
         while True:
             try:
-                await self.tick()
+                await tick()
             except Exception:
-                log.exception("coordinator tick failed")
+                log.exception("%s tick failed", name)
             await asyncio.sleep(self.cfg.scheduler_tick_s)
 
+    async def off_loop(self, fn: Callable[..., T], *args) -> T:
+        """Run MLX / file work on the coordinator's worker thread."""
+        return await asyncio.get_running_loop().run_in_executor(self._mlx, fn, *args)
+
     async def tick(self) -> None:
+        """One pass of every loop, in order (tests)."""
         await self.recovery.tick()
         await self.verification.tick()
         await self.scheduler.tick()
@@ -189,12 +206,16 @@ class Coordinator:
     async def complete_job(self, job: JobRuntime) -> None:
         row = job.row
         try:
-            self.checkpoints.export_adapter(job.id, job.spec.steps, job.spec, job.profile.num_layers)
+            async with self.checkpoint_lock(job.id):
+                await self.off_loop(self.checkpoints.export_adapter, job.id, job.spec.steps,
+                                    job.spec, job.profile.num_layers)
         except Exception as e:
             log.exception("adapter export failed")
             row.error = f"adapter export failed: {e}"
         else:
             row.error = None  # an earlier epoch's abort reason no longer applies
+        if row.status in TERMINAL:
+            return  # cancelled while the adapter was being written
         row.status, row.finished_at = "completed", now()
         self.db.save(row)
         self.credits.settle_job(job.id)
@@ -216,8 +237,8 @@ class Coordinator:
             # A recorded step is never merged again: it may be the file a resuming stage is
             # downloading right now (every stage re-uploads it on a drain just after a resume).
             fresh = step > job.row.last_checkpoint_step
-            merged = await asyncio.to_thread(self.checkpoints.store_stage, job_id, epoch, step,
-                                             stage_idx, data, len(cur.plans), fresh)
+            merged = await self.off_loop(self.checkpoints.store_stage, job_id, epoch, step,
+                                         stage_idx, data, len(cur.plans), fresh)
             if merged is not None and step > job.row.last_checkpoint_step:
                 job.row.last_checkpoint_step = step
                 self.db.save(job.row)

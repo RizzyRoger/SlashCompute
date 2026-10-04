@@ -128,9 +128,12 @@ class VerificationManager:
             self._finish(v, "error", msg.error or "bundle missing")
             return
         record = self.core.ledger.find_step(v.job_id, v.epoch, v.stage_idx, v.step)
-        tensors = mx.load(str(self.bundle_path(v.id)))
-        if record is None or digest(tensors["x_in"]) != record.in_digest \
-                or digest(tensors["out"]) != record.out_digest:
+        matches = record is not None and await self.core.off_loop(
+            _bundle_matches, self.bundle_path(v.id), record.in_digest, record.out_digest)
+        v = self._get(msg.verify_id)  # re-read: it may have moved on while we hashed
+        if v is None or v.status != "fetching":
+            return
+        if not matches:
             self._finish(v, "failed", "uploaded bundle does not match digests committed at step time")
             return
         v.status = "queued"
@@ -226,10 +229,11 @@ class VerificationManager:
         if msg.error or not self.result_path(v.id).exists():
             self._finish(v, "error", msg.error or "replay output missing")
             return
-        claimed = mx.load(str(self.bundle_path(v.id)))
-        replay = mx.load(str(self.result_path(v.id)))["out"]
-        err = relative_error(np.asarray(claimed["out"].astype(mx.float32)),
-                             np.asarray(replay.astype(mx.float32)))
+        err, (batch, seq) = await core.off_loop(_replay_error, self.bundle_path(v.id),
+                                                self.result_path(v.id))
+        v = self._get(msg.verify_id)  # re-read: it may have moved on while we compared
+        if v is None or v.status != "running" or v.verifier_node_id != node_id:
+            return
         ok = err <= core.cfg.verify_rel_tolerance
         self._finish(v, "passed" if ok else "failed", None if ok else "replay mismatch", err)
         job = core.jobs.get(v.job_id)
@@ -238,11 +242,10 @@ class VerificationManager:
                 run = s.exec(select(StageRun).where(
                     StageRun.job_id == v.job_id, StageRun.epoch == v.epoch,
                     StageRun.stage_idx == v.stage_idx)).first()
-            x = claimed["x_in"]
-            flops = replay_flops(job.profile, run.layer_start, run.layer_end, x.shape[0] * x.shape[1],
-                                 x.shape[1], run.layer_end == job.profile.num_layers)
+            flops = replay_flops(job.profile, run.layer_start, run.layer_end, batch * seq,
+                                 seq, run.layer_end == job.profile.num_layers)
             core.ledger.record_verify(node_id, v.job_id, UsageSample(
-                flops=flops, tokens=x.shape[0] * x.shape[1], peak_mem_bytes=0,
+                flops=flops, tokens=batch * seq, peak_mem_bytes=0,
                 resident_mem_bytes=0, mem_byte_seconds=0.0,
                 wall_s=msg.stats.get("wall_s", 0.0), busy_s=msg.stats.get("busy_s", 0.0)))
 
@@ -260,3 +263,22 @@ class VerificationManager:
                 else:  # hand it to another verifier
                     v.status, v.verifier_node_id = "queued", None
                     core.db.save(v)
+
+
+# ------------------------------------------------------------ off-loop checks
+
+
+def _bundle_matches(path: Path, in_digest: str, out_digest: str) -> bool:
+    tensors = mx.load(str(path))
+    return digest(tensors["x_in"]) == in_digest and digest(tensors["out"]) == out_digest
+
+
+def _replay_error(bundle_path: Path, result_path: Path) -> tuple[float, tuple[int, int]]:
+    """Relative error of the replayed output against the claimed one, and the (batch,
+    seq) shape of the replayed input."""
+    claimed = mx.load(str(bundle_path))
+    replay = mx.load(str(result_path))["out"]
+    err = relative_error(np.asarray(claimed["out"].astype(mx.float32)),
+                         np.asarray(replay.astype(mx.float32)))
+    x = claimed["x_in"]
+    return err, (int(x.shape[0]), int(x.shape[1]))

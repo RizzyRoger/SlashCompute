@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sqlmodel import select
 
@@ -29,15 +29,31 @@ log = logging.getLogger(__name__)
 class Recovery:
     def __init__(self, core: "Coordinator") -> None:
         self.core = core
+        self._last_tick: Optional[float] = None
+        self._hold_expiry_until = 0.0
+
+    def _loop_stalled(self) -> bool:
+        """True while recovering from a stall of the event loop (a slow write, a blocking
+        call, the machine sleeping). Heartbeats that arrived meanwhile still sit unread in
+        the sockets, so judging nodes by them would evict everyone at once."""
+        cfg = self.core.cfg
+        now = time.monotonic()
+        gap = now - self._last_tick if self._last_tick is not None else 0.0
+        self._last_tick = now
+        if gap > max(cfg.heartbeat_interval_s, 5 * cfg.scheduler_tick_s):
+            log.warning("coordinator loop stalled for %.1fs; holding node expiry", gap)
+            self._hold_expiry_until = now + 2 * cfg.heartbeat_interval_s
+        return now < self._hold_expiry_until
 
     async def tick(self) -> None:
         core = self.core
-        for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
-            log.warning("node %s missed heartbeats", node.node_id[:8])
-            await self.on_node_lost(node.node_id, "heartbeat timeout")
-        for node in core.registry.away(core.cfg.reconnect_grace_s):
-            await self.on_node_lost(node.node_id,
-                                    f"did not reconnect within {core.cfg.reconnect_grace_s:.0f}s")
+        if not self._loop_stalled():
+            for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
+                log.warning("node %s missed heartbeats", node.node_id[:8])
+                await self.on_node_lost(node.node_id, "heartbeat timeout")
+            for node in core.registry.away(core.cfg.reconnect_grace_s):
+                await self.on_node_lost(node.node_id,
+                                        f"did not reconnect within {core.cfg.reconnect_grace_s:.0f}s")
         for node in list(core.registry.nodes.values()):
             if (node.draining and node.assignment is not None and node.drain_deadline
                     and time.monotonic() > node.drain_deadline):
