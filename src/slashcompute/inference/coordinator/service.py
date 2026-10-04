@@ -467,7 +467,10 @@ def make_router(svc: InferenceService) -> APIRouter:
     async def agent_commands(request: Request, wait: float = 25.0):
         row = svc.node_from(request)
         conn.execute("UPDATE nodes SET last_heartbeat=? WHERE id=?", (time.time(), row["id"]))
-        return {"commands": await bus.poll(row["id"], min(wait, s.COMMAND_LONG_POLL_SECONDS))}
+        commands = await bus.poll(row["id"], min(wait, s.COMMAND_LONG_POLL_SECONDS))
+        if not commands and bus.closing.is_set():  # an empty 200 would have agents re-poll in a hot loop
+            raise HTTPException(503, "coordinator shutting down", headers={"Retry-After": "1"})
+        return {"commands": commands}
 
     @r.post("/agent/commands/{cid}/result")
     async def agent_result(cid: str, body: dict, request: Request):

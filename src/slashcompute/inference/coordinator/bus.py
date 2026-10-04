@@ -17,6 +17,7 @@ class CommandBus:
     def __init__(self):
         self.queues: dict[str, asyncio.Queue] = {}
         self.pending: dict[str, tuple[str, asyncio.Future]] = {}
+        self.dropped: set[str] = set()  # went offline and has not polled since
         self.closing = asyncio.Event()
 
     def queue(self, node_id: str) -> asyncio.Queue:
@@ -25,7 +26,8 @@ class CommandBus:
     def post(self, node_id: str, kind: str, payload: dict) -> str:
         """Fire-and-forget command (its result is ignored)."""
         cid = uuid.uuid4().hex[:16]
-        self.queue(node_id).put_nowait({'id': cid, 'kind': kind, 'payload': payload})
+        if node_id not in self.dropped:  # an offline node would never collect it; keep its queue gone
+            self.queue(node_id).put_nowait({'id': cid, 'kind': kind, 'payload': payload})
         return cid
 
     async def send(self, node_id: str, kind: str, payload: dict, timeout: float) -> dict:
@@ -42,10 +44,17 @@ class CommandBus:
 
     async def poll(self, node_id: str, wait: float) -> list[dict]:
         """Wait up to `wait`s for commands; returns empty at once when the coordinator shuts down."""
+        self.dropped.discard(node_id)
         q = self.queue(node_id)
         get, closing = asyncio.ensure_future(q.get()), asyncio.ensure_future(self.closing.wait())
         try:
             await asyncio.wait((get, closing), timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            if get.done() and not get.cancelled():  # dequeued just before the cancel: put it back first
+                rest = [q.get_nowait() for _ in range(q.qsize())]
+                for cmd in (get.result(), *rest):
+                    q.put_nowait(cmd)
+            raise
         finally:
             closing.cancel()
             got = get.done()
@@ -73,6 +82,7 @@ class CommandBus:
             if nid == node_id and not fut.done():
                 fut.set_exception(CommandFailed(reason))
         self.queues.pop(node_id, None)
+        self.dropped.add(node_id)
 
     def close(self) -> None:
         """Coordinator shutting down: release every agent's long-poll so the server can exit."""

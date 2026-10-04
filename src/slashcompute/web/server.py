@@ -56,13 +56,24 @@ def _hostname(value: str) -> str:
         return ""
 
 
+def _same_origin(origin: str, hosts: frozenset[str], port: int) -> bool:
+    """The shell's own pages: a local host on the shell's port. Any other port (a dev server, a page
+    from another local app) is a different origin even though the SameSite cookie still rides along."""
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and _hostname(origin) in hosts and origin_port == port
+
+
 def local_hosts(bind: str) -> frozenset[str]:
     """Names the shell answers to: loopback, plus the bind address when it is a specific LAN one."""
     bind = bind.strip().strip("[]").lower()
     return _LOOPBACK | {bind} if bind and bind not in ("0.0.0.0", "::") else _LOOPBACK
 
 
-def local_only(app, hosts: frozenset[str]):
+def local_only(app, hosts: frozenset[str], port: int):
     """ASGI guard: a foreign Host is DNS rebinding, a foreign Origin on a write is CSRF. Both get 403."""
     async def guard(scope, receive, send):
         if scope["type"] != "http":
@@ -71,8 +82,7 @@ def local_only(app, hosts: frozenset[str]):
         origin = headers.get("origin")
         if _hostname(f"//{headers.get('host', '')}") not in hosts:
             detail = "Host not allowed."
-        elif (scope["method"] not in _SAFE_METHODS and origin is not None
-              and not (origin.lower().startswith(("http://", "https://")) and _hostname(origin) in hosts)):
+        elif scope["method"] not in _SAFE_METHODS and origin is not None and not _same_origin(origin, hosts, port):
             detail = "Cross-origin request refused."
         else:
             return await app(scope, receive, send)
@@ -190,7 +200,7 @@ def create_shell(launcher: Optional[Launcher] = None,
                  stream_client: Optional[httpx.AsyncClient] = None) -> FastAPI:
     launch = launcher or Launcher()
     app = FastAPI(title="/compute")
-    app.add_middleware(local_only, hosts=local_hosts(SHELL_HOST))
+    app.add_middleware(local_only, hosts=local_hosts(SHELL_HOST), port=SHELL_PORT)
     app.state.launcher = launch
     streams = stream_client or httpx.AsyncClient(timeout=STREAM_TIMEOUT)
 

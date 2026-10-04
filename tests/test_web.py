@@ -150,12 +150,17 @@ def test_shell_refuses_foreign_host_and_cross_origin_writes(tmp_path):
             assert r.status_code == 403, origin
         for path in ("/api/stop", "/api/discover", "/api/coord/auth/logout"):
             assert c.post(path, headers={"origin": "https://evil.example"}).status_code == 403
+        # Another local port is another origin (a dev server, a page from some other local app), even
+        # though it is same-site and so still gets the SameSite=Lax session cookie.
+        for origin in ("http://localhost:3000", "http://127.0.0.1:9810", "http://[::1]", "https://127.0.0.1"):
+            r = c.post("/api/stop-agent", headers={"origin": origin, "content-type": "text/plain"})
+            assert r.status_code == 403, origin
         assert not stopped
         assert launcher.load_settings().session_token == "secret-sess"
-        # The UI itself: loopback Host and Origin, any port, any loopback name.
+        # The UI itself: loopback Host with any port and loopback name; Origin on the shell's own port.
         for host in ("127.0.0.1:8766", "localhost:9810", "[::1]:8766", "localhost"):
             assert c.get("/api/shell", headers={"host": host}).status_code == 200, host
-        for origin in ("http://127.0.0.1:8766", "http://localhost:9810", "http://[::1]:8766"):
+        for origin in ("http://127.0.0.1:8766", "http://localhost:8766", "http://[::1]:8766"):
             r = c.post("/api/stop-agent", headers={"origin": origin})
             assert r.status_code == 200, origin
         assert c.post("/api/stop-agent").status_code == 200   # no Origin: not a browser
@@ -169,6 +174,7 @@ def test_shell_allows_configured_lan_bind_host(tmp_path, monkeypatch):
     with TestClient(app, base_url="http://192.168.1.20:8766") as c:
         assert c.get("/api/shell").status_code == 200
         assert c.post("/api/settings", json={}, headers={"origin": "http://192.168.1.20:8766"}).status_code == 200
+        assert c.post("/api/settings", json={}, headers={"origin": "http://192.168.1.20:3000"}).status_code == 403
         assert c.get("/api/shell", headers={"host": "evil.example"}).status_code == 403
 
 

@@ -17,9 +17,16 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 from slashcompute.common import protocol as P
+<<<<<<< HEAD
 from slashcompute.coordinator.db import Database, Job
 from slashcompute.inference.coordinator.bus import CommandBus
 from slashcompute.jobs import LoraFinetuneSpec
+=======
+from slashcompute.inference import PREFIX
+from slashcompute.inference.config import InferenceSettings
+from slashcompute.inference.coordinator.bus import CommandBus
+from slashcompute.inference.coordinator.service import create_inference_app
+>>>>>>> 7ac0ca3 (fix: require the shell's own port on write Origins and harden the command bus poll)
 
 
 def _free_port() -> int:
@@ -52,6 +59,43 @@ async def test_close_releases_long_polls_without_eating_commands():
     await asyncio.sleep(0.05)
     bus.close()
     assert await asyncio.wait_for(waiting, 1) == []
+
+
+async def test_poll_cancelled_after_dequeue_keeps_the_command_in_order():
+    bus = CommandBus()
+    waiting = asyncio.create_task(bus.poll("n", 30))
+    await asyncio.sleep(0.05)
+    bus.post("n", "first", {})
+    bus.post("n", "second", {})
+    while bus.queues["n"].qsize() == 2:  # the poll's get() has taken "first"; the poll has not returned
+        await asyncio.sleep(0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert [c["kind"] for c in await bus.poll("n", 1)] == ["first", "second"]
+
+
+async def test_posts_to_a_dropped_node_are_not_queued_until_it_polls_again():
+    bus = CommandBus()
+    bus.post("n", "run_job", {})
+    bus.fail_node("n", "went offline")
+    bus.post("n", "cancel_job", {})
+    assert "n" not in bus.queues  # no queue resurrected for a node that is gone
+    assert await bus.poll("n", 0.01) == []
+    bus.post("n", "noop", {})
+    assert [c["kind"] for c in await bus.poll("n", 1)] == ["noop"]
+
+
+async def test_command_poll_during_shutdown_tells_the_agent_to_back_off():
+    app = create_inference_app(InferenceSettings(DB_PATH=":memory:", BACKGROUND_TASKS=False))
+    svc = app.state.inference
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=f"http://test{PREFIX}") as c:
+        r = await c.post("/nodes/register", json={"name": "a", "commitment": {},
+                                                  "llama_build": svc.s.PINNED_LLAMA_BUILD})
+        auth = {"authorization": f"Bearer {r.json()['token']}"}
+        svc.bus.close()
+        r = await c.get("/agent/commands", params={"wait": 20}, headers=auth)
+        assert r.status_code == 503 and r.headers["retry-after"] == "1"
 
 
 @pytest.mark.integration
