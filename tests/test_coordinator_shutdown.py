@@ -17,16 +17,12 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 from slashcompute.common import protocol as P
-<<<<<<< HEAD
 from slashcompute.coordinator.db import Database, Job
-from slashcompute.inference.coordinator.bus import CommandBus
-from slashcompute.jobs import LoraFinetuneSpec
-=======
 from slashcompute.inference import PREFIX
 from slashcompute.inference.config import InferenceSettings
 from slashcompute.inference.coordinator.bus import CommandBus
 from slashcompute.inference.coordinator.service import create_inference_app
->>>>>>> 7ac0ca3 (fix: require the shell's own port on write Origins and harden the command bus poll)
+from slashcompute.jobs import LoraFinetuneSpec
 
 
 def _free_port() -> int:
