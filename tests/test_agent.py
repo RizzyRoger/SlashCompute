@@ -873,3 +873,19 @@ async def test_checkpoint_upload_retries_connection_failures_only(tmp_path, monk
     with pytest.raises(httpx.HTTPStatusError):  # the coordinator said no: retrying won't help
         await worker.upload_checkpoint(Http(), "/stale", path, {})
     assert len(calls) == 3
+
+
+async def test_worker_that_cannot_start_is_reported_at_once(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import StageFinished
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch)
+
+    async def no_sandbox(*args, **kwargs):
+        raise FileNotFoundError("sandbox-exec")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", no_sandbox)
+    await daemon._start_stage(_assignment(epoch=1))
+    [finished] = [m for m in sent if isinstance(m, StageFinished)]
+    # Not a stage stuck "loading" until the coordinator's 15-minute start timeout.
+    assert finished.reason == "error" and "could not start the worker" in finished.detail
+    assert daemon._stage is None and daemon.status == "idle"

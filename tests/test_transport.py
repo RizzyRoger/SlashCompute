@@ -245,6 +245,8 @@ async def test_resilient_link_gives_up_after_its_window():
         with pytest.raises(LinkClosed) as e:
             await link.recv(10)
         assert not isinstance(e.value, LinkTimeout)
+        with pytest.raises(LinkClosed):  # a stage must not think "done" was delivered
+            await link.send(Frame("done", {"step": 3}))
     assert asyncio.get_running_loop().time() - t0 < 5
     await up.close()
     await down.close()
@@ -261,6 +263,8 @@ async def test_resilient_close_is_final_for_the_peer():
         await down.recv(10)
     assert asyncio.get_running_loop().time() - t0 < 2  # not after the 30 s resume window
     assert down.reconnects == 0
+    with pytest.raises(LinkClosed):
+        await down.send(Frame("bwd", {}))
     await down.close()
     await server.close()
 
@@ -290,3 +294,21 @@ async def test_resilience_needs_both_ends(dial_window, listen_window):
     await up.close()
     await down.close()
     await server.close()
+
+
+async def test_resume_arriving_after_close_is_dropped():
+    # The stage closed its link while the upstream's resume hello was being answered:
+    # nothing would ever read or close that connection, and LinkServer.close() would hang.
+    server, up, down = await _resilient_pair()
+    await down.close()
+    accepted = []
+    other = await asyncio.start_server(lambda r, w: accepted.append(w), "127.0.0.1", 0)
+    reader, writer = await asyncio.open_connection("127.0.0.1", other.sockets[0].getsockname()[1])
+    late = TcpLink(reader, writer)
+    await down.attach(late, 0)
+    assert writer.is_closing() and down._tcp is not late
+    await up.close()
+    await asyncio.wait_for(server.close(), 5)
+    for w in accepted:
+        w.close()
+    other.close()

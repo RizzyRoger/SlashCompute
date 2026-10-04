@@ -450,41 +450,52 @@ class Daemon:
             await asyncio.to_thread(resolve_model_path, asg.spec.model)
         except Exception as e:
             log.exception("model fetch failed")
-            if self._stage is stage:  # not cancelled meanwhile
-                await self.send(StageFinished(
-                    job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
-                    reason="error", last_step=asg.resume_step, detail=f"model fetch failed: {e}",
-                ))
-                self._release(stage)
+            await self._fail_start(stage, f"model fetch failed: {e}")
             return
-        spec_path = job_dir / "assignment.json"
-        spec_path.touch(mode=0o600)
-        spec_path.chmod(0o600)
-        spec_path.write_text(json.dumps({
-            "assignment": json.loads(asg.model_dump_json()),
-            "coordinator_url": self.opt.coordinator,
-            "session_token": self.opt.session_token,
-            "job_dir": str(job_dir),
-            "data_bind": self.opt.data_bind,
-            "data_port": self.opt.data_port,
-            "gpu_percent": self.opt.gpu_percent,
-            "node_id": self.opt.node_id,
-        }))
-        cmd = wrap_command(
-            [sys.executable, "-m", "slashcompute.agent.worker", "--assignment", str(spec_path)],
-            job_dir, self.opt.paths.root,
-        )
-        async with self._stage_lock:
-            if self._stage is not stage:
-                log.info("job %s epoch %d was cancelled before its worker started",
-                         asg.job_id, asg.epoch)
-                return
-            log.info("starting sandboxed worker: %s", " ".join(cmd))
-            stage.proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
-                env={**os.environ, "HF_HUB_OFFLINE": "1"},
+        try:
+            spec_path = job_dir / "assignment.json"
+            spec_path.touch(mode=0o600)
+            spec_path.chmod(0o600)
+            spec_path.write_text(json.dumps({
+                "assignment": json.loads(asg.model_dump_json()),
+                "coordinator_url": self.opt.coordinator,
+                "session_token": self.opt.session_token,
+                "job_dir": str(job_dir),
+                "data_bind": self.opt.data_bind,
+                "data_port": self.opt.data_port,
+                "gpu_percent": self.opt.gpu_percent,
+                "node_id": self.opt.node_id,
+            }))
+            cmd = wrap_command(
+                [sys.executable, "-m", "slashcompute.agent.worker", "--assignment", str(spec_path)],
+                job_dir, self.opt.paths.root,
             )
-            stage.pump = self._spawn(self._pump_worker_stdout(stage))
+            async with self._stage_lock:
+                if self._stage is not stage:
+                    log.info("job %s epoch %d was cancelled before its worker started",
+                             asg.job_id, asg.epoch)
+                    return
+                log.info("starting sandboxed worker: %s", " ".join(cmd))
+                stage.proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
+                    env={**os.environ, "HF_HUB_OFFLINE": "1"},
+                )
+                stage.pump = self._spawn(self._pump_worker_stdout(stage))
+        except Exception as e:
+            log.exception("could not start the sandboxed worker")
+            await self._fail_start(stage, f"could not start the worker: {e}")
+
+    async def _fail_start(self, stage: _Stage, detail: str) -> None:
+        """Report a stage that never started now, rather than leave the coordinator
+        waiting out its start timeout."""
+        if self._stage is not stage:
+            return  # cancelled meanwhile; nobody is waiting for it
+        asg = stage.asg
+        await self.send(StageFinished(
+            job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx, reason="error",
+            last_step=asg.resume_step, detail=detail,
+        ))
+        self._release(stage)
 
     async def _pump_worker_stdout(self, stage: _Stage) -> None:
         proc = stage.proc

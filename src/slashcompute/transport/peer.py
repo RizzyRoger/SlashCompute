@@ -219,7 +219,8 @@ class ResilientLink(Link):
         self._unacked: OrderedDict[int, Frame] = OrderedDict()
         self._send_lock = asyncio.Lock()
         self._replaced = asyncio.Event()
-        self._closed = False
+        self._closed = False                      # closed by us
+        self._gone = False                        # the peer closed it, or it could not reconnect
         self._down_since: Optional[float] = None  # first failure not yet fully resumed
         self.reconnects = 0
         self._pump_task = asyncio.create_task(self._pump())
@@ -234,10 +235,15 @@ class ResilientLink(Link):
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        return self._closed or self._gone
+
+    def _give_up(self) -> None:
+        self._gone = True
+        self._unacked.clear()
+        self._queue.put_nowait(_CLOSED)
 
     async def send(self, frame: Frame) -> None:
-        if self._closed:
+        if self.closed:  # don't let a stage think it delivered "done" on a dead link
             raise LinkClosed("peer link closed")
         self._send_seq += 1
         f = Frame(frame.kind, {**frame.meta, "_seq": self._send_seq}, frame.tensors)
@@ -264,14 +270,14 @@ class ResilientLink(Link):
                     if tcp is not self._tcp:
                         continue  # already replaced by a resumed connection
                     if self._closed or not await self._reconnect(tcp, e):
-                        self._queue.put_nowait(_CLOSED)
+                        self._give_up()
                         return
                     continue
                 if f.kind == "_ack":
                     self._on_ack(f.meta.get("seq", 0))
                     continue
                 if f.kind == "_fin":  # the peer closed on purpose: nothing to resume
-                    self._queue.put_nowait(_CLOSED)
+                    self._give_up()
                     return
                 seq = f.meta.pop("_seq", None)
                 if seq is None or seq <= self._recv_seq:  # retransmitted after a resume
@@ -329,6 +335,10 @@ class ResilientLink(Link):
         await self._resume(tcp, peer_recv_seq)
 
     async def _resume(self, tcp: TcpLink, peer_recv_seq: int) -> None:
+        if self.closed:
+            # A resume that raced our close (or came too late): nobody will read or close it.
+            tcp.abort()
+            return
         old, self._tcp = self._tcp, tcp
         if old is not tcp:
             old.abort()  # a send stuck on the dead connection fails now instead of at its timeout
