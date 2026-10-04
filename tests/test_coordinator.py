@@ -311,3 +311,50 @@ def test_submit_rejects_non_string_kind(env, kind):
     body = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json()) | {"kind": kind}
     r = client.post("/jobs", json=body)
     assert r.status_code == 400, r.text
+
+
+def _cli(monkeypatch, client, seen=None):
+    """Route the coordinator CLI's HTTP calls into the in-process app."""
+    import httpx
+
+    from slashcompute.coordinator import main
+
+    def request(method, url, timeout=None, **kw):
+        if seen is not None:
+            seen.append(kw.get("headers") or {})
+        return client.request(method, url, **kw)
+
+    monkeypatch.setattr(httpx, "request", request)
+    return main.app
+
+
+@pytest.mark.parametrize("args", [["jobs", "nope"], ["cancel", "nope"]])
+def test_cli_reports_http_errors_without_traceback(env, monkeypatch, args):
+    from typer.testing import CliRunner
+
+    res = CliRunner().invoke(_cli(monkeypatch, env[0]), args + ["--url", "http://127.0.0.1:9970"])
+    assert res.exit_code == 1
+    assert isinstance(res.exception, SystemExit)
+    assert "not found" in res.output.lower()
+
+
+def test_cli_reports_unreachable_coordinator():
+    from typer.testing import CliRunner
+
+    from slashcompute.coordinator import main
+
+    res = CliRunner().invoke(main.app, ["jobs", "--url", "http://127.0.0.1:9971"])
+    assert res.exit_code == 1
+    assert isinstance(res.exception, SystemExit)
+    assert "cannot reach coordinator at http://127.0.0.1:9971" in res.output
+
+
+def test_cli_sends_session_token_as_bearer(env, monkeypatch):
+    from typer.testing import CliRunner
+
+    seen = []
+    app = _cli(monkeypatch, env[0], seen)
+    url = ["--url", "http://127.0.0.1:9970"]
+    CliRunner().invoke(app, ["cancel", "nope", "--session-token", "tok1"] + url)
+    CliRunner().invoke(app, ["cancel", "nope"] + url, env={"SLASHCOMPUTE_SESSION": "tok2"})
+    assert [h.get("Authorization") for h in seen] == ["Bearer tok1", "Bearer tok2"]

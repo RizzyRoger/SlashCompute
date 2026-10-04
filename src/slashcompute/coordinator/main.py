@@ -19,6 +19,25 @@ def _url(url: Optional[str]) -> str:
     return url or f"http://127.0.0.1:{EngineConfig.from_env().coordinator_port}"
 
 
+SessionToken = typer.Option(None, "--session-token", envvar="SLASHCOMPUTE_SESSION",
+                            help="Account session (needed on a public pool)")
+
+
+def _call(method: str, path: str, url: Optional[str], token: Optional[str] = None,
+          timeout: float = 30, **kw) -> None:
+    base = _url(url)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = httpx.request(method, f"{base}{path}", headers=headers, timeout=timeout, **kw)
+    except httpx.HTTPError as e:
+        typer.echo(f"cannot reach coordinator at {base}: {e}", err=True)
+        raise typer.Exit(1)
+    if r.status_code >= 400:
+        typer.echo(r.text, err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(r.json(), indent=2))
+
+
 @app.command()
 def serve(
     host: str = typer.Option(None, help="Bind address (default 0.0.0.0)"),
@@ -52,23 +71,18 @@ def serve(
 
 
 @app.command()
-def submit(spec: Path = typer.Argument(..., help="JSON job spec"), url: Optional[str] = None):
+def submit(spec: Path = typer.Argument(..., help="JSON job spec"), url: Optional[str] = None,
+           session_token: Optional[str] = SessionToken):
     """Submit a job spec (JSON file)."""
     body = json.loads(spec.read_text())
     if "dataset_path" in body:
         body["dataset_path"] = str((spec.parent / body["dataset_path"]).resolve()) \
             if not Path(body["dataset_path"]).is_absolute() else body["dataset_path"]
-    r = httpx.post(f"{_url(url)}/jobs", json=body, timeout=60)
-    if r.status_code >= 400:
-        typer.echo(r.text, err=True)
-        raise typer.Exit(1)
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("POST", "/jobs", url, session_token, timeout=60, json=body)
 
 
 def _get(path: str, url: Optional[str]):
-    r = httpx.get(f"{_url(url)}{path}", timeout=30)
-    r.raise_for_status()
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("GET", path, url)
 
 
 @app.command()
@@ -96,11 +110,10 @@ def verifications(url: Optional[str] = None):
 
 
 @app.command()
-def cancel(job_id: str, url: Optional[str] = None):
+def cancel(job_id: str, url: Optional[str] = None,
+           session_token: Optional[str] = SessionToken):
     """Cancel a job."""
-    r = httpx.post(f"{_url(url)}/jobs/{job_id}/cancel", timeout=30)
-    r.raise_for_status()
-    typer.echo(json.dumps(r.json(), indent=2))
+    _call("POST", f"/jobs/{job_id}/cancel", url, session_token)
 
 
 if __name__ == "__main__":
