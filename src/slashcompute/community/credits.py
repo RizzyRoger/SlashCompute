@@ -191,15 +191,19 @@ class Credits:
 
     def consume_job(self, job_id: str, flops: float) -> float:
         """Charge a job's reserve. Returns FLOPs actually charged."""
-        acct = self.job_account(job_id)
-        if acct is None or flops <= 0:
+        if flops <= 0:
             return 0.0
-        remaining = acct.reserved_flops - acct.spent_flops
-        take = min(flops, remaining)
-        if take:
-            acct.spent_flops += take
-            self.db.save(acct)
-            self.post(acct.user_id, "consumed", take, job_id=job_id)
+        with self._spend_lock, self.db.session() as s:
+            acct = s.get(JobAccount, job_id)
+            if acct is None:
+                return 0.0
+            remaining = acct.reserved_flops - acct.spent_flops
+            take = min(flops, remaining)
+            if take:
+                acct.spent_flops += take
+                s.add(acct)
+                s.add(CreditTxn(user_id=acct.user_id, kind="consumed", amount=take, job_id=job_id))
+                s.commit()
         return take
 
     def job_exhausted(self, job_id: str) -> bool:
@@ -209,14 +213,18 @@ class Credits:
         return acct.spent_flops >= acct.reserved_flops - 1e-9
 
     def settle_job(self, job_id: str) -> None:
-        acct = self.job_account(job_id)
-        if acct is None:
-            return
-        leftover = max(0.0, acct.reserved_flops - acct.spent_flops)
-        if leftover:
-            self.post(acct.user_id, "release", leftover, job_id=job_id)
-            acct.reserved_flops = acct.spent_flops
-            self.db.save(acct)
+        # Settling shrinks the reserve to what was spent, so a settled account
+        # has nothing left to release and repeat settles are no-ops.
+        with self._spend_lock, self.db.session() as s:
+            acct = s.get(JobAccount, job_id)
+            if acct is None:
+                return
+            leftover = max(0.0, acct.reserved_flops - acct.spent_flops)
+            if leftover:
+                acct.reserved_flops = acct.spent_flops
+                s.add(acct)
+                s.add(CreditTxn(user_id=acct.user_id, kind="release", amount=leftover, job_id=job_id))
+                s.commit()
 
     def donate(self, donor_id: str, recipient_id: str, grant_id: str, flops: float) -> None:
         if flops <= 0:

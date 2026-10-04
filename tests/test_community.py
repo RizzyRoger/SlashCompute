@@ -1118,6 +1118,21 @@ def test_concurrent_spends_cannot_overdraw(core):
     assert core.credits.balance(member.id) == 0.0
 
 
+def test_concurrent_consume_and_settle_keep_job_books_straight(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 100.0, 0)
+    core.credits.reserve_job(user.id, "job-r", 80.0)
+    # Every charge lands on the account: no lost updates to spent_flops.
+    assert _race_count(16, lambda: core.credits.consume_job("job-r", 1.0)) == 16
+    assert core.credits.job_account("job-r").spent_flops == 16.0
+    assert core.credits.lifetime_spent(user.id) == 16.0
+    # The leftover is released exactly once however many settles race.
+    _race_count(16, lambda: core.credits.settle_job("job-r"))
+    assert core.credits.balance(user.id) == 84.0
+    assert core.credits.reserved_in_flight(user.id) == 0.0
+    assert core.credits.consume_job("job-r", 1.0) == 0.0
+
+
 def test_http_admin_flags_reject_string_booleans(env):
     client, core, *_ = env
     admin_tok = client.post("/auth/register", json={
