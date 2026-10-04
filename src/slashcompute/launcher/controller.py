@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -32,6 +33,14 @@ TRANSPORTS = ("direct", "relay")
 UNREACHABLE_ERRORS = ("No coordinator at ", "Coordinator started but is not answering ")
 OUTDATED_COORDINATOR = ("This pool's coordinator has no LLM inference: it runs an older /compute. "
                         "Ask whoever hosts it to update and restart it, or host a pool on this Mac.")
+
+
+def stateless_http(**kw: Any) -> httpx.Client:
+    """Client for the shared shell: it proxies many browsers, so it must never keep a cookie (a
+    stored Set-Cookie would sign every cookie-less request in as the last user). Each request
+    carries only the caller's own Cookie/Authorization headers."""
+    jar = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+    return httpx.Client(follow_redirects=False, cookies=jar, **kw)
 
 
 def supports_inference(health: Optional[dict]) -> Optional[bool]:
@@ -159,7 +168,7 @@ class Launcher:
         self.home.mkdir(parents=True, exist_ok=True)
         self.python = python or sys.executable
         self._popen = popen
-        self._http = http or httpx.Client(follow_redirects=False)
+        self._http = http or stateless_http()
         self._discover = discover_fn
         self._lan_ip = lan_ip_fn
         self._memory = memory_fn

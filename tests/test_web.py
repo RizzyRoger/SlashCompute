@@ -2,7 +2,9 @@ import json
 
 from fastapi.testclient import TestClient
 
-from slashcompute.launcher.controller import Launcher, LauncherSettings
+from slashcompute.common.config import EngineConfig
+from slashcompute.coordinator.app import create_app
+from slashcompute.launcher.controller import Launcher, LauncherSettings, stateless_http
 from slashcompute.web.server import create_shell
 
 
@@ -332,6 +334,23 @@ def test_proxy_forwards_set_cookie(tmp_path):
         r = c.post("/api/coord/auth/login", json={"email": "ada@lan.test", "password": "password1"})
         assert r.status_code == 200
         assert "slashcompute_session=sess" in r.headers.get("set-cookie", "")
+
+
+def test_proxy_never_reuses_another_browsers_session(tmp_path, monkeypatch):
+    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
+    coord_app = create_app(EngineConfig(home=tmp_path / "coord", scheduler_tick_s=0.05))
+    with TestClient(coord_app) as coord:
+        app, launcher, _ = _shell(tmp_path / "shell", http=stateless_http(transport=coord._transport))
+        launcher.save_settings(LauncherSettings(mode="join", url="http://testserver"))
+        with TestClient(app) as c:
+            r = c.post("/api/coord/auth/register", json={
+                "email": "ada@lan.test", "password": "password1", "name": "Ada"})
+            assert r.status_code == 200, r.text
+            assert "slashcompute_session=" in r.headers.get("set-cookie", "")
+            assert c.get("/api/coord/auth/me").json()["user"]["email"] == "ada@lan.test"
+            c.cookies.clear()
+            assert c.get("/api/coord/auth/me").json()["user"] is None
+        assert not launcher._http.cookies
 
 
 def test_live_grants_empty_when_coordinator_down(tmp_path):
