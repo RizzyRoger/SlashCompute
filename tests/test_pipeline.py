@@ -7,13 +7,18 @@ from slashcompute.pipeline.data import load_examples, make_batch
 from slashcompute.pipeline.local import build_compute, run_local_pipeline
 from slashcompute.pipeline.model_profile import profile_model
 from slashcompute.pipeline.shard import load_shard
-from slashcompute.pipeline.stage import merge_checkpoints
+from slashcompute.pipeline.stage import merge_checkpoints, token_losses
 
 
 def _spec(model, data, **kw):
     base = dict(model=str(model), dataset_path=str(data), steps=4, batch_size=4, microbatches=2,
                 learning_rate=1e-2, lora_rank=4, max_seq_len=32, seed=7)
     return LoraFinetuneSpec(**(base | kw))
+
+
+def _batch_loss(compute, batch) -> float:
+    tl = token_losses(compute.forward(batch.inputs), batch.targets, batch.mask)
+    return (tl.sum() / batch.ntoks).item()
 
 
 def test_profile(tiny_model):
@@ -65,7 +70,15 @@ async def test_pipeline_matches_single_stage_reference(tiny_model, tiny_dataset,
 
     ref_losses = [s.loss for s in ref[0]]
     assert len(ref_losses) == 4
-    assert ref_losses[-1] < ref_losses[0]  # it learns
+    # It learns: each step draws its own batch, so compare the loss on one
+    # fixed batch (step 1's) before training and with the final adapters.
+    batch = make_batch(load_examples(tiny_dataset, tiny_model, spec.max_seq_len), 1,
+                       spec.batch_size, spec.seed)
+    compute = build_compute(spec, 0, 6, 6)
+    before = _batch_loss(compute, batch)
+    compute.load_checkpoint(tmp_path / "ref/stage0/step_000004.safetensors")
+    assert before == pytest.approx(ref_losses[0], rel=1e-4)
+    assert _batch_loss(compute, batch) < before
     for got in (two, three):
         last = max(got)
         losses = [s.loss for s in got[last]]
