@@ -58,3 +58,46 @@ def test_install_app_writes_plist_and_launcher(tmp_path):
     icon = dest / "Contents" / "Resources" / "icon.png"
     assert icon.is_file()
     assert icon.read_bytes() == (ROOT / "scripts" / "macos" / "icon.png").read_bytes()
+
+
+def _fake_repo(repo: Path, marker: Path) -> Path:
+    py = repo / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text(f"#!/bin/sh\npwd > '{marker}'\n")
+    py.chmod(py.stat().st_mode | stat.S_IEXEC)
+    return repo
+
+
+def test_install_app_refuses_non_app_dest(tmp_path):
+    repo = _fake_repo(tmp_path / "repo", tmp_path / "marker")
+    home = tmp_path / "home"
+    home.mkdir()
+    keep = home / "keep.txt"
+    keep.write_text("precious")
+    # Only temp paths here: a regression would rm -rf whatever is listed.
+    for dest in (str(home), f"{home}/", str(tmp_path / "somedir")):
+        r = subprocess.run(
+            ["bash", str(INSTALL), "--repo", str(repo), "--dest", dest],
+            env={**os.environ, "HOME": str(home)},
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode != 0, dest
+        assert "Refusing --dest" in r.stderr
+    assert keep.read_text() == "precious"
+
+
+def test_install_app_launcher_quotes_hostile_repo_path(tmp_path):
+    marker = tmp_path / "marker"
+    repo = _fake_repo(tmp_path / 're"po $(touch pwned) `touch pwned` $HOME', marker)
+    dest = tmp_path / "compute.app"
+    subprocess.run(
+        ["bash", str(INSTALL), "--repo", str(repo), "--dest", str(dest)],
+        check=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+    )
+    launch = dest / "Contents" / "MacOS" / "compute"
+    subprocess.run(["bash", "-n", str(launch)], check=True)
+    subprocess.run([str(launch)], check=True, cwd=tmp_path)
+    assert not (tmp_path / "pwned").exists()
+    assert Path(marker.read_text().strip()).resolve() == repo.resolve()

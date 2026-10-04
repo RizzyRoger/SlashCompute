@@ -23,6 +23,12 @@ if [[ -z "$DEST" ]]; then
   mkdir -p "$HOME/Applications"
   DEST="$HOME/Applications/compute.app"
 fi
+# DEST gets rm -rf'd below, so only ever accept an app bundle path.
+DEST="${DEST%/}"
+if [[ "$DEST" != *.app || "$DEST" == "${HOME%/}" ]]; then
+  echo "Refusing --dest $DEST: must be a path ending in .app" >&2
+  exit 2
+fi
 
 PY="$REPO/.venv/bin/python"
 if [[ ! -x "$PY" ]]; then
@@ -58,12 +64,13 @@ cat > "$CONTENTS/Info.plist" <<EOF
 </plist>
 EOF
 
-cat > "$MACOS/compute" <<EOF
-#!/bin/bash
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
-cd "$REPO"
-exec "$PY" -m slashcompute.launcher.main
-EOF
+# %q-quote the paths so quotes, $ or backticks in them stay literal.
+{
+  echo '#!/bin/bash'
+  echo 'export PATH="/usr/bin:/bin:/usr/sbin:/sbin"'
+  printf 'cd %q\n' "$REPO"
+  printf 'exec %q -m slashcompute.launcher.main\n' "$PY"
+} > "$MACOS/compute"
 chmod +x "$MACOS/compute"
 
 ICON_SRC="$SCRIPT_DIR/icon.png"
