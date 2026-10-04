@@ -648,6 +648,9 @@ def test_http_ban_blocks_take(env):
 
 
 def test_http_admin_cannot_ban_self_or_last_admin(env):
+
+
+def test_http_admin_flags_reject_string_booleans(env):
     client, core, *_ = env
     admin_tok = client.post("/auth/register", json={
         "email": "admin@lan.test", "password": "password1", "name": "Admin",
@@ -668,6 +671,39 @@ def test_http_admin_cannot_ban_self_or_last_admin(env):
     r = client.post(f"/admin/users/{other.id}/ban", json={}, headers=_hdr(other_tok))
     assert r.status_code == 400, r.text
     assert client.get("/admin/users", headers=_hdr(other_tok)).status_code == 200
+
+
+    member_tok = client.post("/auth/register", json={
+        "email": "m@lan.test", "password": "password1", "name": "Member",
+    }).json()["token"]
+    member = core.auth.user_from_token(member_tok)
+    client.post("/auth/accept-terms", headers=_hdr(member_tok))
+    g = client.post("/grants", json={
+        "title": "Need compute", "body": "A short paragraph about the need.",
+        "goal_flops": 50,
+    }, headers=_hdr(member_tok)).json()
+    # bool("false") is True: these used to approve and ban.
+    for bad in ("yes", 0, 1, [], "False"):
+        r = client.post(f"/admin/grants/{g['id']}/review", json={"approve": bad},
+                        headers=_hdr(admin_tok))
+        assert r.status_code == 400, (bad, r.text)
+        r = client.post(f"/admin/users/{member.id}/ban", json={"banned": bad},
+                        headers=_hdr(admin_tok))
+        assert r.status_code == 400, (bad, r.text)
+        r = client.post(f"/grants/{g['id']}/donate", json={"flops": 1, "from_pot": bad},
+                        headers=_hdr(member_tok))
+        assert r.status_code == 400, (bad, r.text)
+    assert core.auth.get(member.id).banned is False
+    declined = client.post(f"/admin/grants/{g['id']}/review", json={"approve": "false"},
+                           headers=_hdr(admin_tok))
+    assert declined.status_code == 200, declined.text
+    assert declined.json()["status"] == "declined"
+    r = client.post(f"/admin/users/{member.id}/ban", json={"banned": "false"},
+                    headers=_hdr(admin_tok))
+    assert r.status_code == 200, r.text
+    assert core.auth.get(member.id).banned is False
+    client.post(f"/admin/users/{member.id}/ban", json={}, headers=_hdr(admin_tok))
+    assert core.auth.get(member.id).banned is True
 
 
 # --------------------------------------------------------------------------- engine hooks

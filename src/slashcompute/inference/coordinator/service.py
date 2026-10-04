@@ -27,6 +27,7 @@ from typing import Optional
 from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.inference import PREFIX
 from slashcompute.inference import flops as fl
 from slashcompute.inference.accounting import Accounting, AccountingError, NullAccounting
@@ -562,6 +563,9 @@ def make_v1_router(svc: InferenceService) -> APIRouter:
         except (TypeError, ValueError, OverflowError):
             raise HTTPException(400, "max_tokens must be an integer.") from None
         stream = bool(body.get("stream"))
+
+
+        stream = body_bool(body, "stream")
         engine_body = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "model")}
         account_id = "inf-" + uuid.uuid4().hex[:12]
         reserved = False

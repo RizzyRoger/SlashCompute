@@ -11,6 +11,7 @@ from slashcompute.community.auth import AuthError, google_client_id
 from slashcompute.community.credits import CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.community.terms import TERMS
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import User
 
@@ -197,7 +198,7 @@ def mount_community(app, core: Coordinator) -> None:
         user = require_terms(request, authorization)
         try:
             g = core.grants.donate(user, grant_id, float(body.get("flops", 0)),
-                                   from_pot=bool(body.get("from_pot")))
+                                   from_pot=body_bool(body, "from_pot"))
         except (GrantError, CreditError, TypeError, ValueError) as e:
             _raise(e if isinstance(e, (GrantError, CreditError)) else CreditError(str(e)))
         return core.grants.view(g, names())
@@ -217,7 +218,7 @@ def mount_community(app, core: Coordinator) -> None:
                authorization: Optional[str] = Header(default=None)):
         admin = require(request, authorization)
         try:
-            g = core.grants.review(admin, grant_id, bool(body.get("approve")),
+            g = core.grants.review(admin, grant_id, body_bool(body, "approve"),
                                   note=body.get("note"))
         except GrantError as e:
             _raise(e)
@@ -241,6 +242,9 @@ def mount_community(app, core: Coordinator) -> None:
             if len(admins) <= 1:
                 raise HTTPException(400, "Cannot ban the last admin.")
         return {"user": core.auth.public_view(core.auth.set_banned(user, bool(body.get("banned", True))))}
+
+
+        return {"user": core.auth.public_view(core.auth.set_banned(user, body_bool(body, "banned", True)))}
 
     @r.post("/admin/users/{user_id}/flag")
     def flag(user_id: str, body: dict, request: Request,

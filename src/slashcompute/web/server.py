@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from slashcompute.common.config import DEMO_MODEL_CANDIDATES, DEV_MODEL
+from slashcompute.common.jsonbool import body_bool
 from slashcompute.launcher.controller import (
     FINISHES, OUTDATED_COORDINATOR, Launcher, LauncherError, LauncherSettings, supports_inference,
 )
@@ -357,7 +358,7 @@ def create_shell(launcher: Optional[Launcher] = None,
     @app.post("/api/grants/{grant_id}/review")
     def review_grant(grant_id: str, body: dict, request: Request):
         coord_call(request, "POST", f"/admin/grants/{grant_id}/review", payload={
-            "approve": bool(body.get("approve")),
+            "approve": body_bool(body, "approve"),
             "note": body.get("note"),
         })
         return grant_board(request, str(body.get("sort", "top")))

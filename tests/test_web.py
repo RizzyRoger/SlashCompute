@@ -396,3 +396,8 @@ def test_live_grants_flow(tmp_path):
         assert any(g["id"] == "g2" for g in approved["grants"])
         again = c.post("/api/grants/g2/review", json={"approve": True})
         assert again.status_code == 400
+        # bool("false") is True: the shell used to forward this as an approval.
+        assert c.post("/api/grants/g3/review", json={"approve": "yes"}).status_code == 400
+        declined = c.post("/api/grants/g3/review", json={"approve": "false"})
+        assert declined.status_code == 200, declined.text
+        assert all(g["id"] != "g3" for g in declined.json()["grants"])
