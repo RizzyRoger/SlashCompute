@@ -175,6 +175,62 @@ async def test_idle_pipeline_is_torn_down():
         await h.stop()
 
 
+async def test_coordinator_restart_stops_the_pipelines_it_left_live(tmp_path):
+    """A restarted coordinator has no runtime for the pipelines its DB still shows live: they must not
+    keep holding the node's memory (every chat then fails with 'only 0.3 GB usable'), and the node
+    must stop the llama.cpp processes it still runs for them."""
+    from inf_harness import Harness
+    from slashcompute.inference.node.fake_engine import FakeCluster
+
+    # slow offline detection: the old run must not break the pipeline while it shuts down
+    settings = fast_settings(DB_PATH=str(tmp_path / "inference.db"), PIPELINE_IDLE_SECONDS=30,
+                             OFFLINE_AFTER_SECONDS=5)
+    h = await Harness(settings, FakeCluster()).start(9870)
+    try:
+        h.add_model(qwen_layout())
+        await h.add_nodes([FakeNode("head", 24, may_be_head=True, files=(QWEN,))])
+        r1 = await chat(h, QWEN)
+        assert r1.status_code == 200, r1.text
+        old = r1.json()["network"]["pipeline_id"]
+
+        h.server.should_exit = True  # SIGTERM; the node keeps running
+        await h._task
+        await h.start(9870)
+        (stale,) = pipelines(h)
+        assert stale["state"] == "stopped" and stale["stopped_at"] and stale["broken_reason"] == "coordinator restarted"
+
+        r2 = await chat(h, QWEN, content="again")
+        assert r2.status_code == 200, r2.text
+        new = r2.json()["network"]["pipeline_id"]
+        assert new != old
+        agent = h.agents["head"]
+        for _ in range(40):
+            if old not in agent.engine.heads:
+                break
+            await asyncio.sleep(0.05)
+        assert set(agent.engine.heads) == {new} and set(agent.in_use) == {new}
+    finally:
+        await h.stop()
+
+
+async def test_node_stops_pipelines_the_coordinator_does_not_know(two_node):
+    """A node reports the pipelines it holds on each heartbeat; ones the coordinator isn't running
+    (e.g. broken while the node was unreachable, so the stop never arrived) are stopped."""
+    h = two_node
+    assert (await chat(h, QWEN)).status_code == 200
+    (p,) = pipelines(h)
+    head, worker = h.agents["head"], h.agents["worker"]
+    head.in_use["p-ghost"], head.engine.heads["p-ghost"] = GB, {}
+    worker.in_use["p-ghost"], worker.engine.workers["p-ghost"] = GB, {}
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if "p-ghost" not in head.in_use and "p-ghost" not in worker.in_use:
+            break
+    assert set(head.in_use) == set(head.engine.heads) == {p["id"]}
+    assert set(worker.in_use) == set(worker.engine.workers) == {p["id"]}
+    assert (await chat(h, QWEN, content="again")).status_code == 200
+
+
 async def test_node_failure_breaks_pipeline_replans_and_retries():
     h = await start_harness(fast_settings(), time_scale=1.0)
     try:

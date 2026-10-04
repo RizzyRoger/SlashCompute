@@ -109,6 +109,7 @@ class InferenceService:
     def start(self) -> None:
         self.latency_kick = asyncio.Event()
         self.bus.closing = asyncio.Event()  # bound to this run's event loop
+        self.mgr.recover()
         if self.s.BACKGROUND_TASKS:
             for loop in (self.monitor_loop, self.tick_loop, self.latency_loop):
                 self.spawn(loop())
@@ -411,6 +412,7 @@ def make_router(svc: InferenceService) -> APIRouter:
         conn.execute("UPDATE nodes SET last_heartbeat=?, available=?, downloads_json=? WHERE id=?",
                      (time.time(), available, json.dumps(body.get("downloads") or {}), row["id"]))
         svc.online.add(row["id"])
+        mgr.reconcile(row["id"], body.get("pipelines") or [])
         if row["available"] and not available:
             # paused, training took the Mac, or shutting down: finish the current job, then leave pipelines
             reason = body.get("reason") or ("node shutting down" if body.get("leaving") else "node unavailable")

@@ -322,6 +322,33 @@ class PipelineManager:
             self._set_state(rt, "stopped", reason)
         self._stop_processes(rt)
 
+    def recover(self, reason: str = "coordinator restarted") -> None:
+        """At startup: pipelines a previous run left live have no runtime here and would hold their
+        members' memory forever. Mark them stopped and tell the members to stop their processes."""
+        live = ",".join("?" * len(nodes.LIVE_STATES))
+        rows = self.conn.execute(
+            f"SELECT m.pipeline_id, m.node_id, m.role FROM pipeline_members m JOIN pipelines p ON p.id = m.pipeline_id "
+            f"WHERE p.state IN ({live})", nodes.LIVE_STATES).fetchall()
+        with tx(self.conn):
+            n = self.conn.execute(f"UPDATE pipelines SET state='stopped', stopped_at=?, broken_reason=? "
+                                  f"WHERE state IN ({live})", (time.time(), reason, *nodes.LIVE_STATES)).rowcount
+        if n:
+            log.info("stopped %d pipeline(s) left live by a previous run (%s)", n, reason)
+        for r in rows:
+            self.bus.post(r["node_id"], f"stop_{r['role']}", {"pipeline_id": r["pipeline_id"]})
+
+    def reconcile(self, node_id: str, held: list[str]) -> None:
+        """A node reports the pipelines it holds: stop the ones not running here (left from before a
+        restart, or broken while the node was unreachable so its stop never arrived)."""
+        for pid in held:
+            rt = self.runtimes.get(pid)
+            if rt is not None and rt.state not in TERMINAL:
+                continue
+            row = self.conn.execute("SELECT role FROM pipeline_members WHERE pipeline_id=? AND node_id=?",
+                                    (pid, node_id)).fetchone()
+            for kind in [f"stop_{row['role']}"] if row else ["stop_head", "stop_worker"]:
+                self.bus.post(node_id, kind, {"pipeline_id": pid})
+
     async def on_node_offline(self, node_id: str, name: str = "") -> None:
         """A node missed its heartbeats: break its pipelines and lower its reliability if it dropped
         out of a pipeline (live, or broken moments ago by the head losing it)."""
