@@ -9,6 +9,7 @@ from typing import Optional
 from sqlmodel import select
 
 from slashcompute.community.credits import Credits
+from slashcompute.community.fields import text
 from slashcompute.coordinator.db import Database, Grant, GrantComment, User, UserFlag, now
 
 # Far beyond any real ask; keeps goals finite so progress math and JSON stay sane.
@@ -29,8 +30,8 @@ class Grants:
     def create(self, author: User, title: str, body: str, goal_flops: float) -> Grant:
         if author.banned:
             raise GrantError("Banned accounts cannot open grants.", 403)
-        title = (title or "").strip()[:120]
-        body = (body or "").strip()[:4000]
+        title = text(title, "title", GrantError).strip()[:120]
+        body = text(body, "body", GrantError).strip()[:4000]
         if len(title) < 4 or len(body) < 20:
             raise GrantError("Describe the need: a title and at least a short paragraph.")
         try:
@@ -61,13 +62,14 @@ class Grants:
                note: Optional[str] = None) -> Grant:
         if not admin.admin:
             raise GrantError("Admin only.", 403)
+        note = text(note, "note", GrantError)
         g = self.get(grant_id)
         if g.status != "pending":
             raise GrantError("This grant was already reviewed.")
         g.status = "approved" if approve else "declined"
         g.reviewed_at = now()
         g.reviewed_by = admin.id
-        g.review_note = (note or "").strip()[:500] or None
+        g.review_note = note.strip()[:500] or None
         self.db.save(g)
         return g
 
@@ -101,10 +103,10 @@ class Grants:
             raise GrantError("Grant not found.", 404)
         if g.status == "declined":
             raise GrantError("This grant is not public.")
-        text = (body or "").strip()[:2000]
-        if len(text) < 2:
+        body = text(body, "body", GrantError).strip()[:2000]
+        if len(body) < 2:
             raise GrantError("Write a short comment.")
-        row = GrantComment(grant_id=g.id, user_id=user.id, body=text)
+        row = GrantComment(grant_id=g.id, user_id=user.id, body=body)
         self.db.add(row)
         return row
 
@@ -137,10 +139,10 @@ class Grants:
     def flag_user(self, admin: User, user: User, reason: str) -> UserFlag:
         if not admin.admin:
             raise GrantError("Admin only.", 403)
-        text = (reason or "").strip()[:500] or "flagged"
+        reason = text(reason, "reason", GrantError).strip()[:500] or "flagged"
         user.flagged = True
         self.db.save(user)
-        row = UserFlag(user_id=user.id, admin_id=admin.id, reason=text)
+        row = UserFlag(user_id=user.id, admin_id=admin.id, reason=reason)
         self.db.add(row)
         return row
 

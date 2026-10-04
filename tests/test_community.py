@@ -85,6 +85,16 @@ def test_admin_email_env(core, monkeypatch):
     assert ops.admin is True
 
 
+@pytest.mark.parametrize("email", [
+    "@.", "a b@c d.e", "@lan.test", "a@lan", "a@.test", "a@lan.", "a@ lan.test",
+])
+def test_register_rejects_malformed_email(core, email):
+    with pytest.raises(AuthError, match="email") as e:
+        core.auth.register(email, "password1", "x")
+    assert e.value.status == 400
+    assert core.auth.user_count() == 0
+
+
 def test_register_rejects_bad_email_short_password_duplicate(core):
     with pytest.raises(AuthError, match="email"):
         core.auth.register("not-an-email", "password1", "x")
@@ -506,6 +516,25 @@ def test_http_comment_only_on_grants_you_can_view(env):
 
 
 def test_http_grants_reject_non_finite_goal_and_donation(env):
+
+
+@pytest.mark.parametrize("method,path,payload", [
+    ("post", "/auth/register", {"email": 5, "password": "password1"}),
+    ("post", "/auth/register", {"email": None, "password": "password1"}),
+    ("post", "/auth/register", {"email": "x@lan.test", "password": 12345678}),
+    ("post", "/auth/register", {"email": "x@lan.test", "password": "password1", "name": ["x"]}),
+    ("post", "/auth/login", {"email": "admin@lan.test", "password": 12345678}),
+    ("post", "/auth/login", {"email": ["admin@lan.test"], "password": "password1"}),
+    ("patch", "/auth/me", {"name": 5}),
+    ("patch", "/auth/me", {"bio": 5}),
+    ("post", "/grants", {"title": 12345, "body": "A short paragraph about the need.",
+                         "goal_flops": 50}),
+    ("post", "/grants", {"title": "Need compute", "body": {"x": 1}, "goal_flops": 50}),
+    ("post", "/grants/{approved}/comments", {"body": 123}),
+    ("post", "/admin/grants/{pending}/review", {"approve": True, "note": 5}),
+    ("post", "/admin/users/{member}/flag", {"reason": 5}),
+])
+def test_http_wrongly_typed_fields_are_400(env, method, path, payload):
     client, core, *_ = env
     admin_tok = client.post("/auth/register", json={
         "email": "admin@lan.test", "password": "password1", "name": "Admin",
@@ -536,6 +565,21 @@ def test_http_grants_reject_non_finite_goal_and_donation(env):
     for sort in ("top", "least", "trending"):
         r = client.get("/grants", params={"sort": sort})
         assert r.status_code == 200 and r.json()[0]["received_flops"] == 0
+
+
+    client.post("/auth/accept-terms", headers=_hdr(admin_tok))
+    admin = core.auth.user_from_token(admin_tok)
+    member = core.auth.register("m@lan.test", "password1", "Member")
+    pending = core.grants.create(admin, "Pending one", "A short paragraph about the need.", 50)
+    approved = core.grants.create(admin, "Approved one", "A short paragraph about the need.", 50)
+    core.grants.review(admin, approved.id, True)
+    client.cookies.clear()
+    url = path.format(pending=pending.id, approved=approved.id, member=member.id)
+    r = client.request(method, url, json=payload, headers=_hdr(admin_tok))
+    assert r.status_code == 400, r.text
+    assert core.auth.user_count() == 2
+    assert core.grants.get(pending.id).status == "pending"
+
 
 def test_http_ban_blocks_take(env):
     client, core, tiny_model, tiny_dataset = env
