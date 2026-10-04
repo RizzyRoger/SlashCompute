@@ -142,11 +142,16 @@ class Coordinator:
         return job
 
     def abandon_job(self, job: JobRuntime, reason: str) -> None:
-        """Drop a job that never reserved credits (failed Take)."""
-        job.row.status, job.row.error, job.row.finished_at = "cancelled", reason, now()
-        self.db.save(job.row)
+        """Drop a job that never reserved credits (failed Take). It was never
+        accepted, so nothing of it may survive a restart."""
+        log.info("job %s abandoned: %s", job.id, reason)
         self.jobs.pop(job.id, None)
-        self.dataset_path(job.id).unlink(missing_ok=True)
+        with self.db.session() as s:
+            row = s.get(Job, job.id)
+            if row is not None:
+                s.delete(row)
+                s.commit()
+        shutil.rmtree(self.checkpoints.root / job.id, ignore_errors=True)
 
     def dataset_path(self, job_id: str) -> Path:
         return self.checkpoints.job_dir(job_id) / "dataset.jsonl"
@@ -179,6 +184,8 @@ class Coordinator:
         except Exception as e:
             log.exception("adapter export failed")
             row.error = f"adapter export failed: {e}"
+        else:
+            row.error = None  # an earlier epoch's abort reason no longer applies
         row.status, row.finished_at = "completed", now()
         self.db.save(row)
         self.credits.settle_job(job.id)

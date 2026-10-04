@@ -10,6 +10,7 @@ from slashcompute.common import protocol as P
 from slashcompute.common.canary import compare_stats, expected_stats, run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
+from slashcompute.coordinator.core import Coordinator
 from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.local import build_compute
 
@@ -276,6 +277,62 @@ def test_fatal_stage_error_fails_the_job_without_retrying(env):
                 x.close()
             except Exception:
                 pass
+
+
+def test_recovered_job_drops_the_stale_abort_error(env):
+    client, core, tiny_model, tiny_dataset, tmp_path = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        spec = _spec(tiny_model, tiny_dataset)
+        job_id = client.post("/jobs", json=json.loads(spec.model_dump_json())).json()["id"]
+        ag = {m.stage_idx: x for x in agents for m in [x.recv()]}
+        ag[0].send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0,
+                                   detail="transient"))
+        assert isinstance(ag[1].recv(), P.CancelStage)
+        new = {x.node_id: x.recv() for x in agents}
+        assert all(isinstance(m, P.StageAssignment) and m.epoch == 2 for m in new.values())
+        assert "transient" in client.get(f"/jobs/{job_id}").json()["error"]
+
+        by_stage = {m.stage_idx: (m, x) for x in agents for m in [new[x.node_id]]}
+        for idx, (m, x) in by_stage.items():
+            x.send(P.StageReady(job_id=job_id, epoch=2, stage_idx=idx))
+        _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "running")
+        assert client.get(f"/jobs/{job_id}").json()["error"] is None
+
+        core.jobs[job_id].row.error = "node lost: disconnected"  # as if aborted mid-run
+        for idx, (m, x) in by_stage.items():
+            _upload_ckpt(client, spec, m, 2, tmp_path)
+            x.send(P.StageFinished(job_id=job_id, epoch=2, stage_idx=idx, reason="done", last_step=2))
+        _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "completed")
+        assert client.get(f"/jobs/{job_id}").json()["error"] is None
+        assert Coordinator(core.cfg).jobs[job_id].row.error is None
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+def test_rejected_job_does_not_come_back_after_restart(env, monkeypatch):
+    monkeypatch.setattr("slashcompute.community.auth.ITERATIONS", 1)
+    client, core, tiny_model, tiny_dataset, _ = env
+    token = client.post("/auth/register", json={
+        "email": "ada@lan.test", "password": "password1", "name": "Ada",
+    }).json()["token"]
+    hdr = {"Authorization": f"Bearer {token}"}
+    client.post("/auth/accept-terms", headers=hdr)
+    r = client.post("/jobs/upload", headers=hdr,
+                    files={"dataset": ("train.jsonl", tiny_dataset.read_bytes())},
+                    data={"model": str(tiny_model), "steps": 2, "batch_size": 2,
+                          "microbatches": 1, "min_stages": 1, "max_flops": 1e30})
+    assert r.status_code == 400, r.text
+    assert client.get("/jobs").json() == []
+    assert Coordinator(core.cfg).jobs == {}
+    assert not any(core.checkpoints.root.iterdir())
 
 
 def test_unsatisfiable_job_fails_instead_of_blocking_queue(env):

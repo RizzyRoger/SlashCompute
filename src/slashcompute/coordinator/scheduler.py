@@ -150,7 +150,8 @@ class Scheduler:
             return
         cur.ready.add(stage_idx)
         if len(cur.ready) == len(cur.plans) and job.row.status == "starting":
-            job.row.status = "running"
+            # The epoch is healthy again: drop the reason the previous one aborted.
+            job.row.status, job.row.error = "running", None
             self.core.db.save(job.row)
             log.info("job %s epoch %d running", job.id, epoch)
 
