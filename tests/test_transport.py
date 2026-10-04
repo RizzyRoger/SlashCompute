@@ -38,6 +38,21 @@ def test_digest_stable_and_sensitive():
     assert digest(a) != digest(a * 2)
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.int32, mx.bool_])
+@pytest.mark.parametrize("shape", [(0,), (0, 4), (2, 0, 3)])
+def test_empty_tensor_roundtrip(shape, dtype):
+    t = {"empty": mx.zeros(shape, dtype=dtype), "ids": mx.array([[1, 2]], dtype=mx.int32)}
+    out = decode_bytes(encode_bytes(Frame("x", {}, t)))
+    _assert_same(t, out.tensors)
+
+
+def test_digest_empty_tensor():
+    a = mx.zeros((0, 4), dtype=mx.bfloat16)
+    assert digest(a) == digest(mx.zeros((0, 4), dtype=mx.bfloat16))
+    assert digest(a) != digest(mx.zeros((4, 0), dtype=mx.bfloat16))
+    assert digest(a) != digest(a.astype(mx.float16))
+
+
 async def test_tcp_link_roundtrip_and_hello():
     server = await LinkServer("127.0.0.1", 0, {"job": "j1", "epoch": 2}).start()
     up_task = asyncio.create_task(connect("127.0.0.1", server.port, {"job": "j1", "epoch": 2}))

@@ -55,6 +55,11 @@ def from_numpy(arr: np.ndarray, name: str) -> mx.array:
     return out
 
 
+def _raw(arr: np.ndarray) -> memoryview | bytes:
+    """Flat byte view of a C-contiguous array (memoryview can't cast empty N-d)."""
+    return memoryview(arr).cast("B") if arr.size else b""
+
+
 def encode(frame: Frame) -> list[bytes | memoryview]:
     """Return the chunks to write, in order. Evaluates tensors first."""
     if frame.tensors:
@@ -64,7 +69,7 @@ def encode(frame: Frame) -> list[bytes | memoryview]:
         arr = np.ascontiguousarray(to_numpy(a))
         specs.append({"name": name, "dtype": dtype_name(a), "shape": list(a.shape),
                       "nbytes": arr.nbytes})
-        buffers.append(memoryview(arr).cast("B"))
+        buffers.append(_raw(arr))
     header = msgpack.packb({"kind": frame.kind, "meta": frame.meta, "tensors": specs},
                            use_bin_type=True)
     return [_HDR.pack(len(header)), header, *buffers]
@@ -104,5 +109,5 @@ def digest(*arrays: mx.array) -> str:
         arr = np.ascontiguousarray(to_numpy(a))
         h.update(dtype_name(a).encode())
         h.update(str(tuple(a.shape)).encode())
-        h.update(memoryview(arr).cast("B"))
+        h.update(_raw(arr))
     return h.hexdigest()
