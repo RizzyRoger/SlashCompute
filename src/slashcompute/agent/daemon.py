@@ -18,7 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from slashcompute.agent.benchmark import benchmark
 from slashcompute.agent.http import CoordHTTP
-from slashcompute.agent.paths import AgentPaths, resolve_data_host
+from slashcompute.agent.paths import AgentPaths, claim_data_port, resolve_data_host
 from slashcompute.agent.sandbox import sandbox_enabled, wrap_command
 from slashcompute.agent.verify import run_canary, run_replay
 from slashcompute.agent.worker import StageSession, WorkerContext, run_stage
@@ -92,7 +92,10 @@ class AgentOptions:
             self.cfg.home = Path(home)
         self.paths = AgentPaths(self.cfg.home)
         self.gpu_percent = max(1, min(100, int(gpu_percent)))
-        self.data_port = int(data_port)
+        wanted = int(data_port)
+        self.data_port = claim_data_port(wanted)
+        if self.data_port != wanted:
+            log.warning("data port %s in use; advertising %s", wanted, self.data_port)
         self.max_memory_bytes = int(max_memory_gb * 1024**3) if max_memory_gb else None
         self.localhost = localhost
         self.sandbox = sandbox_enabled(sandbox, self.cfg.sandbox)

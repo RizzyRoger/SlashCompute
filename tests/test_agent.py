@@ -51,6 +51,23 @@ def test_agent_options_localhost_host(tmp_path):
     assert opt.node_id == AgentOptions(url="http://127.0.0.1:8765", home=tmp_path).node_id
 
 
+def test_claim_data_port_skips_a_busy_port():
+    import socket
+
+    from slashcompute.agent.paths import claim_data_port
+
+    busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    busy.bind(("127.0.0.1", 0))
+    port = busy.getsockname()[1]
+    try:
+        claimed = claim_data_port(port, host="127.0.0.1")
+        assert claimed != port
+        assert 1024 <= claimed <= 65535
+    finally:
+        busy.close()
+
+
 # ------------------------------------------------------------ coordinator outages
 
 

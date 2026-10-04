@@ -18,6 +18,27 @@ def resolve_data_host(localhost: bool) -> str:
     return lan_ip()
 
 
+def claim_data_port(preferred: int, host: str = "0.0.0.0") -> int:
+    """Use ``preferred`` if it is free; otherwise bind an ephemeral port.
+
+    A leftover agent on 9700 would otherwise keep the new worker from listening,
+    and peers that dial 9700 get that stale listener's hello_reject.
+    """
+    import socket
+
+    for port in (int(preferred), 0):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            return int(sock.getsockname()[1])
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    raise OSError(f"no free data port (preferred {preferred})")
+
+
 class AgentPaths:
     def __init__(self, home: Path) -> None:
         self.home = Path(home)
