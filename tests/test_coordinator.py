@@ -276,3 +276,38 @@ def test_fatal_stage_error_fails_the_job_without_retrying(env):
                 x.close()
             except Exception:
                 pass
+
+
+def test_unsatisfiable_job_fails_instead_of_blocking_queue(env):
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+
+        stuck = json.loads(_spec(tiny_model, tiny_dataset, min_stages=500).model_dump_json())
+        stuck_id = client.post("/jobs", json=stuck).json()["id"]
+        ok = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
+        ok_id = client.post("/jobs", json=ok).json()["id"]
+
+        _wait(lambda: client.get(f"/jobs/{stuck_id}").json()["status"] == "failed")
+        assert "6 layers" in client.get(f"/jobs/{stuck_id}").json()["error"]
+        _wait(lambda: client.get(f"/jobs/{ok_id}").json()["status"] == "starting")
+        for x in agents:
+            msg = x.recv()
+            assert isinstance(msg, P.StageAssignment) and msg.job_id == ok_id
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+@pytest.mark.parametrize("kind", [["x"], {}, 3])
+def test_submit_rejects_non_string_kind(env, kind):
+    client, _, tiny_model, tiny_dataset, _ = env
+    body = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json()) | {"kind": kind}
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 400, r.text

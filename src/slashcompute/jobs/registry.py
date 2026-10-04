@@ -15,7 +15,7 @@ JobSpec = LoraFinetuneSpec
 
 def parse_spec(data: dict) -> JobSpec:
     kind = data.get("kind", "lora_finetune")
-    if kind not in JOB_TYPES:
+    if not isinstance(kind, str) or kind not in JOB_TYPES:
         raise ValueError(f"unknown job kind {kind!r}; known: {sorted(JOB_TYPES)}")
     spec = JOB_TYPES[kind].model_validate({**data, "kind": kind})
     if not allowed_model(spec.model):
