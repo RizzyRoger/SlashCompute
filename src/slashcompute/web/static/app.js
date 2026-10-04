@@ -7,6 +7,7 @@ const SETTING_KEYS = [
   "training", "memory_gb", "inference", "inference_memory_gb", "inference_head", "models_dir", "transport",
 ];
 const GIB = 1024 ** 3;
+const GRANTS_REFRESH_MS = 20000;
 const OUTDATED_COORDINATOR = "This pool's coordinator has no LLM inference: it runs an older /compute. "
   + "Ask whoever hosts it to update and restart it, or host a pool on this Mac.";
 const STATUS_TONE = {
@@ -22,6 +23,9 @@ const state = {
   rates: [],
   last: null,
   grants: null,
+  grantsUp: null,     // coordinator_up when the board was last loaded
+  grantsAt: 0,
+  grantsSeq: 0,
   sort: "top",
   admin: false,
   fundOpen: null,
@@ -236,6 +240,11 @@ async function poll() {
     state.user = null;
     state.credits = null;
   }
+  // The board comes from the coordinator: reload it when the pool comes or goes,
+  // and now and then while the tab is open, so it never reads Live while offline.
+  const up = !!status().coordinator_up;
+  const stale = state.tab === "grants" && Date.now() - state.grantsAt > GRANTS_REFRESH_MS;
+  if (up !== state.grantsUp || stale) loadGrants(true);
   render();
 }
 
@@ -525,12 +534,18 @@ function setMsg(sel, text, tone) {
 
 // ------------------------------------------------------------ grants
 
-async function loadGrants() {
+async function loadGrants(quiet = false) {
+  const seq = ++state.grantsSeq;
+  state.grantsUp = !!status().coordinator_up;
+  state.grantsAt = Date.now();
+  let board = null;
   try {
-    state.grants = await api(`/api/grants?sort=${encodeURIComponent(state.sort)}`);
+    board = await api(`/api/grants?sort=${encodeURIComponent(state.sort)}`);
   } catch (e) {
-    toast(e.message, "bad");
+    if (!quiet) toast(e.message, "bad");
   }
+  if (seq !== state.grantsSeq) return;
+  state.grants = board;
   renderGrants();
   renderGrantsLive();
 }
@@ -566,15 +581,18 @@ function renderGrantsLive() {
 function renderGrants() {
   const g = state.grants;
   $$("#g-sort button").forEach((b) => b.classList.toggle("is-on", b.dataset.sort === state.sort));
-  if (!g) return;
   const admin = !!(state.user && state.user.admin);
+  const online = !!(g && g.online);
+  const grants = g ? g.grants : [];
+  const pending = g ? g.pending : [];
 
-  $("#g-list").innerHTML = g.grants.length ? g.grants.map(grantCard).join("")
-    : `<article class="card"><p class="empty">${g.online ? "No public grants yet." : "Start or join a pool to see live grants."}</p></article>`;
+  renderOnce("grants", [grants, online, state.fundOpen, state.fundMsg], $("#g-list"), () => grants.length
+    ? grants.map(grantCard).join("")
+    : `<article class="card"><p class="empty">${online ? "No public grants yet." : "Start or join a pool to see live grants."}</p></article>`);
 
   $("#g-review").hidden = !admin;
-  setTag("#g-review-count", String(g.pending.length), g.pending.length ? "hot" : "");
-  $("#g-pending").innerHTML = g.pending.length ? g.pending.map((p) => `<div class="pending">
+  setTag("#g-review-count", String(pending.length), pending.length ? "hot" : "");
+  renderOnce("pending", pending, $("#g-pending"), () => pending.length ? pending.map((p) => `<div class="pending">
       <div class="top"><b>${esc(p.title)}</b><span class="muted">${esc(withUnit(p.goal))} goal</span></div>
       <p class="hint">by ${esc(p.author)}</p>
       <p class="summary">${esc(p.summary)}</p>
@@ -582,7 +600,7 @@ function renderGrants() {
         <button type="button" class="btn primary sm" data-review="${esc(p.id)}" data-approve="1">Approve</button>
         <button type="button" class="btn danger sm" data-review="${esc(p.id)}" data-approve="">Decline</button>
       </div>
-    </div>`).join("") : `<p class="empty">Nothing waiting for review.</p>`;
+    </div>`).join("") : `<p class="empty">Nothing waiting for review.</p>`);
 }
 
 function grantCard(g) {
@@ -607,6 +625,7 @@ function grantCard(g) {
 }
 
 async function grantAction(path, body, okText) {
+  state.grantsSeq += 1;   // a board load already in flight is older than this answer
   try {
     state.grants = await post(path, { ...body, sort: state.sort });
     if (okText) toast(okText);
@@ -1269,5 +1288,4 @@ $("#l-draft").addEventListener("keydown", (e) => {
 $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); sendChat(); });
 
 poll();
-loadGrants();
 window.setInterval(poll, 2000);

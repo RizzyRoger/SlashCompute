@@ -1,5 +1,9 @@
 import json
+import shutil
+import subprocess
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.common.config import EngineConfig
@@ -427,6 +431,98 @@ def test_live_grants_empty_when_coordinator_down(tmp_path):
     assert board["sample"] is False
     assert board["grants"] == [] and board["pending"] == []
     assert board["online"] is False
+
+
+# Runs app.js under Node with a stub DOM; fetch answers from the `routes` the
+# test swaps in, so a poll can see the coordinator come and go.
+APP_JS = Path(__file__).resolve().parents[1] / "src/slashcompute/web/static/app.js"
+DOM_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const [appJs, phasesFile] = process.argv.slice(1);
+const phases = JSON.parse(fs.readFileSync(phasesFile, "utf8"));
+const stub = () => new Proxy(function () {}, {
+  get: (_, k) => (k === Symbol.toPrimitive ? () => "" : k === "then" ? undefined : stub()),
+  apply: () => stub(),
+});
+const els = new Map();
+const element = (sel) => {
+  if (!els.has(sel)) {
+    const props = { textContent: "", innerHTML: "", className: "", hidden: false, value: "",
+      dataset: {}, style: { setProperty() {} }, classList: { toggle() {}, add() {}, remove() {} } };
+    els.set(sel, new Proxy(props, { get: (o, k) => (k in o ? o[k] : stub()) }));
+  }
+  return els.get(sel);
+};
+let routes = {};
+const ctx = {
+  document: { querySelector: element, querySelectorAll: () => [], addEventListener() {},
+    createElement: element, body: stub(), activeElement: null },
+  window: { setInterval() {}, setTimeout() {}, clearTimeout() {} },
+  CSS: { escape: (s) => s }, navigator: stub(), XMLHttpRequest: function () {},
+  FormData: function () {}, console,
+  fetch: async (path) => {
+    const body = routes[path.split("?")[0]];
+    const ok = body !== undefined;
+    return { ok, status: ok ? 200 : 404, statusText: "x",
+      text: async () => JSON.stringify(ok ? body : { detail: "nope" }) };
+  },
+};
+vm.createContext(ctx);
+const settle = () => new Promise((r) => setTimeout(r, 30));
+(async () => {
+  const seen = [];
+  for (const [i, phase] of phases.entries()) {
+    routes = phase.routes;
+    if (i === 0) {
+      vm.runInContext(fs.readFileSync(appJs, "utf8"), ctx);
+      vm.runInContext("showTab('grants')", ctx);
+    } else {
+      vm.runInContext(phase.run, ctx);
+    }
+    await settle();
+    seen.push({ pill: element("#g-pill").textContent, open: element("#g-open").textContent,
+      list: element("#g-list").innerHTML });
+  }
+  console.log(JSON.stringify(seen));
+})();
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_grants_tab_follows_coordinator_on_poll(tmp_path):
+    grant = {"id": "g1", "title": "Parser", "author": "Ada", "body": "Need FLOPs for a parser.",
+             "goal_flops": 50e12, "received_flops": 10e12, "status": "approved"}
+    app, launcher, _ = _shell(tmp_path / "up", http=RoutedHTTP({**POOL, "/grants": [grant]}))
+    launcher.save_settings(LauncherSettings(mode="host"))
+    with TestClient(app) as c:
+        live = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
+    assert live["/api/overview"]["status"]["coordinator_up"] and live["/api/grants"]["online"]
+    app, _, _ = _shell(tmp_path / "down", http=RoutedHTTP({}))
+    with TestClient(app) as c:
+        down = {"/api/overview": c.get("/api/overview").json(), "/api/grants": c.get("/api/grants").json()}
+    assert not down["/api/overview"]["status"]["coordinator_up"]
+    board = live["/api/grants"]
+    more = {**live, "/api/grants": {**board, "grants": board["grants"] + [{**board["grants"][0], "id": "g2"}]}}
+    phases = [
+        {"routes": live},
+        {"routes": down, "run": "poll()"},
+        {"routes": live, "run": "poll()"},
+        # Same coordinator, new grant: only the slow refresh picks it up.
+        {"routes": more, "run": "poll()"},
+        {"routes": more, "run": "state.grantsAt -= 60000; poll()"},
+    ]
+    (tmp_path / "phases.json").write_text(json.dumps(phases))
+    out = subprocess.run(["node", "-e", DOM_HARNESS, str(APP_JS), str(tmp_path / "phases.json")],
+                         capture_output=True, text=True, timeout=30, check=True)
+    seen = json.loads(out.stdout.strip().splitlines()[-1])
+    assert (seen[0]["pill"], seen[0]["open"]) == ("Live", "1")
+    assert "Fund this grant" in seen[0]["list"]
+    assert (seen[1]["pill"], seen[1]["open"]) == ("Offline", "0")
+    assert "Fund this grant" not in seen[1]["list"] and "Start or join a pool" in seen[1]["list"]
+    assert (seen[2]["pill"], seen[2]["open"]) == ("Live", "1")
+    assert seen[3]["open"] == "1"
+    assert seen[4]["open"] == "2"
 
 
 def test_live_grants_flow(tmp_path):
