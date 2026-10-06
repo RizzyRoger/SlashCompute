@@ -1,3 +1,32 @@
+# Jobs stuck on "starting", and the LLM Send button that can't be clicked
+
+Base: SlashComputeFinished main at f43b677 (byte-identical to the installed /Applications/compute.app).
+Branch: fix/job-start-and-llm-send. Plan: `/Users/darren/.claude/plans/make-sure-you-are-sharded-nest.md`.
+Baseline: 518 passed (2 sandbox tests fail only when the checkout lives under /private/tmp).
+
+Evidence (live logs + coordinator.db on this Mac): 18 of 37 cancelled jobs were assigned and never ran
+a step (11 with Min Macs 1). The agent awaited the whole HF download inside its message loop (10 min
+for a 7B today, ~36 min on Oct 3), so cancels, new assignments and shutdown went unread; the coordinator
+freed the Mac on cancel and sent the next job straight to it. LLMs: no node was serving, so Send was
+disabled with no reason; Start serving went through /api/start and could restart the stuck agent.
+
+- [x] Agent: model download in a killable child (`agent/fetch.py`), off the message loop, with progress
+      in heartbeats and status.json; every stop reports StageFinished(cancelled) once; shutdown mid-download
+      takes ~2 s
+- [x] Coordinator: a cancelled/aborted Mac takes no new work until its agent confirms (60 s fallback unless
+      its heartbeats still name the job); stage_runs closed on cancel and for lost nodes
+- [x] Start timeout counts from the last progress (download bytes, a stage ready); prefer other Macs after a
+      stall; peer handshake waits for a neighbour still downloading
+- [x] Scheduler: a job needing more Macs than the pool has waits with a reason without blocking the queue;
+      Min Macs defaults to 1; datasets checked at submit
+- [x] UI: job card shows download progress / loading / ready and the last try's error separately
+- [x] LLMs tab: reason box under Send with the fixing button (start serving, make head, lend N GB);
+      `/api/inference` starts/stops only the LLM node; node exit reasons surfaced; pid recorded at spawn;
+      paused heads don't make models servable; per-model `min_memory_gb`
+- [x] Window always loads the current app.js/app.css (versioned, no-cache); shell generation 7
+- [x] docs/troubleshooting.md
+- [ ] Full suite, stress loop, rebuild + reinstall the app, verify in the real app, PR
+
 # Reliability bugs: peer links, agent races, reconnects, scheduling, checkpoints, ring memory, tick
 
 Base: RizzyRoger/SlashCompute main at b357ee3. Branch: fix/reliability-bugs. Baseline: 472 passed
