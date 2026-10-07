@@ -509,8 +509,12 @@ function renderUsage() {
   msg.dataset.offline = p.online ? "" : "1";
 
   setText("#u-count", String(p.jobs.length));
-  renderOnce("jobs", p.jobs, $("#jobs"), () => p.jobs.length ? p.jobs.map(jobCard).join("")
-    : `<p class="empty">No jobs yet. Submit one and it will appear here.</p>`);
+  // Rebuilt only when the cards themselves change. A starting job's progress changes every poll,
+  // and rebuilding then replaced its Cancel button under the pointer, losing the click.
+  renderOnce("jobs", p.jobs.map((j) => [j.id, j.status, j.can_cancel, j.model]), $("#jobs"),
+    () => p.jobs.length ? p.jobs.map(jobCard).join("")
+      : `<p class="empty">No jobs yet. Submit one and it will appear here.</p>`);
+  $$("#jobs .job").forEach((card, i) => patchJob(card, p.jobs[i]));
 }
 
 // What a starting job waits for on each Mac: the model download, loading it, or nothing.
@@ -552,18 +556,31 @@ function jobCard(j) {
   const status = String(j.status || "");
   const cls = ["running", "starting"].includes(status) ? "is-active"
     : ["queued", "recovering"].includes(status) ? "is-waiting" : "";
-  const meta = [`Step ${j.progress_step ?? 0} of ${j.steps ?? 0}`];
-  if (j.last_loss != null) meta.push(`loss ${Number(j.last_loss).toFixed(3)}`);
-  if (j.stages && j.stages.length) meta.push(plural(j.stages.length, "Mac"));
-  meta.push(String(j.id).slice(0, 8));
-  const note = jobNotes(j, status);
   const cancel = j.can_cancel
     ? `<button type="button" class="btn ghost sm" data-cancel="${esc(j.id)}">Cancel</button>` : "";
   return `<div class="job ${cls}">
     <div class="job-top"><b>${esc(modelLabel(j.model))}</b><span class="tag ${STATUS_TONE[status] || ""}">${esc(status)}</span>${cancel}</div>
-    <div class="bar ${status === "completed" ? "done" : ""}"><i style="width:${(Number(j.progress) * 100).toFixed(1)}%"></i></div>
-    <p class="meta">${esc(meta.join(" · "))}</p>${note}
+    <div class="bar ${status === "completed" ? "done" : ""}"><i></i></div>
+    <p class="meta"></p><div class="notes"></div>
   </div>`;
+}
+
+// The parts of a job card that change between polls, set in place.
+function patchJob(card, j) {
+  if (!j) return;
+  const status = String(j.status || "");
+  const meta = [`Step ${j.progress_step ?? 0} of ${j.steps ?? 0}`];
+  if (j.last_loss != null) meta.push(`loss ${Number(j.last_loss).toFixed(3)}`);
+  if (j.stages && j.stages.length) meta.push(plural(j.stages.length, "Mac"));
+  meta.push(String(j.id).slice(0, 8));
+  card.querySelector(".bar i").style.width = `${(Number(j.progress) * 100).toFixed(1)}%`;
+  card.querySelector(".meta").textContent = meta.join(" · ");
+  const notes = card.querySelector(".notes");
+  const html = jobNotes(j, status);
+  if (notes.dataset.html !== html) {
+    notes.innerHTML = html;
+    notes.dataset.html = html;
+  }
 }
 
 function setMsg(sel, text, tone) {
