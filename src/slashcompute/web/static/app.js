@@ -48,6 +48,7 @@ const state = {
     upload: null,       // {name, pct} while a GGUF is on its way
     error: "",          // why the pool's LLM service could not be read
     why: null,          // why Send is unavailable: {text, tone?, action?}
+    starting: false,    // the pending Start/Stop serving click is a start
   },
 };
 
@@ -792,7 +793,7 @@ function llmWhy(st, s, l, unsupported) {
   const m = choices.find((c) => c.id === l.model) || choices[0];
   const n = st.inference_status || {};
   const running = !!st.inference_running;
-  if (state.busy.has("llm")) return { text: "Starting llama.cpp on this Mac…" };
+  if (state.busy.has("llm")) return { text: l.starting ? "Starting llama.cpp on this Mac…" : "Stopping serving on this Mac…" };
   const me = l.net && n.node_id ? l.net.nodes.find((x) => x.id === n.node_id) : null;
   const lent = me ? Number(me.committed_gb) || 0 : 0;
   const need = Number(m.min_memory_gb) || 0;
@@ -1096,6 +1097,7 @@ async function withBusy(key, button, busyText, fn) {
 // Start or stop serving LLMs on this Mac. Only the LLM node changes: the training agent is left
 // alone (resending every setting through /api/start used to restart it, and it hung mid-download).
 function serveLlm(btn, on, changes = {}) {
+  if (!state.busy.has("llm")) state.llm.starting = on;
   return withBusy("llm", btn, on ? "Starting…" : "Stopping…", async () => {
     const s = state.settings || {};
     const snap = await post("/api/inference", {
