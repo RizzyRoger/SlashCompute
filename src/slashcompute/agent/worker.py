@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+import httpx
+
 from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.throttle import make_pace
 from slashcompute.common.protocol import StageAssignment, StageFinished, StageReady, StepMetrics
@@ -23,6 +25,8 @@ from slashcompute.pipeline.schedule import StageResult, StageRunner, StepStats
 from slashcompute.transport import Link, LinkServer, connect
 
 log = logging.getLogger(__name__)
+
+UPLOAD_RETRY_DELAYS_S = (2.0, 4.0, 8.0, 16.0)
 
 OnMessage = Callable[[object], Awaitable[None]]
 
@@ -74,11 +78,14 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     prev = nxt = None
     # Downstream listens; upstream dials (see transport.peer).
     if asg.stage_idx > 0:
-        server = await LinkServer(ctx.data_bind, ctx.data_port, hello).start()
+        server = await LinkServer(ctx.data_bind, ctx.data_port, hello,
+                                  send_timeout=asg.peer_timeout_s,
+                                  resume_window=asg.peer_timeout_s).start()
         log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
     if asg.next_peer is not None:
         log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
-        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello)
+        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                            send_timeout=asg.peer_timeout_s, resume_window=asg.peer_timeout_s)
     if server is not None:
         prev = await server.accept(timeout=180.0)
         log.info("upstream connected from %s", getattr(prev, "peername", "?"))
@@ -96,10 +103,26 @@ def _load_dataset(path: Path, spec) -> list:
         raise DatasetError(f"bad dataset: {e}") from e
 
 
+async def upload_checkpoint(http: CoordHTTP, url: str, path: Path, params: dict) -> None:
+    """Upload off the event loop, so peer links keep flowing, and retry connection
+    failures: a blip that briefly cuts the coordinator off must not fail the stage.
+    An HTTP error (a stale epoch's 409, say) is final."""
+    data = await asyncio.to_thread(path.read_bytes)
+    for delay in (*UPLOAD_RETRY_DELAYS_S, None):
+        try:
+            await asyncio.to_thread(http.put_bytes, url, data, params)
+            return
+        except httpx.TransportError as e:
+            if delay is None:
+                raise
+            log.warning("checkpoint upload failed (%s); retrying in %.0fs", e, delay)
+            await asyncio.sleep(delay)
+
+
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
-    prev = nxt = server = None
+    prev = nxt = server = compute = None
     # Setup is inside the try so a failure still reports StageFinished(error)
     # rather than leaving the coordinator waiting on a stage that never starts.
     try:
@@ -133,11 +156,8 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
             ))
 
         async def on_checkpoint(step: int, path: Path) -> None:
-            ctx.http.put_bytes(
-                f"/jobs/{asg.job_id}/checkpoints/{step}",
-                path.read_bytes(),
-                params={"epoch": asg.epoch, "stage": asg.stage_idx},
-            )
+            await upload_checkpoint(ctx.http, f"/jobs/{asg.job_id}/checkpoints/{step}", path,
+                                    {"epoch": asg.epoch, "stage": asg.stage_idx})
 
         runner = StageRunner(
             compute=compute, total_steps=spec.steps, microbatches=spec.microbatches,
@@ -145,7 +165,7 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
             checkpoint_dir=ckdir, prev=prev, next=nxt,
             examples=examples, batch_size=spec.batch_size, seed=spec.seed,
             start_step=asg.resume_step, on_step=on_step, on_checkpoint=on_checkpoint,
-            pace=make_pace(ctx.gpu_percent),
+            pace=make_pace(ctx.gpu_percent), peer_timeout=asg.peer_timeout_s,
         )
         ctx_session = getattr(ctx, "session", None)
         if ctx_session is not None:
@@ -172,6 +192,8 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
         ))
         raise
     finally:
+        if compute is not None:
+            compute.release_ring()
         for link in (prev, nxt):
             if link is not None:
                 try:

@@ -9,3 +9,7 @@
 - Parallel fixer agents: worktrees start from the default branch, not the integration branch; tell them the exact tip to reset to.
 - Never resolve source conflicts by keeping both sides; a "union" is only safe when each side adds whole new top-level functions. Merge tests by function blocks and check imports.
 - Many agents running test suites at once overload the machine (load ~127 on 10 cores) and make timing tests flaky; have fixers run only related tests and run the full suite once at the end.
+- Stress concurrency code in a loop (hundreds of runs) before trusting it; a single passing run of the resilient link hid a 1-in-25 hang.
+- Don't rely on the peer's RST: macOS can ignore it under zero-window and only notice at the next persist probe (~5 s). Bound retransmission (TCP_RXT_CONNDROPTIME / TCP_USER_TIMEOUT) and abort a link once its read side ends.
+- `mx.save_safetensors` appends `.safetensors` to a path that lacks it; temp files for atomic writes must keep the extension.
+- Network drops are usually silent: a reconnect grace window must also cover missed heartbeats, not just socket closes.

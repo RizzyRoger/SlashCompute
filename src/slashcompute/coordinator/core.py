@@ -1,5 +1,11 @@
 """Coordinator state and message routing. All mutation happens on the event
-loop thread, so no locking is needed."""
+loop thread, so no locking is needed. Blocking work (checkpoint merges, adapter
+exports, verification checks, model profiling) runs off the loop and only
+returns results; state changes after it re-check what may have moved meanwhile.
+
+Recovery, verification and scheduling tick in separate loops, so a slow
+scheduler pass can't hold up liveness checks and one failing part doesn't skip
+the others."""
 
 from __future__ import annotations
 
@@ -7,18 +13,21 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from pydantic import BaseModel
 from sqlmodel import select
 
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import (
-    CancelStage, DrainNotice, Heartbeat, Register, StageFinished, StageReady, StepMetrics,
+    Ack, CancelStage, DrainNotice, Heartbeat, Register, StageFinished, StageReady, StepMetrics,
     VerifyBundleReady, VerifyResult, Welcome,
 )
+from slashcompute.common.reliable import is_sequenced
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
 from slashcompute.community.grants import Grants
@@ -26,13 +35,14 @@ from slashcompute.coordinator.checkpoints import CheckpointStore
 from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
 from slashcompute.coordinator.recovery import Recovery
-from slashcompute.coordinator.registry import Registry, SendFn
+from slashcompute.coordinator.registry import CloseFn, NodeState, Registry, SendFn
 from slashcompute.coordinator.scheduler import ACTIVE, TERMINAL, WAITING, JobRuntime, Scheduler
 from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.common.config import allowed_model
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 MAX_DATASET_BYTES = 32 * 1024 * 1024
 
@@ -73,7 +83,11 @@ class Coordinator:
         self.recovery = Recovery(self)
         self.verification = VerificationManager(self)
         self.jobs: dict[str, JobRuntime] = {}
-        self._task: Optional[asyncio.Task] = None
+        self._checkpoint_locks: dict[str, asyncio.Lock] = {}
+        self._tasks: list[asyncio.Task] = []
+        # MLX must not be driven from several threads at once, so all of the coordinator's
+        # tensor and file work shares one thread.
+        self._mlx = ThreadPoolExecutor(max_workers=1, thread_name_prefix="coordinator-mlx")
         self._load_jobs()
 
     def _load_jobs(self) -> None:
@@ -91,37 +105,49 @@ class Coordinator:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._loop())
+        self._tasks = [asyncio.create_task(self._every(name, tick)) for name, tick in (
+            ("recovery", self.recovery.tick), ("verification", self.verification.tick),
+            ("scheduler", self.scheduler.tick))]
 
     async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        self._mlx.shutdown(wait=False, cancel_futures=True)
 
-    async def _loop(self) -> None:
+    async def _every(self, name: str, tick: Callable) -> None:
         while True:
             try:
-                await self.tick()
+                await tick()
             except Exception:
-                log.exception("coordinator tick failed")
+                log.exception("%s tick failed", name)
             await asyncio.sleep(self.cfg.scheduler_tick_s)
 
+    async def off_loop(self, fn: Callable[..., T], *args) -> T:
+        """Run MLX / file work on the coordinator's worker thread."""
+        return await asyncio.get_running_loop().run_in_executor(self._mlx, fn, *args)
+
     async def tick(self) -> None:
+        """One pass of every loop, in order (tests)."""
         await self.recovery.tick()
         await self.verification.tick()
         await self.scheduler.tick()
 
-    async def send(self, node_id: str, msg: BaseModel) -> None:
+    async def send(self, node_id: str, msg: BaseModel) -> bool:
+        """Send to a node; False if it is gone. A reliable node keeps the message until
+        it is acknowledged, so one that is briefly disconnected gets it on reconnect."""
         node = self.registry.get(node_id)
         if node is None:
-            return
-        try:
-            await node.send(msg)
-        except Exception as e:
-            log.warning("send to %s failed: %s", node_id[:8], e)
+            return False
+        if node.reliable and is_sequenced(msg):
+            msg = node.outbox.stamp(msg)
+        if node.connected:
+            try:
+                await node.send(msg)
+            except Exception as e:
+                log.warning("send to %s failed: %s", node_id[:8], e)
+        return True
 
     # ------------------------------------------------------------ jobs
 
@@ -180,31 +206,47 @@ class Coordinator:
     async def complete_job(self, job: JobRuntime) -> None:
         row = job.row
         try:
-            self.checkpoints.export_adapter(job.id, job.spec.steps, job.spec, job.profile.num_layers)
+            async with self.checkpoint_lock(job.id):
+                await self.off_loop(self.checkpoints.export_adapter, job.id, job.spec.steps,
+                                    job.spec, job.profile.num_layers)
         except Exception as e:
             log.exception("adapter export failed")
             row.error = f"adapter export failed: {e}"
         else:
             row.error = None  # an earlier epoch's abort reason no longer applies
+        if row.status in TERMINAL:
+            return  # cancelled while the adapter was being written
         row.status, row.finished_at = "completed", now()
         self.db.save(row)
         self.credits.settle_job(job.id)
         log.info("job %s completed (%d steps, last loss %s)", job.id, row.progress_step, row.last_loss)
 
-    def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
-                             data: bytes) -> None:
+    def checkpoint_lock(self, job_id: str) -> asyncio.Lock:
+        """Serializes a job's checkpoint writes, merges and exports."""
+        return self._checkpoint_locks.setdefault(job_id, asyncio.Lock())
+
+    async def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
+                                   data: bytes) -> None:
         job = self.jobs.get(job_id)
-        if job is None or job.current is None or job.current.epoch != epoch:
+        cur = job.current if job else None
+        if cur is None or cur.epoch != epoch or cur.closed:
             raise ValueError("unknown or stale job epoch")
-        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages)
-        if merged is not None and step > job.row.last_checkpoint_step:
-            job.row.last_checkpoint_step = step
-            self.db.save(job.row)
-            self.db.add(Checkpoint(job_id=job_id, step=step, path=str(merged)))
+        if not 0 <= stage_idx < len(cur.plans):
+            raise ValueError(f"epoch {epoch} has no stage {stage_idx}")
+        async with self.checkpoint_lock(job_id):
+            # A recorded step is never merged again: it may be the file a resuming stage is
+            # downloading right now (every stage re-uploads it on a drain just after a resume).
+            fresh = step > job.row.last_checkpoint_step
+            merged = await self.off_loop(self.checkpoints.store_stage, job_id, epoch, step,
+                                         stage_idx, data, len(cur.plans), fresh)
+            if merged is not None and step > job.row.last_checkpoint_step:
+                job.row.last_checkpoint_step = step
+                self.db.save(job.row)
+                self.db.add(Checkpoint(job_id=job_id, step=step, path=str(merged)))
 
     # ------------------------------------------------------------ agent sessions
 
-    async def on_register(self, msg: Register, send: SendFn) -> None:
+    async def on_register(self, msg: Register, send: SendFn, close: Optional[CloseFn] = None) -> None:
         user = self.auth.session_user(msg.session_token) if msg.session_token else None
         if self.cfg.public_pool and user is None:
             raise PermissionError("sign in")
@@ -218,9 +260,14 @@ class Coordinator:
         elif msg.session_token and user is None:
             log.warning("node %s presented a bad session token", msg.node_id[:8])
         self._check_claim(msg.node_id, user.id if user else None)
-        if self.registry.get(msg.node_id) is not None:
+        old = self.registry.get(msg.node_id)
+        if (old is not None and msg.session_id is not None and old.session_id == msg.session_id
+                and old.user_id == (user.id if user else None)):
+            await self._resume(old, msg, send, close)
+            return
+        if old is not None:
             await self.recovery.on_node_lost(msg.node_id, "re-registered")
-        state = self.registry.register(msg, send)
+        state = self.registry.register(msg, send, close)
         if user is not None:
             state.user_id = user.id
             self.credits.bind_node(msg.node_id, user.id, take_over=True)
@@ -235,7 +282,35 @@ class Coordinator:
         log.info("node %s registered: %s (%s, lends %.1f GB, %.1f TFLOPS, gpu %d%%)",
                  msg.node_id[:8], msg.name, d.chip, d.memory_contrib_bytes / 1e9, d.matmul_tflops,
                  msg.gpu_percent)
-        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s))
+        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s,
+                           session=state.reliable,
+                           reconnect_grace_s=self.cfg.reconnect_grace_s if state.reliable else 0.0))
+
+    async def _resume(self, node: NodeState, msg: Register, send: SendFn,
+                      close: Optional[CloseFn]) -> None:
+        """The same agent process reconnected while we held its place: it keeps its stage,
+        and gets what it hasn't acknowledged replayed (no awaits in between yield to
+        other senders, since sends only enqueue)."""
+        stale_close = node.close if node.connected else None
+        node.send, node.close = send, close
+        node.connected, node.disconnected_at = True, None
+        node.last_heartbeat = time.monotonic()
+        node.data_host, node.data_port, node.gpu_percent = msg.data_host, msg.data_port, msg.gpu_percent
+        node.outbox.ack(msg.last_seq)
+        replay = node.outbox.pending()
+        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s,
+                           session=True, resumed=True, last_seq=node.inbox.last,
+                           reconnect_grace_s=self.cfg.reconnect_grace_s))
+        for m in replay:
+            await send(m)
+        if stale_close is not None:
+            await stale_close()  # its old socket was still open on our side
+        row = self.db.get(Node, msg.node_id)
+        if row is not None:
+            row.online, row.last_seen = True, now()
+            self.db.save(row)
+        log.info("node %s reconnected and resumed its session (%d message(s) replayed)",
+                 msg.node_id[:8], len(replay))
 
     def _check_claim(self, node_id: str, claimant: Optional[str]) -> None:
         """Node ids are public (GET /nodes), so a stranger must not evict a live node or rebind
@@ -257,9 +332,36 @@ class Coordinator:
             raise PermissionError("node id belongs to another account")
 
     async def on_disconnect(self, node_id: str) -> None:
+        node = self.registry.get(node_id)
+        if node is not None and node.reliable and not node.draining:
+            # Hold its place: a reconnect within the grace window resumes the session.
+            if node.connected:
+                node.connected, node.disconnected_at = False, time.monotonic()
+                log.info("node %s disconnected; holding its place for %.0fs", node_id[:8],
+                         self.cfg.reconnect_grace_s)
+            return
         await self.recovery.on_node_lost(node_id, "disconnected")
 
     async def handle(self, node_id: str, msg: BaseModel) -> None:
+        node = self.registry.get(node_id)
+        if isinstance(msg, Ack):
+            if node is not None:
+                node.outbox.ack(msg.upto)
+            return
+        seq = msg.seq if node is not None and node.reliable else None
+        if seq is not None and not node.inbox.accept(seq):
+            await node.send(Ack(upto=node.inbox.last))  # a replay of something already handled
+            return
+        try:
+            await self._dispatch(node_id, msg)
+        except Exception:
+            # Logged, not fatal: ending the session would only make a reliable agent
+            # replay the same message.
+            log.exception("handling %s from %s failed", type(msg).__name__, node_id[:8])
+        if seq is not None and node.connected:
+            await node.send(Ack(upto=seq))
+
+    async def _dispatch(self, node_id: str, msg: BaseModel) -> None:
         if isinstance(msg, Heartbeat):
             self.registry.heartbeat(node_id, msg.status)
         elif isinstance(msg, DrainNotice):
@@ -291,8 +393,15 @@ class Coordinator:
 
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
         job = self.jobs.get(msg.job_id)
-        if job is None or job.current is None or job.current.epoch != msg.epoch:
+        cur = job.current if job else None
+        if cur is None or cur.epoch != msg.epoch or cur.closed:
+            return  # a stage still running in an aborted epoch is not billed
+        if (msg.stage_idx, msg.step) in cur.steps_seen:
+            log.warning("dropping repeated step %d from job %s stage %d", msg.step, job.id,
+                        msg.stage_idx)
             return
+        cur.steps_seen.add((msg.stage_idx, msg.step))
+        cur.last_progress = time.monotonic()
         self.ledger.record_step(node_id, msg)
         flops = float(msg.usage.flops)
         job.last_step_flops = flops

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy import event
 from sqlmodel import Field, Session, SQLModel, create_engine
 
 
@@ -192,10 +193,20 @@ class UserFlag(SQLModel, table=True):
     created_at: float = Field(default_factory=now)
 
 
+def _sqlite_pragmas(dbapi_conn, _record) -> None:
+    # WAL: readers (HTTP handlers on the threadpool) no longer block the event loop's writes
+    # for up to the busy timeout, which stalled every heartbeat and socket behind them.
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=5000")
+    cur.close()
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+        event.listen(self.engine, "connect", _sqlite_pragmas)
         SQLModel.metadata.create_all(self.engine)
         self._migrate()
 
@@ -237,4 +248,11 @@ class Database:
     def save(self, row) -> None:
         with self.session() as s:
             s.merge(row)
+            s.commit()
+
+    def save_all(self, *rows) -> None:
+        """Insert or update every row in one transaction: all are written or none is."""
+        with self.session() as s:
+            for row in rows:
+                s.merge(row)
             s.commit()

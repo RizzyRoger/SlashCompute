@@ -13,7 +13,7 @@ from slashcompute.pipeline.lora import apply_lora
 from slashcompute.pipeline.schedule import StageRunner, StepStats
 from slashcompute.pipeline.shard import load_shard
 from slashcompute.pipeline.stage import StageCompute
-from slashcompute.transport import MemoryLink
+from slashcompute.transport import Link, MemoryLink
 
 
 def build_compute(spec: LoraFinetuneSpec, start: int, end: int, num_layers: int,
@@ -25,13 +25,16 @@ def build_compute(spec: LoraFinetuneSpec, start: int, end: int, num_layers: int,
 
 async def run_local_pipeline(spec: LoraFinetuneSpec, boundaries: list[int], workdir: Path,
                              start_step: int = 0, resume_from: Optional[Path] = None,
-                             checkpoint_every: int = 25) -> dict[int, list[StepStats]]:
+                             checkpoint_every: int = 25,
+                             links: Optional[list[tuple[Link, Link]]] = None,
+                             ) -> dict[int, list[StepStats]]:
     """``boundaries`` like [0, 3, 6] makes stages [0,3) and [3,6).
-    Returns per-stage step stats."""
+    Returns per-stage step stats. ``links`` replaces the in-memory (upstream end,
+    downstream end) pair between each pair of neighbouring stages."""
     num_layers = boundaries[-1]
     n = len(boundaries) - 1
     examples = load_examples(spec.dataset_path, spec.model, spec.max_seq_len)
-    links = [MemoryLink.pair() for _ in range(n - 1)]
+    links = links if links is not None else [MemoryLink.pair() for _ in range(n - 1)]
     stats: dict[int, list[StepStats]] = {i: [] for i in range(n)}
     runners = []
     for i in range(n):

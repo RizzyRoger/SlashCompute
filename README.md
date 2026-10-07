@@ -26,3 +26,9 @@ Changing the pool address, GPU share, or session restarts the training agent aft
 3. Neighbouring stages open a TCP link and run a GPipe LoRA step: activations forward, gradients back.
 4. Each step is metered (FLOPs, memory, time).
 5. `stop` drains after the current step; a crash resumes from the last complete checkpoint.
+
+## When the network drops
+
+- **Between stages:** peer links use TCP keepalive and time out instead of waiting forever. A dropped link redials and resends the activations or gradients the other stage missed, so a short outage doesn't restart the job. A neighbour that stays silent for `SLASHCOMPUTE_PEER_TIMEOUT_S` (600 s) fails the stage, and the job resumes from its last checkpoint.
+- **Between an agent and the coordinator:** both sides number their control messages and resend whatever wasn't acknowledged. An agent that drops off (or stops heartbeating) and returns within `SLASHCOMPUTE_RECONNECT_GRACE_S` (60 s) keeps its stage. Agents and coordinators from before this change keep the old behaviour with each other.
+- **Backstop:** a running job that reports no step for `SLASHCOMPUTE_STALL_TIMEOUT_S` (1800 s) restarts from its last checkpoint.

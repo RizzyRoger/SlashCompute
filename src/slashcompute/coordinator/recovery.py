@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sqlmodel import select
 
@@ -29,12 +29,40 @@ log = logging.getLogger(__name__)
 class Recovery:
     def __init__(self, core: "Coordinator") -> None:
         self.core = core
+        self._last_tick: Optional[float] = None
+        self._hold_expiry_until = 0.0
+
+    def _loop_stalled(self) -> bool:
+        """True while recovering from a stall of the event loop (a slow write, a blocking
+        call, the machine sleeping). Heartbeats that arrived meanwhile still sit unread in
+        the sockets, so judging nodes by them would evict everyone at once."""
+        cfg = self.core.cfg
+        now = time.monotonic()
+        gap = now - self._last_tick if self._last_tick is not None else 0.0
+        self._last_tick = now
+        if gap > max(cfg.heartbeat_interval_s, 5 * cfg.scheduler_tick_s):
+            log.warning("coordinator loop stalled for %.1fs; holding node expiry", gap)
+            self._hold_expiry_until = now + 2 * cfg.heartbeat_interval_s
+        return now < self._hold_expiry_until
 
     async def tick(self) -> None:
         core = self.core
-        for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
-            log.warning("node %s missed heartbeats", node.node_id[:8])
-            await self.on_node_lost(node.node_id, "heartbeat timeout")
+        if not self._loop_stalled():
+            for node in core.registry.expired(core.cfg.heartbeat_timeout_s):
+                if node.reliable and not node.draining:
+                    # Most network drops are silent: treat it like a disconnect, so an agent that
+                    # comes back within the grace window resumes instead of losing its stage.
+                    log.warning("node %s missed heartbeats; closing its socket and holding its "
+                                "place for %.0fs", node.node_id[:8], core.cfg.reconnect_grace_s)
+                    node.connected, node.disconnected_at = False, time.monotonic()
+                    if node.close is not None:
+                        await node.close()
+                    continue
+                log.warning("node %s missed heartbeats", node.node_id[:8])
+                await self.on_node_lost(node.node_id, "heartbeat timeout")
+            for node in core.registry.away(core.cfg.reconnect_grace_s):
+                await self.on_node_lost(node.node_id,
+                                        f"did not reconnect within {core.cfg.reconnect_grace_s:.0f}s")
         for node in list(core.registry.nodes.values()):
             if (node.draining and node.assignment is not None and node.drain_deadline
                     and time.monotonic() > node.drain_deadline):
@@ -42,6 +70,18 @@ class Recovery:
                 job = core.jobs.get(node.assignment.job_id)
                 if job is not None:
                     await self.abort_epoch(job, "drain exceeded grace period", count=False)
+        await self._abort_stalled()
+
+    async def _abort_stalled(self) -> None:
+        """Backstop for a hang nothing else notices (a wedged worker, a link that never
+        errors): a running epoch that reports no step for ``stall_timeout_s`` restarts
+        from its last checkpoint."""
+        limit = self.core.cfg.stall_timeout_s
+        for job in list(self.core.jobs.values()):
+            cur = job.current
+            if (job.row.status == "running" and cur is not None and not cur.closed
+                    and time.monotonic() - cur.last_progress > limit):
+                await self.abort_epoch(job, f"no progress for {limit:.0f}s")
 
     async def on_drain(self, node_id: str) -> None:
         core = self.core
@@ -66,6 +106,10 @@ class Recovery:
         node = core.registry.remove(node_id)
         if node is None:
             return
+        if node.connected and node.close is not None:
+            # Close its socket too: an agent evicted for missed heartbeats otherwise stays
+            # connected, ignored, and never re-registers.
+            await node.close()
         row = core.db.get(Node, node_id)
         if row is not None:
             row.online = False

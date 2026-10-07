@@ -143,34 +143,37 @@ async def test_agent_stops_when_the_coordinator_refuses_it(tmp_path, monkeypatch
     assert count["n"] == 1                                 # no retry loop against a refusal
 
 
-async def test_agent_reconnects_when_handling_a_message_raises_an_http_error(tmp_path, monkeypatch):
-    """A blob upload/download failing (httpx error, not OSError) used to kill the daemon outright."""
+async def test_agent_survives_a_message_handler_raising_an_http_error(tmp_path, monkeypatch):
+    """A blob upload/download failing (httpx error, not OSError) used to kill the daemon
+    outright; it must not even cost the session (a reconnect would drop a running stage)."""
     import httpx
 
     from slashcompute.agent.daemon import AgentOptions, Daemon
     from slashcompute.common.protocol import Drain, Welcome, dump
 
     monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
-    rejoined = asyncio.Event()
+    handled = []
+    second = asyncio.Event()
 
     async def on_register(ws, n):
         await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=30)))
-        if n == 1:
-            await ws.send(dump(Drain(job_id="j", epoch=1)))
-        else:
-            rejoined.set()
+        await ws.send(dump(Drain(job_id="j", epoch=1)))
+        await ws.send(dump(Drain(job_id="j", epoch=2)))
         await ws.wait_closed()
 
-    async def boom(_msg):
-        raise httpx.ConnectError("coordinator blob store unreachable")
+    async def boom(msg):
+        handled.append(msg.epoch)
+        if msg.epoch == 1:
+            raise httpx.ConnectError("coordinator blob store unreachable")
+        second.set()
 
     server, url, count = await _fake_coordinator(on_register)
     daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True))
     monkeypatch.setattr(daemon, "_handle", boom)
     running = asyncio.create_task(daemon.run())
     try:
-        await asyncio.wait_for(rejoined.wait(), 10)
-        assert count["n"] == 2 and not running.done()
+        await asyncio.wait_for(second.wait(), 10)
+        assert handled == [1, 2] and count["n"] == 1 and not running.done()
     finally:
         await daemon.shutdown()
         await asyncio.wait_for(running, 5)
@@ -185,6 +188,22 @@ class _HeldBundle:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"bundle")
         return True
+
+
+def _assignment(job_id="j", epoch=1, stage_idx=0):
+    from slashcompute.common.protocol import LoraFinetuneSpec, StageAssignment
+
+    return StageAssignment(
+        job_id=job_id, epoch=epoch, stage_idx=stage_idx, num_stages=1, layer_start=0, layer_end=8,
+        num_layers=8, spec=LoraFinetuneSpec(dataset_path="dataset.jsonl", steps=2),
+        checkpoint_every=25, verify_ring_size=8,
+    )
+
+
+def _held_stage(job_id="j", epoch=1):
+    from slashcompute.agent.daemon import _Stage
+
+    return _Stage(_assignment(job_id, epoch), session=_HeldBundle())
 
 
 def _verify_daemon(tmp_path):
@@ -208,7 +227,7 @@ async def test_failed_bundle_upload_is_reported_not_raised(tmp_path, status):
     from slashcompute.common.protocol import VerifyBundleReady, VerifyFetch
 
     daemon, sent = _verify_daemon(tmp_path)
-    daemon._session = _HeldBundle()
+    daemon._stage = _held_stage()
 
     def put_bytes(path, data, params=None):
         req = httpx.Request("POST", "http://127.0.0.1:9931" + path)
@@ -547,3 +566,326 @@ open({str(job_dir / "probe.json")!r}, "w").write(json.dumps(out))
         shutil.rmtree(home, ignore_errors=True)
     assert out.get("config") == {"model_type": "tiny"}, out.get("error")
     assert out["cache"] == "read-only"
+
+
+# ------------------------------------------------------------ stage lifecycle races
+
+
+def _sandboxed_daemon(tmp_path, monkeypatch, worker="import time; time.sleep(30)"):
+    import sys
+
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+
+    monkeypatch.setattr("slashcompute.agent.daemon.wrap_command",
+                        lambda cmd, *_: [sys.executable, "-c", worker])
+    monkeypatch.setattr("slashcompute.agent.daemon.resolve_model_path", lambda model: Path(model))
+    daemon = Daemon(AgentOptions(url="http://127.0.0.1:9940", home=tmp_path, localhost=True,
+                                 sandbox=True))
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    daemon.send = send
+    return daemon, sent
+
+
+async def test_finished_worker_does_not_clobber_the_next_stage(tmp_path, monkeypatch):
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    await daemon._start_stage(_assignment(epoch=1))
+    a = daemon._stage
+    await daemon._start_stage(_assignment(epoch=2))  # replaces (and stops) epoch 1
+    b = daemon._stage
+    try:
+        await asyncio.wait_for(a.pump, 10)  # epoch 1's pump ran its cleanup after epoch 2 began
+        assert a.proc.returncode is not None
+        assert daemon._stage is b and daemon._proc is b.proc and b.proc.returncode is None
+        assert (daemon.status, daemon.job_id, daemon.epoch) == ("loading", "j", 2)
+    finally:
+        await daemon._cancel_stage()
+    assert b.proc.returncode is not None and daemon._stage is None and daemon.status == "idle"
+
+
+async def test_stale_stage_commands_are_ignored(tmp_path):
+    from slashcompute.agent.daemon import AgentOptions, Daemon, _Stage
+    from slashcompute.common.protocol import CancelStage, Drain, VerifyFetch
+
+    class Session(_HeldBundle):
+        drained = cancelled = False
+
+        def request_drain(self):
+            self.drained = True
+
+        async def cancel(self):
+            self.cancelled = True
+
+    daemon = Daemon(AgentOptions(url="http://127.0.0.1:9941", home=tmp_path, localhost=True))
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    daemon.send = send
+    session = Session()
+    stage = daemon._stage = _Stage(_assignment(epoch=2), session=session)
+
+    await daemon._handle(Drain(job_id="j", epoch=1))
+    await daemon._handle(CancelStage(job_id="j", epoch=1))
+    await daemon._handle(CancelStage(job_id="other", epoch=2))
+    await daemon._on_fetch(VerifyFetch(verify_id="v", job_id="j", epoch=1, stage_idx=0, step=3))
+    assert not session.drained and not session.cancelled and daemon._stage is stage
+    assert sent[-1].error == "bundle no longer held"  # epoch 1's ring is not this one
+
+    await daemon._handle(Drain(job_id="j", epoch=2))
+    assert session.drained
+    await daemon._handle(CancelStage(job_id="j", epoch=2))
+    assert session.cancelled and daemon._stage is None
+
+
+async def test_repeated_assignment_keeps_the_running_stage(tmp_path, monkeypatch):
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    await daemon._start_stage(_assignment(epoch=1))
+    first = daemon._stage
+    try:
+        await daemon._start_stage(_assignment(epoch=1))  # e.g. replayed after a reconnect
+        assert daemon._stage is first and first.proc.returncode is None
+    finally:
+        await daemon._cancel_stage()
+
+
+async def test_worker_that_dies_silently_is_reported(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import StageFinished
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch, worker="raise SystemExit(3)")
+    await daemon._start_stage(_assignment(epoch=1))
+    await asyncio.wait_for(daemon._stage.pump, 10)
+    [finished] = [m for m in sent if isinstance(m, StageFinished)]
+    assert finished.reason == "error" and "exited with code 3" in finished.detail
+    assert daemon._stage is None and daemon.status == "idle"
+
+
+async def test_second_shutdown_is_a_no_op_and_blocks_new_stages(tmp_path, monkeypatch):
+    from slashcompute.agent.daemon import _Stage
+
+    daemon, _ = _sandboxed_daemon(tmp_path, monkeypatch)
+    daemon.opt.cfg.grace_period_s = 0.5
+    session = _HeldBundle()
+    session.request_drain = lambda: None
+    session.task = asyncio.create_task(asyncio.sleep(30))  # a stage that never drains
+
+    async def cancel():
+        session.task.cancel()
+
+    session.cancel = cancel
+    daemon._stage = _Stage(_assignment(epoch=1), session=session)
+    first = asyncio.create_task(daemon.shutdown())
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(daemon.shutdown(), 0.1)  # returns at once instead of draining again
+    await daemon._start_stage(_assignment(epoch=2))
+    assert daemon._stage is None or daemon._stage.asg.epoch == 1
+    await asyncio.wait_for(first, 5)
+    assert daemon._stage is None and session.task.cancelled()
+
+
+# ------------------------------------------------------------ reliable sessions across reconnects
+
+
+class _FakeSession(_HeldBundle):
+    task = None
+    drained = cancelled = False
+
+    def request_drain(self):
+        self.drained = True
+
+    async def cancel(self):
+        self.cancelled = True
+
+
+async def _scripted_coordinator(on_register):
+    """Like _fake_coordinator, but passes the parsed Register too."""
+    import websockets
+
+    from slashcompute.common.protocol import parse_agent_message
+
+    count = {"n": 0}
+
+    async def handler(ws):
+        reg = parse_agent_message(await ws.recv())
+        count["n"] += 1
+        await on_register(ws, count["n"], reg)
+
+    server = await websockets.serve(handler, "127.0.0.1", 0)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", count
+
+
+async def _until(cond, timeout=10.0):
+    for _ in range(int(timeout / 0.01)):
+        if cond():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met")
+
+
+def _step(step=1):
+    from slashcompute.common.protocol import StepMetrics, UsageSample
+
+    return StepMetrics(job_id="j", epoch=1, stage_idx=0, step=step, in_digest="a", out_digest="b",
+                       usage=UsageSample(flops=1.0, tokens=1, peak_mem_bytes=1, resident_mem_bytes=1,
+                                         mem_byte_seconds=1.0, wall_s=1.0, busy_s=1.0))
+
+
+async def _drop_then(second_welcome, tmp_path, monkeypatch, grace=30.0):
+    """A coordinator that welcomes a reliable session, drops it, then answers the
+    reconnect with ``second_welcome`` (None: never accepts another connection)."""
+    from slashcompute.agent.daemon import AgentOptions, Daemon, _Stage
+    from slashcompute.common.protocol import Heartbeat, Welcome, dump, parse_agent_message
+
+    monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
+    registers, got = [], []
+
+    async def on_register(ws, n, reg):
+        registers.append(reg)
+        if n == 1:
+            await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=30, session=True,
+                                       reconnect_grace_s=grace)))
+            await ws.close(code=1012, reason="network blip")
+            return
+        await ws.send(dump(second_welcome))
+        async for raw in ws:
+            m = parse_agent_message(raw)
+            if not isinstance(m, Heartbeat):
+                got.append(m)
+
+    server, url, _ = await _scripted_coordinator(on_register)
+    daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True))
+    running = asyncio.create_task(daemon.run())
+    await _until(lambda: registers and daemon._reliable and daemon._ws is None)
+    session = _FakeSession()
+    daemon._stage = _Stage(_assignment(), session=session)  # assigned in the first session
+    if second_welcome is None:
+        server.close()
+    await daemon.send(_step())  # sent while the connection is down
+    return daemon, running, server, session, registers, got
+
+
+async def test_reconnect_resumes_the_session_and_replays_what_was_missed(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import StepMetrics, Welcome
+
+    resumed = Welcome(node_id="x", heartbeat_interval_s=30, session=True, resumed=True, last_seq=0,
+                      reconnect_grace_s=30)
+    daemon, running, server, session, registers, got = await _drop_then(resumed, tmp_path, monkeypatch)
+    try:
+        await _until(lambda: got)
+        assert isinstance(got[0], StepMetrics) and got[0].seq == 1  # replayed, not lost
+        assert registers[1].session_id == registers[0].session_id
+        assert daemon._stage is not None and not session.cancelled  # the stage kept running
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 5)
+        server.close()
+
+
+async def test_fresh_session_after_reconnect_releases_the_stage(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import Welcome
+
+    fresh = Welcome(node_id="x", heartbeat_interval_s=30, session=True, reconnect_grace_s=30)
+    daemon, running, server, session, _, got = await _drop_then(fresh, tmp_path, monkeypatch)
+    try:
+        await _until(lambda: daemon._stage is None)
+        assert session.cancelled  # the coordinator restarted: it knows nothing of this stage
+        await asyncio.sleep(0.2)
+        assert got == []  # nor of the old session's messages
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 5)
+        server.close()
+
+
+async def test_stage_is_released_once_the_grace_window_passes(tmp_path, monkeypatch):
+    daemon, running, server, session, _, _ = await _drop_then(None, tmp_path, monkeypatch, grace=0.2)
+    try:
+        await _until(lambda: daemon._stage is None, timeout=10)
+        assert session.cancelled
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 5)
+
+
+async def test_replayed_coordinator_message_is_handled_once(tmp_path, monkeypatch):
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import Ack, Drain, Welcome, dump, parse_agent_message
+
+    monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
+    acks = []
+
+    async def on_register(ws, n, reg):
+        await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=30, session=True,
+                                   reconnect_grace_s=30)))
+        drain = Drain(job_id="j", epoch=1, seq=1)
+        await ws.send(dump(drain))
+        await ws.send(dump(drain))
+        async for raw in ws:
+            m = parse_agent_message(raw)
+            if isinstance(m, Ack):
+                acks.append(m.upto)
+
+    server, url, _ = await _scripted_coordinator(on_register)
+    daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True))
+    handled = []
+
+    async def handle(msg):
+        handled.append(msg)
+
+    monkeypatch.setattr(daemon, "_handle", handle)
+    running = asyncio.create_task(daemon.run())
+    try:
+        await _until(lambda: len(acks) == 2)
+        assert len(handled) == 1 and acks == [1, 1]
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 5)
+        server.close()
+
+
+async def test_checkpoint_upload_retries_connection_failures_only(tmp_path, monkeypatch):
+    import httpx
+
+    from slashcompute.agent import worker
+
+    monkeypatch.setattr(worker, "UPLOAD_RETRY_DELAYS_S", (0.01, 0.01, 0.01))
+    path = tmp_path / "ckpt.safetensors"
+    path.write_bytes(b"weights")
+    calls = []
+
+    class Http:
+        def put_bytes(self, url, data, params=None):
+            calls.append(data)
+            req = httpx.Request("POST", "http://c" + url)
+            if len(calls) < 3:
+                raise httpx.ConnectError("coordinator unreachable", request=req)
+            if url.endswith("/stale"):
+                httpx.Response(409, request=req).raise_for_status()
+
+    await worker.upload_checkpoint(Http(), "/jobs/j/checkpoints/5", path, {"epoch": 1})
+    assert calls == [b"weights"] * 3  # two blips, then through
+
+    calls.clear()
+    with pytest.raises(httpx.HTTPStatusError):  # the coordinator said no: retrying won't help
+        await worker.upload_checkpoint(Http(), "/stale", path, {})
+    assert len(calls) == 3
+
+
+async def test_worker_that_cannot_start_is_reported_at_once(tmp_path, monkeypatch):
+    from slashcompute.common.protocol import StageFinished
+
+    daemon, sent = _sandboxed_daemon(tmp_path, monkeypatch)
+
+    async def no_sandbox(*args, **kwargs):
+        raise FileNotFoundError("sandbox-exec")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", no_sandbox)
+    await daemon._start_stage(_assignment(epoch=1))
+    [finished] = [m for m in sent if isinstance(m, StageFinished)]
+    # Not a stage stuck "loading" until the coordinator's 15-minute start timeout.
+    assert finished.reason == "error" and "could not start the worker" in finished.detail
+    assert daemon._stage is None and daemon.status == "idle"

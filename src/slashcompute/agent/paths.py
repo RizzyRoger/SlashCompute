@@ -82,7 +82,11 @@ class AgentPaths:
     def write_status(self, **fields) -> None:
         cur = self.read_status()
         cur.update(fields)
-        self.status_file.write_text(json.dumps(cur, indent=2) + "\n")
+        # Write then rename: the launcher and the inference node read this file at any
+        # moment and must never see it half-written.
+        tmp = self.status_file.with_name(f".{self.status_file.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cur, indent=2) + "\n")
+        os.replace(tmp, self.status_file)
 
     def read_status(self) -> dict:
         if not self.status_file.exists():
